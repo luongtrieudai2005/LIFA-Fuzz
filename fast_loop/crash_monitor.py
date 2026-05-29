@@ -6,21 +6,21 @@ Crash Monitor — watches the Target Server for crash events.
 Responsibilities:
     - Poll the sandbox backend for target liveness.
     - On crash: log the offending packet, timestamp, and exit code.
-    - Notify the Interceptor to pause/resume mutation injection.
-    - Maintain crash corpus (all packets that caused crashes).
-    - Trigger sandbox state reset for continued fuzzing.
+    - Pause the Interceptor and Mutation Engine immediately.
+    - Save the offending packet as a PoC artifact (JSON + .bin) in /crashes/.
+    - Call ``sandbox.reset_state()`` to restore the target.
+    - Resume the Interceptor and Mutation Engine once the target is alive.
 
 Architecture:
     Runs as an asyncio task in the Fast Loop's event loop. Polls the
     ``BaseSandbox`` abstraction at a configurable interval (default 500ms).
     When a crash is detected, it:
-    1. Creates a CrashRecord with the last injected mutation.
-    2. Saves the record to the crash corpus directory.
-    3. Signals the Interceptor to pause.
+    1. Pauses the Interceptor and MutationEngine immediately.
+    2. Creates a CrashRecord with the last injected mutation.
+    3. Saves the record + raw packet to the crash corpus directory.
     4. Calls ``sandbox.reset_state()`` to restore the target.
-       - Docker: container restart (~200-500ms).
-       - MicroVM: snapshot restore (< 10ms).
-    5. Signals the Interceptor to resume.
+    5. Waits for the target to become alive again.
+    6. Resumes the Interceptor and MutationEngine.
 
 Key Design:
     The Crash Monitor depends on ``BaseSandbox``, NOT on Docker directly.
@@ -29,19 +29,13 @@ Key Design:
 
 Configuration:
     All tunables are read from ``config.yaml`` under ``fast_loop.crash_monitor``.
-
-TODO (Phase 2):
-    - [ ] Implement sandbox polling via BaseSandbox.is_target_alive()
-    - [ ] Implement crash detection logic
-    - [ ] Implement crash corpus persistence (JSON files)
-    - [ ] Implement auto-reset via sandbox.reset_state()
-    - [ ] Implement Interceptor pause/resume signaling
-    - [ ] Write tests/test_crash_monitor.py
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -76,27 +70,30 @@ class CrashMonitor:
 
     Args:
         sandbox:            The sandbox backend (Docker, Firecracker, etc.).
+        interceptor:        The Interceptor instance (for pause/resume).
+                            Can be None if pause/resume is managed externally.
+        mutator:            The MutationEngine instance (for pause/resume
+                            and last-injected-packet tracking).
+                            Can be None if managed externally.
         poll_interval_ms:   How often to check target status (milliseconds).
-        crash_corpus_dir:   Directory to save crash artifacts (JSON + offending packet).
+        crash_corpus_dir:   Directory to save crash artifacts (JSON + .bin).
         auto_reset:         Whether to automatically reset the target after a crash.
         restart_delay_s:    Seconds to wait before resetting (Docker-specific).
-
-    Example:
-        >>> sandbox = DockerSandbox(target_container="lifa-target-server")
-        >>> await sandbox.start()
-        >>> monitor = CrashMonitor(sandbox=sandbox, auto_reset=True)
-        >>> await monitor.watch()
     """
 
     def __init__(
         self,
         sandbox: BaseSandbox,
+        interceptor: Any = None,
+        mutator: Any = None,
         poll_interval_ms: int = 500,
         crash_corpus_dir: str = "./crashes",
         auto_reset: bool = True,
         restart_delay_s: float = 2.0,
     ) -> None:
         self.sandbox = sandbox
+        self.interceptor = interceptor
+        self.mutator = mutator
         self.poll_interval_ms = poll_interval_ms
         self.crash_corpus_dir = Path(crash_corpus_dir)
         self.auto_reset = auto_reset
@@ -105,7 +102,7 @@ class CrashMonitor:
         # Internal state
         self._running: bool = False
         self._crash_count: int = 0
-        self._last_offending_packet: Optional[bytes] = None
+        self._last_offending_packet: bytes = b""
         self._last_mutation_rule_id: Optional[str] = None
 
         # Callbacks (set by the Fast Loop orchestrator)
@@ -120,21 +117,41 @@ class CrashMonitor:
 
         Runs an infinite loop that polls the container status at the
         configured interval. On crash, delegates to ``on_crash()``.
-
-        TODO (Phase 2): Implement.
-        - Poll sandbox.is_target_alive() at configured interval
-        - On False: call sandbox.get_last_crash_info() for details
-        - Trigger on_crash() with the crash info
-        - Handle sandbox backend errors gracefully
         """
-        raise NotImplementedError("TODO: Implement container monitoring loop")
+        self._running = True
+        was_alive = True  # Track state transitions
+
+        logger.info(
+            f"CrashMonitor started (poll={self.poll_interval_ms}ms, "
+            f"auto_reset={self.auto_reset})"
+        )
+
+        while self._running:
+            try:
+                alive = await self.sandbox.is_target_alive()
+
+                if was_alive and not alive:
+                    # State transition: running → crashed
+                    logger.error("CRASH DETECTED — target server is down!")
+                    crash_info = await self.sandbox.get_last_crash_info()
+                    exit_code = crash_info.exit_code if crash_info else 0
+                    await self.on_crash(exit_code)
+                    was_alive = False
+
+                elif not was_alive and alive:
+                    # State transition: crashed → running (after reset)
+                    logger.info("Target server is back up — resuming operations")
+                    was_alive = True
+
+            except Exception as e:
+                logger.error(f"Error in crash monitor poll: {e}", exc_info=True)
+
+            await asyncio.sleep(self.poll_interval_ms / 1000.0)
 
     async def stop(self) -> None:
-        """Stop monitoring and clean up resources.
-
-        TODO (Phase 2): Implement.
-        """
-        raise NotImplementedError("TODO: Implement stop")
+        """Stop monitoring and clean up resources."""
+        self._running = False
+        logger.info("CrashMonitor stopped")
 
     # -----------------------------------------------------------------
     # Crash Handling
@@ -143,31 +160,82 @@ class CrashMonitor:
     async def on_crash(self, exit_code: int) -> CrashRecord:
         """Handle a crash event.
 
+        Full pipeline:
         1. Resolve the signal name from the exit code.
         2. Create a CrashRecord with the offending packet.
-        3. Save the crash record to the corpus directory.
-        4. Signal the Interceptor to pause (if callback is set).
-        5. Optionally restart the container.
+        3. Pause the Interceptor and MutationEngine immediately.
+        4. Save the crash record to the corpus directory.
+        5. Reset the target via sandbox.reset_state().
+        6. Wait for the target to come back alive.
+        7. Resume the Interceptor and MutationEngine.
 
         Args:
             exit_code: Container exit code (e.g., 139 for SIGSEGV).
 
         Returns:
             The created CrashRecord.
-
-        TODO (Phase 2): Implement.
         """
-        raise NotImplementedError("TODO: Implement crash handling")
+        self._crash_count += 1
+
+        # 1. Resolve signal
+        signal = self._resolve_signal(exit_code)
+        signal_str = signal.value if signal else f"unknown (exit {exit_code})"
+        logger.error(
+            f"Crash #{self._crash_count}: {signal_str} "
+            f"(exit_code={exit_code})"
+        )
+
+        # 2. Get offending packet from mutator's tracking
+        offending_packet = b""
+        rule_id = None
+        if self.mutator is not None:
+            offending_packet = self.mutator._last_injected_packet
+            rule_id = self.mutator._last_injected_rule_id
+
+        # Also check our own register
+        if not offending_packet and self._last_offending_packet:
+            offending_packet = self._last_offending_packet
+            rule_id = rule_id or self._last_mutation_rule_id
+
+        # 3. Create CrashRecord
+        record = CrashRecord(
+            exit_code=exit_code,
+            signal=signal,
+            offending_packet=offending_packet,
+            mutation_rule_id=rule_id,
+        )
+        logger.error(
+            f"Crash artifact: packet={record.offending_packet_hex[:64]}, "
+            f"rule_id={rule_id}"
+        )
+
+        # 4. Pause traffic IMMEDIATELY
+        await self.pause_interceptor()
+
+        # 5. Save crash artifact to disk
+        crash_path = self.save_crash_record(record)
+        logger.error(f"Crash PoC saved to: {crash_path}")
+
+        # 6. Invoke external callback if registered
+        if self._on_crash_callback:
+            try:
+                self._on_crash_callback(record)
+            except Exception as e:
+                logger.error(f"on_crash_callback error: {e}")
+
+        # 7. Reset the target
+        if self.auto_reset:
+            await self.restart_target()
+        else:
+            logger.warning(
+                "Auto-reset disabled — target left in crashed state. "
+                "Manual intervention required."
+            )
+
+        return record
 
     def _resolve_signal(self, exit_code: int) -> Optional[Signal]:
-        """Map a container exit code to a POSIX signal name.
-
-        Args:
-            exit_code: The numeric exit code from the container.
-
-        Returns:
-            The corresponding Signal enum value, or None if unrecognized.
-        """
+        """Map a container exit code to a POSIX signal name."""
         return EXIT_CODE_TO_SIGNAL.get(exit_code)
 
     # -----------------------------------------------------------------
@@ -177,21 +245,47 @@ class CrashMonitor:
     def save_crash_record(self, record: CrashRecord) -> Path:
         """Persist a crash record to the corpus directory.
 
-        Saves a JSON file named ``{crash_id}.json`` containing the
-        crash metadata and offending packet hex.
+        Saves:
+        - ``/crashes/crash_<timestamp>_<crash_id>.json`` — metadata + hex.
+        - ``/crashes/crash_<timestamp>_<crash_id>.bin`` — raw packet bytes for replay.
 
         Args:
             record: The CrashRecord to save.
 
         Returns:
-            Path to the saved file.
-
-        TODO (Phase 2): Implement.
-        - Ensure crash_corpus_dir exists
-        - Write JSON with indent=2 for readability
-        - Also save raw offending packet as .bin file for replay
+            Path to the saved JSON file.
         """
-        raise NotImplementedError("TODO: Implement crash persistence")
+        # Ensure crash directory exists
+        self.crash_corpus_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp_suffix = time.strftime("%Y%m%d_%H%M%S")
+        base_name = f"crash_{timestamp_suffix}_{record.crash_id}"
+        json_path = self.crash_corpus_dir / f"{base_name}.json"
+        bin_path = self.crash_corpus_dir / f"{base_name}.bin"
+
+        # Save JSON metadata
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    record.model_dump(mode="json"),
+                    f,
+                    indent=2,
+                    default=str,
+                )
+            logger.info(f"Crash metadata saved: {json_path}")
+        except OSError as e:
+            logger.error(f"Failed to save crash JSON: {e}")
+
+        # Save raw packet binary (for replay tools)
+        if record.offending_packet:
+            try:
+                with open(bin_path, "wb") as f:
+                    f.write(record.offending_packet)
+                logger.info(f"Crash binary saved: {bin_path}")
+            except OSError as e:
+                logger.error(f"Failed to save crash binary: {e}")
+
+        return json_path
 
     # -----------------------------------------------------------------
     # Container Control
@@ -204,32 +298,77 @@ class CrashMonitor:
         - Docker: container restart (~200-500ms).
         - MicroVM: snapshot restore (< 10ms).
 
-        TODO (Phase 2): Implement.
-        - Call self.sandbox.reset_state()
-        - Await health check via sandbox.is_target_alive()
-        - Log the reset event with timing info
+        After reset, waits for the target to become alive again.
         """
-        raise NotImplementedError("TODO: Implement target reset via sandbox")
+        logger.info(
+            f"Resetting target server (waiting {self.restart_delay_s}s "
+            f"before reset)..."
+        )
+
+        # Brief delay to let the crash settle (Docker daemon needs time)
+        await asyncio.sleep(self.restart_delay_s)
+
+        # Reset
+        t0 = time.monotonic()
+        try:
+            await self.sandbox.reset_state()
+        except Exception as e:
+            logger.error(f"sandbox.reset_state() failed: {e}")
+            return
+
+        # Verify target is alive again
+        max_wait = 15.0  # seconds
+        deadline = time.monotonic() + max_wait
+        while time.monotonic() < deadline:
+            if await self.sandbox.is_target_alive():
+                elapsed = time.monotonic() - t0
+                logger.info(
+                    f"Target server reset complete "
+                    f"(took {elapsed:.2f}s, waited {max_wait - (deadline - time.monotonic()):.1f}s)"
+                )
+                # Resume operations
+                await self.resume_interceptor()
+                return
+            await asyncio.sleep(0.5)
+
+        logger.error(
+            f"Target server did NOT come back alive after {max_wait}s. "
+            f"Fuzzing is paused — manual intervention may be required."
+        )
 
     async def pause_interceptor(self) -> None:
-        """Signal the Interceptor to pause mutation injection.
+        """Signal the Interceptor and MutationEngine to pause.
 
         Called after a crash to prevent flooding a potentially unstable
         target with mutations during restart.
-
-        TODO (Phase 2): Implement.
-        - Call registered _on_crash_callback or use asyncio.Event
         """
-        raise NotImplementedError("TODO: Implement interceptor pause")
+        if self.interceptor is not None:
+            self.interceptor.pause()
+
+        if self.mutator is not None:
+            self.mutator.pause()
+
+        logger.warning(
+            "CrashMonitor: Interceptor + MutationEngine PAUSED "
+            "(traffic stopped)"
+        )
 
     async def resume_interceptor(self) -> None:
-        """Signal the Interceptor to resume mutation injection.
+        """Signal the Interceptor and MutationEngine to resume.
 
-        Called after the target container has successfully restarted.
-
-        TODO (Phase 2): Implement.
+        Called after the target container has successfully restarted
+        and been verified alive.
         """
-        raise NotImplementedError("TODO: Implement interceptor resume")
+        if self.interceptor is not None:
+            self.interceptor.resume()
+
+        if self.mutator is not None:
+            self.mutator.resume()
+
+        logger.info(
+            "CrashMonitor: Interceptor + MutationEngine RESUMED "
+            "(traffic flowing)"
+        )
 
     # -----------------------------------------------------------------
     # Offending Packet Tracking

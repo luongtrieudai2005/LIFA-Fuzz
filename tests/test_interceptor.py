@@ -66,12 +66,20 @@ class TestInterceptorCapture:
             direction=Direction.SERVER_TO_CLIENT,
             raw_data=b"\xFF\xFF",
         )
+        # Manually drain write queue → buffer → disk (background writer is not running)
+        while not interceptor._write_queue.empty():
+            interceptor._write_buffer.append(interceptor._write_queue.get_nowait())
+        if interceptor._write_buffer:
+            with open(log_path, "a") as f:
+                for line in interceptor._write_buffer:
+                    f.write(line + "\n")
+            interceptor._write_buffer.clear()
         # Verify file has one valid JSON line
         lines = Path(log_path).read_text().strip().split("\n")
         assert len(lines) == 1
         record = json.loads(lines[0])
         assert record["direction"] == "server_to_client"
-        assert record["raw_data"] == "ffff"
+        assert record["payload"] == "ffff"
         Path(log_path).unlink(missing_ok=True)
 
 

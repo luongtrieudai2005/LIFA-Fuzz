@@ -9,14 +9,20 @@
 # -----------------------------------------------------------------------------
 sandbox:
   driver: "docker"                # "docker" (Phase 1) or "firecracker" (Phase 4)
-  client_image: "lifa-fuzz-client:latest"
   server_image: "lifa-fuzz-server:latest"
   target_container: "lifa-target-server"
-  client_container: "lifa-client"
   network_name: "lifa-network"
   proxy_listen_port: 8001        # Port the interceptor listens on (client connects here)
   upstream_port: 9000             # Port the target server listens on inside the sandbox
   server_restart_delay: 2        # Seconds to wait before resetting crashed server
+
+  # Client subprocess settings (runs locally on host, not in Docker)
+  client:
+    enabled: true
+    script: "sandbox/client/client.py"
+    target_host: "127.0.0.1"     # Connects to the Interceptor on the host
+    target_port: 8001            # Interceptor's listen port
+    send_interval_ms: 1000
 
 # -----------------------------------------------------------------------------
 # Fast Loop (Block 2)
@@ -66,6 +72,7 @@ slow_loop:
 
   # LLM Agent settings
   llm_agent:
+    mode: "REAL"                # "REAL" (calls actual API) or "MOCK" (simulated for testing)
     provider: "openai"          # litellm provider string (openai, anthropic, etc.)
     model: "gpt-4o"             # Model name (must be supported by litellm)
     api_key_env: "OPENAI_API_KEY"  # Environment variable holding the API key
@@ -74,6 +81,17 @@ slow_loop:
     timeout_seconds: 60         # Request timeout
     max_retries: 3              # Retry count on API failure
     retry_backoff_ms: 5000      # Base retry backoff
+    session_budget_tokens: 0    # Max tokens per session (0 = unlimited)
+
+  # Differential analyzer settings (mathematical pre-processing)
+  differential_analyzer:
+    max_depth: 64               # Maximum byte offset to analyze
+    min_packets: 3              # Minimum packets for meaningful analysis
+    min_coverage: 0.6           # Minimum coverage fraction per offset
+
+  # Crash manager integration
+  crash_manager:
+    crash_dir: "./crashes"      # Directory for crash PoCs and reports
 
   # Rule generator settings
   rule_generator:

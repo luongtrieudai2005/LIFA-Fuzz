@@ -13,6 +13,11 @@ Architecture:
     A separate injection task reads from the mutation queue and sends
     mutated packets directly to the target.
 
+    Pause/Resume:
+        The CrashMonitor can call pause() to immediately stop all mutation
+        injection and reject new client connections. resume() re-enables
+        normal operation.  Uses asyncio.Event for zero-COST suspension.
+
 Data flow:
         Client ──> [proxy:8001] ──> Interceptor ──> [target:9000] ──> Server
                               │                  │
@@ -55,7 +60,7 @@ class Interceptor:
         listen_port: int = 8001,
         upstream_host: str = "127.0.0.1",
         upstream_port: int = 9000,
-        traffic_log_path: str = "/tmp/lifa_traffic.log",
+        traffic_log_path: str = "shared/raw_traffic.jsonl",
         max_connections: int = 100,
     ) -> None:
         self.listen_host = listen_host
@@ -68,20 +73,38 @@ class Interceptor:
         self._server: Optional[asyncio.Server] = None
         self._active_connections: int = 0
         self._running: bool = False
-        self._log_lock = asyncio.Lock()
         self._total_captured: int = 0
         self._total_injected: int = 0
 
+        # ── Pause / Resume ───────────────────────────────────────────
+        # asyncio.Event: set = paused, clear = running.
+        # The injection loop awaits on this event, so paused mutations
+        # queue up and are processed when resumed.
+        self._pause_event: asyncio.Event = asyncio.Event()
+
         # Mutation injection queue
         self._mutation_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1000)
+
+        # Non-blocking write queue for traffic log.
+        # capture_packet() pushes entries here; a background writer
+        # flushes them to disk in batches. This ensures proxy
+        # performance is never degraded by I/O.
+        self._write_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=10000)
+        self._write_buffer: list[str] = []
+        self._buffer_flush_interval = 0.5  # seconds
 
     # -----------------------------------------------------------------
     # Lifecycle
     # -----------------------------------------------------------------
 
     async def start(self) -> None:
-        """Start the proxy server and the injection task."""
+        """Start the proxy server, injection task, and log writer."""
         self._running = True
+        self._pause_event.clear()  # Ensure we start in running state
+
+        # Ensure log directory exists
+        self.traffic_log_path.parent.mkdir(parents=True, exist_ok=True)
+
         self._server = await asyncio.start_server(
             client_connected_cb=self._handle_connection,
             host=self.listen_host,
@@ -91,9 +114,11 @@ class Interceptor:
             f"Interceptor listening on {self.listen_host}:{self.listen_port} "
             f"-> forwarding to {self.upstream_host}:{self.upstream_port}"
         )
+        logger.info(f"Traffic log: {self.traffic_log_path}")
 
-        # Start injection task
-        asyncio.create_task(self._injection_loop())
+        # Start background tasks
+        asyncio.create_task(self._injection_loop(), name="injection_loop")
+        asyncio.create_task(self._log_writer_loop(), name="log_writer_loop")
 
     async def serve_forever(self) -> None:
         """Run the proxy server until stopped."""
@@ -104,10 +129,41 @@ class Interceptor:
     async def stop(self) -> None:
         """Gracefully shut down the proxy."""
         self._running = False
+        self._pause_event.set()  # Unblock injection loop if waiting
         if self._server:
             self._server.close()
             await self._server.wait_closed()
         logger.info("Interceptor stopped.")
+
+    # -----------------------------------------------------------------
+    # Pause / Resume (called by CrashMonitor)
+    # -----------------------------------------------------------------
+
+    def pause(self) -> None:
+        """Immediately pause mutation injection and reject new connections.
+
+        Called by the CrashMonitor when a target crash is detected.
+        Existing mutations in the queue are preserved and will be
+        flushed on resume.
+        """
+        self._pause_event.set()
+        logger.warning(
+            "Interceptor PAUSED — injection stopped, new connections rejected"
+        )
+
+    def resume(self) -> None:
+        """Resume mutation injection and accept new connections.
+
+        Called by the CrashMonitor after the target server has been
+        verified alive again following a crash reset.
+        """
+        self._pause_event.clear()
+        logger.info("Interceptor RESUMED — injection and connections active")
+
+    @property
+    def is_paused(self) -> bool:
+        """Whether the interceptor is currently paused."""
+        return self._pause_event.is_set()
 
     # -----------------------------------------------------------------
     # Connection Handling
@@ -121,6 +177,11 @@ class Interceptor:
         """Handle a single proxied client connection."""
         if self._active_connections >= self.max_connections:
             logger.warning("Max connections reached, rejecting")
+            client_writer.close()
+            return
+
+        # ── Pause check: reject new connections when paused ────────
+        if self._pause_event.is_set():
             client_writer.close()
             return
 
@@ -203,30 +264,67 @@ class Interceptor:
         is_mutated: bool = False,
         mutation_id: Optional[str] = None,
     ) -> TrafficRecord:
-        """Capture a packet and append to the traffic log."""
-        record = TrafficRecord(
+        """Capture a packet and enqueue for non-blocking log write.
+
+        Writes a simplified JSONL entry (LLM-optimized format):
+            {"timestamp": float, "direction": str, "payload": hex_string, ...}
+        """
+        self._total_captured += 1
+
+        # Write simplified JSONL entry
+        entry = json.dumps({
+            "timestamp": time.time(),
+            "direction": direction.value,
+            "payload": raw_data.hex(),
+            "length": len(raw_data),
+            "is_mutated": is_mutated,
+            "mutation_id": mutation_id,
+        })
+
+        # Non-blocking: push to write queue, drops if full
+        try:
+            self._write_queue.put_nowait(entry)
+        except asyncio.QueueFull:
+            logger.warning("Traffic log write queue full, dropping entry")
+
+        logger.debug(
+            f"Captured {direction.value} {len(raw_data)} bytes "
+            f"(total: {self._total_captured})"
+        )
+        return TrafficRecord(
             direction=direction,
             raw_data=raw_data,
             is_mutated=is_mutated,
             mutation_id=mutation_id,
         )
 
-        self._total_captured += 1
+    async def _log_writer_loop(self) -> None:
+        """Background task: flushes traffic log entries to disk in batches."""
+        logger.debug("Traffic log writer started")
+        while self._running:
+            await asyncio.sleep(self._buffer_flush_interval)
+            if not self._write_buffer:
+                while not self._write_queue.empty():
+                    try:
+                        self._write_buffer.append(
+                            self._write_queue.get_nowait()
+                        )
+                    except asyncio.QueueEmpty:
+                        break
 
-        # Append to JSONL log file
-        async with self._log_lock:
+            if not self._write_buffer:
+                continue
+
             try:
-                log_line = record.model_dump_json() + "\n"
                 with open(self.traffic_log_path, "a") as f:
-                    f.write(log_line)
+                    for line in self._write_buffer:
+                        f.write(line)
+                        f.write("\n")
+                flushed = len(self._write_buffer)
+                self._write_buffer.clear()
+                logger.debug(f"Flushed {flushed} entries to {self.traffic_log_path}")
             except OSError as e:
-                logger.error(f"Failed to write traffic log: {e}")
-
-        logger.debug(
-            f"Captured {direction.value} {len(raw_data)} bytes "
-            f"(total: {self._total_captured})"
-        )
-        return record
+                logger.error(f"Failed to flush traffic log: {e}")
 
     # -----------------------------------------------------------------
     # Mutation Injection
@@ -237,6 +335,9 @@ class Interceptor:
         logger.info("Mutation injection loop started")
         while self._running:
             try:
+                # ── Pause gate: wait until resumed ──────────────
+                await self._pause_event.wait()
+
                 mutated_data = await asyncio.wait_for(
                     self._mutation_queue.get(), timeout=1.0
                 )
