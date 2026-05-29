@@ -1,0 +1,34 @@
+# =============================================================================
+# LIFA-Fuzz Dependencies
+# =============================================================================
+
+# --- Core Async ---
+asyncio-mqtt>=0.16.1        # MQTT client for async message passing (optional)
+aiofiles>=23.2.1            # Async file I/O for traffic log read/write
+
+# --- Networking & Packet Manipulation ---
+scapy>=2.5.0                # Packet capture, crafting, and dissection
+dpkt>=1.9.8                 # Fast packet parsing (alternative to scapy for raw parsing)
+
+# --- LLM Integration ---
+litellm>=1.40.0             # Provider-agnostic LLM client (OpenAI, Anthropic, etc.)
+tiktoken>=0.7.0             # Token counting for prompt budgeting
+
+# --- Data Validation & Serialization ---
+pydantic>=2.7.0             # Data models and validation (SemanticRule, TrafficSample)
+pyyaml>=6.0.1               # YAML configuration loading
+
+# --- Docker SDK (for Crash Monitor) ---
+docker>=7.0.0               # Docker Engine API client (container monitoring)
+
+# --- Testing ---
+pytest>=8.2.0               # Test framework
+pytest-asyncio>=0.23.0      # Async test support for pytest
+pytest-mock>=3.14.0         # Mocking library
+pytest-cov>=5.0.0           # Coverage reporting
+
+# --- Utilities ---
+rich>=13.7.0                # Pretty-printing for CLI output
+click>=8.1.7                # CLI argument parsing
+tenacity>=8.2.0             # Retry logic with backoff
+structlog>=24.1.0           # Structured logging (optional, alternative to stdlib logging)

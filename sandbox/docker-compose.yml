@@ -1,0 +1,80 @@
+# =============================================================================
+# LIFA-Fuzz Sandbox — Docker Compose
+# =============================================================================
+# Orchestrates the Client, Target Server, and network for Block 1.
+# Traffic flows: Client → Interceptor (proxy) → Target Server
+#
+# Usage:
+#   docker compose -f sandbox/docker-compose.yml up --build
+#   docker compose -f sandbox/docker-compose.yml down
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Target Server — the proprietary protocol we want to fuzz
+  # ---------------------------------------------------------------------------
+  target-server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: lifa-target-server
+    restart: unless-stopped
+    expose:
+      - "9000"        # Only accessible within lifa-network (not host)
+    networks:
+      - lifa-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.connect(('0.0.0.0', 9000)); s.close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 3s
+
+  # ---------------------------------------------------------------------------
+  # Interceptor — transparent TCP proxy (Fast Loop, Block 2)
+  # Sits between Client and Server. Captures + mutates traffic.
+  # ---------------------------------------------------------------------------
+  interceptor:
+    build:
+      context: ./server  # Reuse server image (Python base); replace with fast-loop image later
+      dockerfile: Dockerfile
+    container_name: lifa-interceptor
+    restart: unless-stopped
+    depends_on:
+      target-server:
+        condition: service_healthy
+    expose:
+      - "8001"        # Client connects here
+    networks:
+      - lifa-network
+    environment:
+      - UPSTREAM_HOST=target-server
+      - UPSTREAM_PORT=9000
+      - LISTEN_PORT=8001
+    command: ["python", "-c", "print('Interceptor placeholder — replace with fast_loop.interceptor')"]
+    # NOTE: In Phase 2, replace the command with the actual Fast Loop entrypoint:
+    #   command: ["python", "-m", "fast_loop.interceptor", "--config", "/app/config.yaml"]
+
+  # ---------------------------------------------------------------------------
+  # Client — sends legitimate traffic through the Interceptor to the Server
+  # ---------------------------------------------------------------------------
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+    container_name: lifa-client
+    restart: unless-stopped
+    depends_on:
+      interceptor:
+        condition: service_started
+    networks:
+      - lifa-network
+    environment:
+      - TARGET_HOST=interceptor     # Client connects to the proxy, NOT the server directly
+      - TARGET_PORT=8001            # Proxy listen port
+      - SEND_INTERVAL_MS=1000
+
+networks:
+  lifa-network:
+    driver: bridge
+    name: lifa-network

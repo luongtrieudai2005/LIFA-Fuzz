@@ -1,0 +1,90 @@
+# =============================================================================
+# LIFA-Fuzz Global Configuration
+# =============================================================================
+# All tunable parameters for the three-block architecture.
+# Override individual values via environment variables (LIFA_{SECTION}_{KEY}).
+
+# -----------------------------------------------------------------------------
+# Sandbox (Block 1)
+# -----------------------------------------------------------------------------
+sandbox:
+  driver: "docker"                # "docker" (Phase 1) or "firecracker" (Phase 4)
+  client_image: "lifa-fuzz-client:latest"
+  server_image: "lifa-fuzz-server:latest"
+  target_container: "lifa-target-server"
+  client_container: "lifa-client"
+  network_name: "lifa-network"
+  proxy_listen_port: 8001        # Port the interceptor listens on (client connects here)
+  upstream_port: 9000             # Port the target server listens on inside the sandbox
+  server_restart_delay: 2        # Seconds to wait before resetting crashed server
+
+# -----------------------------------------------------------------------------
+# Fast Loop (Block 2)
+# -----------------------------------------------------------------------------
+fast_loop:
+  # Interceptor settings
+  interceptor:
+    host: "0.0.0.0"
+    port: 8001
+    max_connections: 100         # Max concurrent proxied connections
+    connection_timeout: 30       # Seconds before dropping idle connections
+
+  # Traffic log settings
+  traffic_log:
+    path: "/tmp/lifa_traffic.log"     # Ring buffer file path
+    max_size_mb: 100                   # Max log size before rotation (MB)
+    flush_interval_ms: 100            # How often to flush to disk
+
+  # Mutation engine settings
+  mutator:
+    mode: "smart"                # "random" (bit-flip only) or "smart" (rule-based)
+    mutations_per_packet: 5      # Number of variants per captured packet
+    max_packet_size: 65535       # Cap on mutated packet size
+    rate_limit_eps: 500          # Max Executions Per Second (0 = unlimited)
+    random_flip_ratio: 0.1       # Fraction of mutations that are pure random (vs rule-based)
+
+  # Crash monitor settings
+  crash_monitor:
+    poll_interval_ms: 500        # How often to check container status
+    crash_corpus_dir: "./crashes" # Directory to save crash artifacts
+    auto_restart: true           # Automatically restart crashed target
+
+  # Rule watcher settings (receives rules from Slow Loop)
+  rule_watcher:
+    rules_file: "/tmp/lifa_rules.json"  # File watched for new rules
+    poll_interval_ms: 2000            # How often to check for rule updates
+
+# -----------------------------------------------------------------------------
+# Slow Loop (Block 3)
+# -----------------------------------------------------------------------------
+slow_loop:
+  # Traffic parser settings
+  parser:
+    read_interval_ms: 5000       # How often to read the traffic log
+    max_samples_per_batch: 20   # Max traffic samples sent to LLM per inference
+    min_samples_before_infer: 5 # Minimum samples before first LLM inference
+
+  # LLM Agent settings
+  llm_agent:
+    provider: "openai"          # litellm provider string (openai, anthropic, etc.)
+    model: "gpt-4o"             # Model name (must be supported by litellm)
+    api_key_env: "OPENAI_API_KEY"  # Environment variable holding the API key
+    max_tokens: 4096            # Max tokens for LLM response
+    temperature: 0.2            # Low temperature for consistent inference
+    timeout_seconds: 60         # Request timeout
+    max_retries: 3              # Retry count on API failure
+    retry_backoff_ms: 5000      # Base retry backoff
+
+  # Rule generator settings
+  rule_generator:
+    min_confidence: 0.5         # Minimum LLM confidence to accept a rule
+    max_rules: 200              # Max active rules (drop lowest priority if exceeded)
+    rule_output_file: "/tmp/lifa_rules.json"  # Where to write generated rules
+
+# -----------------------------------------------------------------------------
+# Shared / Global
+# -----------------------------------------------------------------------------
+global:
+  log_level: "INFO"             # DEBUG | INFO | WARNING | ERROR
+  log_format: "json"            # "json" (structured) or "text" (human-readable)
+  log_file: "/tmp/lifa_fuzz.log" # Optional: also write logs to file (empty = stdout only)
