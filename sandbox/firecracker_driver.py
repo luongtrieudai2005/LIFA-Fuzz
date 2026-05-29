@@ -57,8 +57,9 @@ logger = get_logger("sandbox.firecracker_driver")
 class FirecrackerSandbox(BaseSandbox):
     """Firecracker MicroVM sandbox backend.
 
-    Manages two MicroVMs (client + target server) with kernel-level isolation
+    Manages the target MicroVM with kernel-level isolation
     and sub-10ms snapshot/restore for crash recovery.
+    The Client runs as a local subprocess on the host.
 
     Args:
         vmlinux_path:         Path to the vmlinux kernel binary.
@@ -69,7 +70,6 @@ class FirecrackerSandbox(BaseSandbox):
         vcpu_count:          Number of vCPUs per VM.
         network_name:        Name of the Linux bridge for TAP devices.
         target_vsock_port:   Firecracker vsock port for the target VM.
-        client_vsock_port:   Firecracker vsock port for the client VM.
     """
 
     def __init__(
@@ -82,7 +82,6 @@ class FirecrackerSandbox(BaseSandbox):
         vcpu_count: int = 2,
         network_name: str = "lifa-bridge",
         target_vsock_port: int = 9000,
-        client_vsock_port: int = 8001,
     ) -> None:
         self.vmlinux_path = Path(vmlinux_path)
         self.rootfs_path = Path(rootfs_path)
@@ -92,24 +91,22 @@ class FirecrackerSandbox(BaseSandbox):
         self.vcpu_count = vcpu_count
         self.network_name = network_name
         self.target_vsock_port = target_vsock_port
-        self.client_vsock_port = client_vsock_port
 
     # -----------------------------------------------------------------
     # BaseSandbox Implementation (all TODO for Phase 4)
     # -----------------------------------------------------------------
 
     async def start(self) -> None:
-        """Boot the client and target MicroVMs.
+        """Boot the target MicroVM.
 
         Phase 4 implementation:
         1. Verify KVM availability (``/dev/kvm`` exists and accessible).
         2. Create Linux bridge and TAP devices.
         3. Boot target VM with Firecracker API (PUT /machine-config, PUT /boot-source).
-        4. Boot client VM.
-        5. Wait for both to reach networking readiness.
-        6. Take initial snapshot for fast reset_state().
+        4. Wait for target to reach networking readiness.
+        5. Take initial snapshot for fast reset_state().
 
-        Expected boot time: ~125ms per VM.
+        Expected boot time: ~125ms.
 
         TODO (Phase 4): Implement.
         """
@@ -120,7 +117,7 @@ class FirecrackerSandbox(BaseSandbox):
         )
 
     async def stop(self) -> None:
-        """Shut down and clean up both MicroVMs.
+        """Shut down and clean up the target MicroVM.
 
         Phase 4 implementation:
         1. Send cleanup action to Firecracker API (``Actions`` flush + Instance shutdown).
@@ -158,13 +155,6 @@ class FirecrackerSandbox(BaseSandbox):
         - Query VM network config to get assigned IP.
         """
         raise NotImplementedError("TODO (Phase 4): Get target VM IP from network config")
-
-    async def get_client_info(self) -> ContainerInfo:
-        """Return client VM connection info.
-
-        TODO (Phase 4): Implement.
-        """
-        raise NotImplementedError("TODO (Phase 4): Get client VM IP from network config")
 
     async def is_target_alive(self) -> None:
         """Check if the target MicroVM is running.

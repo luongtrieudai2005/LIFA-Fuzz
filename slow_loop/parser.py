@@ -1,220 +1,432 @@
 """
 slow_loop/parser.py
 ───────────────────
-Traffic Parser — converts raw binary traffic from the Fast Loop's log
-into structured JSON representations for LLM consumption.
-
-Responsibilities:
-    - Read traffic log buffer (from the Fast Loop's Interceptor).
-    - Convert raw bytes → hex strings / field breakdowns.
-    - Perform lightweight local pattern detection:
-        - Magic bytes (constant byte sequences at fixed offsets).
-        - Length fields (bytes whose value matches remaining packet length).
-        - Repeated structure (consistent field boundaries across samples).
-    - Output structured ``TrafficSample`` objects.
-
-Design:
-    The Parser is deliberately kept *lightweight* and *fast*. It does NOT
-    try to fully reverse-engineer the protocol — that's the LLM's job.
-    The Parser's job is to:
-    1. Normalize raw bytes into a format the LLM can process.
-    2. Pre-compute obvious patterns to give the LLM a head start.
+Traffic Parser — reads raw JSONL traffic from the Fast Loop, groups into
+Interaction Sessions, augments with ASCII representation, and outputs
+structured data payloads optimized for LLM comprehension.
 
 Data Flow:
-    Interceptor (Block 2) ──writes──▶ Traffic Log File ──reads──▶ Parser
-                                                               │
-                                                               ▼
-                                                    list[TrafficRecord]
-                                                               │
-                                                               ▼
-                                                    Parser.infer_basic_structure()
-                                                               │
-                                                               ▼
-                                                    dict (pattern hints)
-                                                               │
-                                                               ▼
-                                                    LLMAgent.infer_protocol()
+    shared/raw_traffic.jsonl (written by Interceptor)
+        │
+        ▼
+    TrafficParser.read_log()
+        │
+        ▼
+    list[InteractionSession]  (grouped by temporal proximity)
+        │
+        ▼
+    TrafficParser.format_for_llm()  → JSON payload for LLMAgent
 
-TODO (Phase 3):
-    - [ ] Implement traffic log reader (file/redis stream)
-    - [ ] Implement bytes_to_hex()
-    - [ ] Implement infer_basic_structure() pattern detection
-    - [ ] Implement batch reading with configurable interval
-    - [ ] Add traffic log rotation handling
+Session Grouping Logic:
+    Packets are grouped into "sessions" based on temporal gaps:
+    - If the time delta between consecutive packets exceeds a threshold
+      (default: 2 seconds), a new session begins.
+    - This approximates TCP connection boundaries without needing session IDs
+      in the raw log.
+
+ASCII Augmentation:
+    For each packet, the parser adds a readable ASCII column:
+        - Printable ASCII chars (0x20-0x7E) are shown as-is.
+        - Non-printable bytes are shown as ``.`` (dot).
+    This gives the LLM immediate visual context alongside the hex.
+
+Output Format:
+    The LLM payload is a JSON object with:
+    {
+        "session_count": int,
+        "sessions": [
+            {
+                "session_id": int,
+                "packet_count": int,
+                "total_bytes": int,
+                "packets": [
+                    {
+                        "seq": int,
+                        "direction": str,
+                        "hex": "deadbeef0005",
+                        "ascii": "....?",
+                        "length": int
+                    }
+                ]
+            }
+        ]
+    }
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
+import time
 from pathlib import Path
 from typing import Any, Optional
 
 from shared.logger import get_logger
-from shared.schemas import TrafficRecord
 
 logger = get_logger("slow_loop.parser")
 
 
-class TrafficParser:
-    """Reads raw traffic logs and produces structured data for LLM analysis.
+class InteractionSession:
+    """A group of packets representing one interaction sequence.
 
-    The Parser periodically reads from the traffic log (written by the
-    Fast Loop's Interceptor), normalizes the data, and performs lightweight
-    pattern pre-analysis.
+    Packets are grouped by temporal proximity (gap > threshold
+    starts a new session).
+
+    Attributes:
+        session_id:      Monotonically increasing session identifier.
+        packets:         List of parsed packet dicts (hex + ascii + direction).
+        start_time:      Timestamp of the first packet in the session.
+        end_time:        Timestamp of the last packet in the session.
+        total_bytes:     Total bytes across all packets in the session.
+    """
+
+    def __init__(self, session_id: int) -> None:
+        self.session_id: int = session_id
+        self.packets: list[dict[str, Any]] = []
+        self.start_time: float = 0.0
+        self.end_time: float = 0.0
+
+    @property
+    def packet_count(self) -> int:
+        return len(self.packets)
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(p.get("length", 0) for p in self.packets)
+
+    def add_packet(self, packet: dict[str, Any]) -> None:
+        """Add a parsed packet to this session."""
+        if not self.packets:
+            self.start_time = packet.get("timestamp", time.time())
+        self.end_time = packet.get("timestamp", time.time())
+        self.packets.append(packet)
+
+
+class TrafficParser:
+    """Reads raw JSONL traffic log and produces structured sessions.
 
     Args:
-        log_path:              Path to the traffic log file.
-        read_interval_ms:      How often to check for new entries (milliseconds).
-        max_samples_per_batch: Maximum samples to return per read cycle.
-
-    Example:
-        >>> parser = TrafficParser(log_path="/tmp/lifa_traffic.log")
-        >>> samples = await parser.parse_log()
-        >>> hints = parser.infer_basic_structure(samples)
+        log_path:              Path to the JSONL traffic log.
+        read_interval_ms:      How often to check for new entries.
+        session_gap_threshold: Seconds of silence before starting a new session.
+        max_packets_per_scan:  Maximum packets to process per read cycle.
     """
 
     def __init__(
         self,
-        log_path: str = "/tmp/lifa_traffic.log",
+        log_path: str = "shared/raw_traffic.jsonl",
         read_interval_ms: int = 5000,
-        max_samples_per_batch: int = 20,
+        session_gap_threshold: float = 2.0,
+        max_packets_per_scan: int = 100,
     ) -> None:
         self.log_path = Path(log_path)
         self.read_interval_ms = read_interval_ms
-        self.max_samples_per_batch = max_samples_per_batch
+        self.session_gap_threshold = session_gap_threshold
+        self.max_packets_per_scan = max_packets_per_scan
 
-        # Track read position (for incremental reads)
-        self._read_position: int = 0
-        self._total_samples_read: int = 0
+        self._last_read_position: int = 0
+        self._total_packets_read: int = 0
 
     # -----------------------------------------------------------------
-    # Core Parsing API
+    # Core API
     # -----------------------------------------------------------------
 
-    async def parse_log(self) -> list[TrafficRecord]:
-        """Read the traffic log and return parsed samples.
+    async def read_log(self) -> list[InteractionSession]:
+        """Read the JSONL log and return grouped interaction sessions.
 
         Reads incrementally from the last known position.
-        Returns up to ``max_samples_per_batch`` new entries.
+        Groups consecutive packets into sessions based on temporal gaps.
 
         Returns:
-            List of ``TrafficRecord`` objects parsed from the log.
-
-        TODO (Phase 3): Implement.
-        - Open log file at current read position
-        - Parse each line/entry into a TrafficRecord
-        - Advance read position
-        - Handle file rotation (if file shrinks, reset position)
+            List of InteractionSession objects, ordered oldest first.
         """
-        raise NotImplementedError("TODO: Implement traffic log reader")
+        if not self.log_path.exists():
+            logger.debug(f"Traffic log not found: {self.log_path}")
+            return []
+
+        try:
+            with open(self.log_path, "r") as f:
+                lines = f.readlines()
+        except OSError as e:
+            logger.error(f"Failed to read traffic log: {e}")
+            return []
+
+        # Parse new lines (incremental)
+        new_entries: list[dict[str, Any]] = []
+        for line in lines[self._last_read_position:]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                new_entries.append(entry)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Skipping malformed JSONL line: {e}")
+                continue
+
+        self._last_read_position = len(lines)
+        self._total_packets_read += len(new_entries)
+
+        if not new_entries:
+            return []
+
+        # Group into sessions
+        sessions = self._group_into_sessions(new_entries)
+
+        logger.info(
+            f"Read {len(new_entries)} new packets "
+            f"-> {len(sessions)} interaction sessions"
+        )
+        return sessions
+
+    def format_for_llm(self, sessions: list[InteractionSession]) -> dict[str, Any]:
+        """Format sessions into a structured JSON payload for the LLM.
+
+        The output is designed to give the LLM maximum context:
+        - Clear session boundaries.
+        - Both hex AND ASCII representation side by side.
+        - Packet counts and byte totals for pattern detection.
+
+        Args:
+            sessions: The interaction sessions to format.
+
+        Returns:
+            A dict ready to be serialized as JSON and sent to the LLM.
+        """
+        session_dicts: list[dict[str, Any]] = []
+
+        for session in sessions:
+            packets: list[dict[str, Any]] = []
+            for idx, pkt in enumerate(session.packets):
+                packets.append({
+                    "seq": idx,
+                    "direction": pkt.get("direction", "unknown"),
+                    "hex": pkt.get("payload", ""),
+                    "ascii": self._bytes_to_ascii(
+                        pkt.get("payload", "")
+                    ),
+                    "length": pkt.get("length", len(bytes.fromhex(pkt.get("payload", "")))),
+                })
+            session_dicts.append({
+                "session_id": session.session_id,
+                "packet_count": session.packet_count,
+                "total_bytes": session.total_bytes,
+                "packets": packets,
+            })
+
+        return {
+            "session_count": len(session_dicts),
+            "sessions": session_dicts,
+            "parser_note": (
+                "Analyze the hex dumps below. Identify magic bytes, "
+                "length fields, checksums, enum values, and any "
+                "field boundaries that repeat across sessions."
+            ),
+        }
 
     # -----------------------------------------------------------------
-    # Byte Conversion
+    # Session Grouping
+    # -----------------------------------------------------------------
+
+    def _group_into_sessions(
+        self, entries: list[dict[str, Any]]
+    ) -> list[InteractionSession]:
+        """Group entries into sessions based on temporal gaps.
+
+        Consecutive packets with a time gap <= ``session_gap_threshold``
+        belong to the same session. A gap exceeding the threshold
+        starts a new session.
+
+        Args:
+            entries: Parsed JSONL entries, ordered by timestamp.
+
+        Returns:
+            List of InteractionSession objects.
+        """
+        if not entries:
+            return []
+
+        # Sort by timestamp (should already be ordered, but ensure)
+        entries.sort(key=lambda e: e.get("timestamp", 0))
+
+        sessions: list[InteractionSession] = []
+        current_session = InteractionSession(session_id=len(sessions))
+
+        for entry in entries:
+            timestamp = entry.get("timestamp", 0)
+
+            if current_session.packets:
+                gap = timestamp - current_session.end_time
+                if gap > self.session_gap_threshold:
+                    # Gap too large — start new session
+                    sessions.append(current_session)
+                    current_session = InteractionSession(
+                        session_id=len(sessions)
+                    )
+
+            current_session.add_packet(entry)
+
+        sessions.append(current_session)
+        return sessions
+
+    # -----------------------------------------------------------------
+    # ASCII Conversion
     # -----------------------------------------------------------------
 
     @staticmethod
-    def bytes_to_hex(data: bytes, separator: str = " ") -> str:
-        """Convert raw bytes to a space-separated hex string.
+    def _bytes_to_ascii(hex_str: str) -> str:
+        """Convert a hex string to a human-readable ASCII representation.
 
-        E.g., ``b'\\xde\\xad\\xbe\\xef'`` → ``"de ad be ef"``
+        Printable ASCII characters (0x20–0x7E) are shown as-is.
+        All other bytes are represented as ``.`` (dot).
+
+        Examples:
+            "deadbeef0005" → "?????."
+            "48454c4c4f"  → "HELLO"
+            "00010203ff"   → "....?"
 
         Args:
-            data:       Raw bytes to convert.
-            separator:  String between each byte's hex representation.
+            hex_str: Hex string (e.g., "deadbeef").
 
         Returns:
-            A human-readable hex string.
-
-        TODO (Phase 3): Implement.
+            ASCII representation string of the same length.
         """
-        raise NotImplementedError("TODO: Implement hex conversion")
+        result: list[str] = []
+        for i in range(0, len(hex_str), 2):
+            hex_byte = hex_str[i:i+2]
+            if len(hex_byte) < 2:
+                result.append(".")
+                continue
+            byte_val = int(hex_byte, 16)
+            if 0x20 <= byte_val <= 0x7E:
+                result.append(chr(byte_val))
+            else:
+                result.append(".")
+        return "".join(result)
 
     @staticmethod
     def hex_to_bytes(hex_str: str) -> bytes:
-        """Convert a hex string back to bytes.
+        """Convert a hex string to bytes.
 
-        Handles both space-separated (``"de ad be ef"``) and
-        contiguous (``"deadbeef"``) formats.
+        Handles both contiguous ("deadbeef") and space-separated
+        ("de ad be ef") formats.
 
         Args:
             hex_str: Hex string to convert.
 
         Returns:
             Raw bytes.
-
-        TODO (Phase 3): Implement.
         """
-        raise NotImplementedError("TODO: Implement hex-to-bytes conversion")
+        cleaned = hex_str.replace(" ", "")
+        if len(cleaned) % 2 != 0:
+            raise ValueError(f"Odd-length hex string: {hex_str!r}")
+        return bytes.fromhex(cleaned)
 
     # -----------------------------------------------------------------
-    # Lightweight Pattern Detection
-    # -----------------------------------------------------------------
-
-    def infer_basic_structure(
-        self,
-        samples: list[TrafficRecord],
-    ) -> dict[str, Any]:
-        """Perform lightweight local pattern detection on traffic samples.
-
-        This is a *pre-analysis* step that gives the LLM hints about
-        obvious patterns. It does NOT attempt full protocol inference.
-
-        Detected patterns:
-        - **magic_bytes**: Constant byte sequences at the same offset across samples.
-        - **length_fields**: Bytes whose value equals (total_length - offset).
-        - **header_boundary**: If there's a consistent size before variable-length data.
-        - **common_byte_values**: Most frequent byte at each offset.
-
-        Args:
-            samples: List of TrafficRecord objects to analyze.
-
-        Returns:
-            A dict with detected patterns:
-            ``{
-                "magic_bytes": "DEADBEEF",
-                "suspected_length_field_offset": 4,
-                "header_size_estimate": 16,
-                "sample_count": 42,
-            }``
-
-        TODO (Phase 3): Implement.
-        """
-        raise NotImplementedError("TODO: Implement basic pattern detection")
-
-    # -----------------------------------------------------------------
-    # Helpers
+    # Lightweight Pattern Detection (pre-analysis)
     # -----------------------------------------------------------------
 
     @staticmethod
-    def find_common_prefix(samples: list[TrafficRecord]) -> tuple[int, bytes]:
-        """Find the longest common byte prefix across all client→server samples.
+    def find_common_prefix(
+        sessions: list[InteractionSession],
+        direction: str = "client_to_server",
+    ) -> tuple[int, str]:
+        """Find the longest common byte prefix across all client→server packets.
 
-        This is useful for detecting magic bytes / protocol headers.
+        Useful for detecting magic bytes / protocol headers.
 
         Args:
-            samples: Traffic records to analyze.
+            sessions: Interaction sessions to analyze.
+            direction: Which direction to analyze.
 
         Returns:
-            Tuple of (prefix_length, prefix_bytes).
-
-        TODO (Phase 3): Implement.
+            Tuple of (prefix_length, hex_string).
         """
-        raise NotImplementedError("TODO: Implement common prefix detection")
+        all_hex: list[str] = []
+        for session in sessions:
+            for pkt in session.packets:
+                if pkt.get("direction") == direction:
+                    all_hex.append(pkt.get("payload", ""))
+
+        if not all_hex:
+            return (0, "")
+
+        prefix = all_hex[0]
+        for hex_data in all_hex[1:]:
+            # Find common prefix length in characters (2 chars = 1 byte)
+            common_len = 0
+            for i in range(0, min(len(prefix), len(hex_data))):
+                if i + 2 > len(hex_data):
+                    break
+                if prefix[i:i+2] == hex_data[i:i+2]:
+                    common_len = i + 2
+                else:
+                    break
+            prefix = prefix[:common_len]
+
+        return (len(prefix) // 2, prefix)
 
     @staticmethod
     def detect_length_field(
-        samples: list[TrafficRecord],
-    ) -> Optional[dict[str, int]]:
-        """Heuristic: find a byte range whose value correlates with packet length.
+        sessions: list[InteractionSession],
+    ) -> Optional[dict[str, Any]]:
+        """Heuristic: find a byte range whose decoded value correlates
+        with packet length.
 
-        Checks 1, 2, and 4-byte fields at each offset to see if their
-        decoded value is close to the total packet length.
+        Checks 1, 2, and 4-byte fields at each offset.
 
         Args:
-            samples: Traffic records to analyze.
+            sessions: Interaction sessions to analyze.
 
         Returns:
-            Dict with ``offset``, ``size``, ``correlation`` if found, else None.
-
-        TODO (Phase 3): Implement.
+            Dict with ``offset``, ``size``, ``correlation`` if found.
         """
-        raise NotImplementedError("TODO: Implement length field detection")
+        all_hex: list[str] = []
+        for session in sessions:
+            for pkt in session.packets:
+                if pkt.get("direction") == "client_to_server":
+                    all_hex.append(pkt.get("payload", ""))
+
+        if len(all_hex) < 5:
+            return None
+
+        # Check offsets for 1, 2, 4-byte fields
+        max_offset = min(len(h) for h in all_hex) // 2
+        best_offset = 0
+        best_size = 2
+        best_corr = 0.0
+
+        for offset in range(0, max(0, max_offset - 1)):
+            for size in (1, 2, 4):
+                byte_count = 0
+                total_corr = 0.0
+                for hex_data in all_hex:
+                    pkt_len = len(hex_data) // 2
+                    end = offset + size
+                    if end * 2 > len(hex_data) or offset * 2 >= len(hex_data):
+                        continue
+                    try:
+                        field_bytes = bytes.fromhex(hex_data[offset * 2:end * 2])
+                        field_val = int.from_bytes(
+                            field_bytes, byteorder="little"
+                        )
+                        if field_val == pkt_len - (offset + size):
+                            total_corr += 1.0
+                        byte_count += 1
+                    except (ValueError, IndexError):
+                        continue
+
+                if byte_count > 0:
+                    corr = total_corr / byte_count
+                    if corr > best_corr:
+                        best_corr = corr
+                        best_offset = offset
+                        best_size = size
+
+        if best_corr >= 0.5:
+            return {
+                "offset": best_offset,
+                "size": best_size,
+                "correlation": round(best_corr, 2),
+            }
+        return None

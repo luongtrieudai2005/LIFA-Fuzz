@@ -20,12 +20,23 @@ Thumbs.db
 *.Zone.Identifier
 **/*.Zone.Identifier
 
+# Core dumps
+core.*
+**/core.*
+
 # LIFA-Fuzz runtime
 /tmp/lifa_traffic.log
 /tmp/lifa_rules.json
 /tmp/lifa_fuzz.log
 /test_interceptor_log.log
 crashes/
+shared/raw_traffic.jsonl
+shared/llm_last_inference.json
+logs/
+
+# Evaluation generated outputs (keep source, ignore results)
+evaluation/results/
+evaluation/plots/
 
 # Docker
 .docker/

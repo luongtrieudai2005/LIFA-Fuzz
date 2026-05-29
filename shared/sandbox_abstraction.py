@@ -118,8 +118,8 @@ class BaseSandbox(abc.ABC):
     async def start(self) -> None:
         """Launch the sandbox environment.
 
-        Brings up both the client and target server instances.
-        Must wait until both are ready to accept connections.
+        Brings up the target server instance.
+        Must wait until the target is ready to accept connections.
 
         Raises:
             SandboxError: If the sandbox fails to start.
@@ -130,7 +130,7 @@ class BaseSandbox(abc.ABC):
     async def stop(self) -> None:
         """Shut down and destroy the sandbox environment.
 
-        Cleans up all containers/VMs and releases network resources.
+        Cleans up the target container/VM and releases network resources.
         Must be safe to call even if the sandbox is partially running.
 
         Raises:
@@ -162,17 +162,6 @@ class BaseSandbox(abc.ABC):
         """Return connection details for the target server.
 
         Used by the Interceptor to know where to forward traffic.
-
-        Returns:
-            ContainerInfo with host, port, and status.
-        """
-        ...
-
-    @abc.abstractmethod
-    async def get_client_info(self) -> ContainerInfo:
-        """Return connection details for the client instance.
-
-        Used for diagnostics and traffic generation.
 
         Returns:
             ContainerInfo with host, port, and status.

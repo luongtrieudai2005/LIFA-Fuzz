@@ -4,32 +4,53 @@
 
 ---
 
-## Overview: Three-Block Architecture
+## Overview: Three-Block + Fusion Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         LIFA-Fuzz System                            │
-│                                                                     │
-│  ┌──────────────────┐     ┌──────────────────────┐                │
-│  │   Block 1        │     │   Block 2            │                │
-│  │   Sandbox        │────▶│   Fast Loop          │                │
-│  │   (Isolation)    │     │   (Fuzzing Engine)   │                │
-│  │                  │     │                      │                │
-│  │  Client ◄──────▶ │     │  Interceptor         │                │
-│  │    Proxy ◄──────▶ │     │  Mutator             │                │
-│  │    Server        │     │  Crash Monitor       │                │
-│  └──────────────────┘     └──────────┬───────────┘                │
-│                                      │                             │
-│                         ┌────────────┘                             │
-│                         ▼                                          │
-│            ┌────────────────────────┐                             │
-│            │   Block 3              │                             │
-│            │   Slow Loop            │                             │
-│            │   (LLM Brain)          │                             │
-│            │                        │                             │
-│            │  Parser → LLM → Rules │                             │
-│            └────────────────────────┘                             │
-└─────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────┐
+│                            LIFA-Fuzz System                               │
+│                                                                           │
+│  ┌──────────────────┐     ┌──────────────────────┐                       │
+│  │   Block 1        │     │   Block 2            │                       │
+│  │   Sandbox        │────▶│   Fast Loop          │                       │
+│  │   (Isolation)    │     │   (Fuzzing Engine)   │                       │
+│  │                  │     │                      │                       │
+│  │  Client ◄──────▶ │     │  Interceptor         │                       │
+│  │    Proxy ◄──────▶ │     │  Mutator             │                       │
+│  │    Server        │     │  Crash Monitor       │──▶ CrashManager       │
+│  └──────────────────┘     └──────────┬───────────┘    (dedup + isolate)  │
+│                                      │                                    │
+│                         ┌────────────┘                                    │
+│                         ▼                                                 │
+│            ┌─────────────────────────────────────────┐                    │
+│            │   Block 3: Neural-Mathematical Fusion    │                    │
+│            │                                           │                    │
+│            │   Parser ──▶ DifferentialAnalyzer ──┐    │                    │
+│            │        │                        │    │    │                    │
+│            │        │    ┌───────────────────┘    │    │                    │
+│            │        │    ▼                         │    │                    │
+│            │        │  HeatmapResult               │    │                    │
+│            │        │    ├─ to_llm_hint() ──▶ LLM  │    │                    │
+│            │        │    └─ to_field_rules() ──┐   │    │                    │
+│            │        │                         │   │    │                    │
+│            │        │              Bootstrap Fallback  │                    │
+│            │        │              (if LLM fails)│   │    │                    │
+│            │        ▼                         ▼   │    │                    │
+│            │   RulesOrchestrator ──▶ RuleGenerator   │                    │
+│            │                           │             │                    │
+│            │                           ▼             │                    │
+│            │                    active_rules.json     │                    │
+│            └─────────────────────────────────────────┘                    │
+│                                                                           │
+│  ┌──────────────────────────────────────────────────┐                     │
+│  │   Evaluation Framework (Phase 7)                  │                     │
+│  │                                                    │                     │
+│  │   TelemetryCollector ──▶ telemetry.jsonl           │                     │
+│  │   RQ1 Accuracy ──▶ P/R/F1 vs Ground Truth        │                     │
+│  │   EvaluationRunner ──▶ 3 Baselines (A/B/C)        │                     │
+│  │   PlotGenerator ──▶ Paper-ready PNGs              │                     │
+│  └──────────────────────────────────────────────────┘                     │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -387,7 +408,132 @@ Both loops run as **separate processes** communicating via file-based IPC. This 
 ## Design Principles
 
 1. **Decoupling** — Fast Loop never waits on Slow Loop. They communicate asynchronously via files/IPC.
-2. **Resilience** — If the LLM call fails, the Fast Loop continues with existing rules (degraded mode).
+2. **Resilience** — If the LLM call fails, the Fast Loop continues with existing rules (degraded mode), or bootstrap rules from the DifferentialAnalyzer.
 3. **Evolvability** — New mutation strategies are added as new `SemanticRule` types without modifying the Interceptor.
 4. **Observability** — Every packet, mutation, rule update, and crash is logged with structured logging.
 5. **Reproducibility** — All fuzz inputs and crash artifacts are saved for replay.
+6. **No Starvation** — The fuzzer never runs without rules: DifferentialAnalyzer produces bootstrap FieldRules in <1ms when the LLM is unavailable.
+
+---
+
+## Neural-Mathematical Fusion Loop (Phase 6)
+
+### Purpose
+
+Bridge the **mathematical pre-processing layer** (`DifferentialAnalyzer`) with the **neural inference layer** (`LLMAgent`) so the LLM receives a pre-computed statistical heatmap and focuses on semantic naming rather than raw byte discovery.
+
+### Architecture
+
+```
+Raw Client Packets
+        │
+        ▼
+┌─────────────────────────┐
+│  DifferentialAnalyzer    │  ← Pure math, <1ms, stateless
+│  (Shannon H, Pearson r,  │
+│   Kendall τ per offset)  │
+│                           │
+│  Output: HeatmapResult   │
+│    ├─ to_llm_hint()      │──▶ Injected into LLM prompt
+│    └─ to_field_rules()   │──▶ Bootstrap rules if LLM fails
+└─────────────────────────┘
+        │
+        ▼ math_hint parameter
+┌─────────────────────────┐
+│  LLMAgent                │  ← Neural layer, ~60s per inference
+│  infer_protocol(         │
+│    traffic_input,        │
+│    math_hint=heatmap     │  ← Fusion: math + neural
+│  )                       │
+│                           │
+│  Output: ProtocolGrammar │
+└─────────────────────────┘
+        │
+        ▼
+┌─────────────────────────┐
+│  RulesOrchestrator       │
+│                           │
+│  If LLM succeeds:        │
+│    grammar → SemanticRules│
+│                           │
+│  If LLM fails:           │
+│    heatmap.to_field_rules│──▶ Bootstrap SemanticRules
+│    (fuzzer never starves)│
+└─────────────────────────┘
+```
+
+### Key Components
+
+| Component | File | Speed | Purpose |
+|-----------|------|-------|---------|
+| DifferentialAnalyzer | `slow_loop/differential_analyzer.py` | <1ms | Classify byte offsets (STATIC/CALCULATED/HIGH_ENTROPY/LOW_ENTROPY) |
+| CrashManager | `shared/crash_manager.py` | O(1) lookup | Two-level crash dedup (SHA256 primary + structural secondary) |
+| RulesOrchestrator | `slow_loop/rules_orchestrator.py` | Pipeline | Orchestrates math → LLM → rules with bootstrap fallback |
+
+### Crash Isolation (Precision Mode)
+
+When `CrashManager` detects unique crashes, the orchestrator enters **precision mode (k=1)**:
+- Fast Loop reduces to single-field-at-a-time mutations
+- Enables precise attribution of which field triggered the crash
+- Remains in precision mode until operator resets
+
+### Fusion System Prompt Guidelines
+
+The LLM receives `SYSTEM_PROMPT_FUSION_APPEND` instructing it to:
+- RESPECT all STATIC labels — do NOT propose mutating those offsets
+- Focus BOUNDARY_VALUES strategies on CALCULATED fields (length, sequence)
+- Use BIT_FLIP on LOW_ENTROPY regions, RANDOM_BYTES on HIGH_ENTROPY
+- Explain how findings ALIGN or CONTRADICT the heatmap in the `reasoning` field
+
+---
+
+## Evaluation Framework (Phase 7)
+
+### Purpose
+
+Automated academic benchmarking producing empirical data for three research questions:
+
+| RQ | Question | Metric |
+|----|----------|--------|
+| RQ1 | How precisely does LIFA-Fuzz infer protocol grammar? | Precision, Recall, F1-Score vs ground truth |
+| RQ2 | Does the async architecture maintain high throughput? | EPS over time across 3 baselines |
+| RQ3 | Does full fusion find crashes faster and discover more? | Cumulative unique crashes, time-to-first-crash |
+
+### Three Baseline Configurations
+
+| Baseline | Mutator | Math Layer | LLM | Expected Behavior |
+|----------|---------|-----------|-----|-------------------|
+| **A** (Pure Random) | `random` | OFF | OFF | Brute-force fuzzing, late crash discovery |
+| **B** (Math-Only) | `smart` | ON | OFF | Bootstrap rules from analyzer, earlier crashes |
+| **C** (Full Fusion) | `smart` | ON | ON | Complete pipeline, fastest crash discovery |
+
+### Evaluation Components
+
+| File | Purpose |
+|------|---------|
+| `evaluation/ground_truth.py` | LIFA protocol definition (magic + opcode + length + payload) |
+| `evaluation/rq1_accuracy.py` | P/R/F1 evaluator with ±1 byte tolerance |
+| `evaluation/telemetry_collector.py` | Real-time 10s JSONL snapshot (EPS, crashes, tokens) |
+| `evaluation/evaluation_runner.py` | 3-baseline experiment orchestrator |
+| `evaluation/plot_generator.py` | Paper-ready PNG plots (matplotlib) |
+
+### Generated Plots
+
+| Plot | File | Research Question |
+|------|------|-------------------|
+| EPS Over Time | `evaluation/plots/rq2_eps_over_time.png` | RQ2: Throughput comparison |
+| Cumulative Crashes | `evaluation/plots/rq3_cumulative_crashes.png` | RQ3: Vulnerability discovery |
+| Accuracy Bars | `evaluation/plots/rq1_accuracy_bars.png` | RQ1: Grammar inference accuracy |
+
+### CLI Commands
+
+```bash
+# RQ1 accuracy evaluation (no Docker needed):
+python -m evaluation.rq1_accuracy
+
+# Generate synthetic data + plots (no Docker needed):
+python -m evaluation.plot_generator --synthetic
+
+# Full benchmark (requires Docker, 5 min per baseline):
+python -m evaluation.evaluation_runner --duration 300
+```

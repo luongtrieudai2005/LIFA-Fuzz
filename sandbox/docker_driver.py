@@ -1,17 +1,19 @@
 """
 sandbox/docker_driver.py
 ───────────────────────
-Docker-based sandbox backend — fully functional for local testing.
+Docker-based sandbox backend — manages ONLY the Target Server container.
+
+The Client runs as a lightweight local subprocess (see ``fast_loop/client_process.py``),
+connecting to the Interceptor on the host. This eliminates unnecessary container
+overhead since the Client is a trusted component that never crashes.
 
 Implements ``BaseSandbox`` using the Docker Engine API.
-This is the development/testing harness. For production fuzzing,
-swap to ``FirecrackerSandbox`` (Phase 4) for kernel-level isolation
-and < 10ms snapshot/restore.
+For production fuzzing, swap to ``FirecrackerSandbox`` (Phase 4) for
+kernel-level isolation and < 10ms snapshot/restore.
 """
 
 from __future__ import annotations
 
-import asyncio
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -30,54 +32,47 @@ from shared.sandbox_abstraction import (
     SandboxError,
     SandboxResetError,
     SandboxStartError,
+    register_driver,
 )
 
 logger = get_logger("sandbox.docker_driver")
 
 
 class DockerSandbox(BaseSandbox):
-    """Docker-based sandbox — the local development backend.
+    """Docker-based sandbox — manages the target container only.
 
-    Manages two containers on an isolated bridge network.
-    All operations go through the Docker Engine API (docker-py).
+    The Client runs as a local subprocess on the host, not inside Docker.
 
     Args:
-        network_name:       Docker bridge network name.
-        target_image_tag:   Tag for the target server image.
-        client_image_tag:   Tag for the client image.
-        target_container:   Container name for the target.
-        client_container:   Container name for the client.
+        network_name:         Docker bridge network name.
+        target_image_tag:     Tag for the target server image.
+        target_container:     Container name for the target.
         target_internal_port: Port the server listens on inside the container.
-        proxy_listen_port:   Port exposed on the host for the Interceptor.
-        restart_delay_s:     Seconds to wait after reset_state().
-        build_context:       Path to the directory containing Dockerfiles.
+        proxy_listen_port:    Port exposed on the host for the Interceptor.
+        restart_delay_s:      Seconds to wait after reset_state().
+        build_context:        Path to the directory containing the server Dockerfile.
     """
 
     def __init__(
         self,
         network_name: str = "lifa-network",
         target_image_tag: str = "lifa-target-server:latest",
-        client_image_tag: str = "lifa-client:latest",
         target_container: str = "lifa-target-server",
-        client_container: str = "lifa-client",
         target_internal_port: int = 9000,
         proxy_listen_port: int = 8001,
         restart_delay_s: float = 2.0,
-        build_context: str = ".",
+        build_context: str = "sandbox/target",
     ) -> None:
         self.network_name = network_name
         self.target_image_tag = target_image_tag
-        self.client_image_tag = client_image_tag
         self.target_container = target_container
-        self.client_container = client_container
         self.target_internal_port = target_internal_port
         self.proxy_listen_port = proxy_listen_port
         self.restart_delay_s = restart_delay_s
         self.build_context = Path(build_context)
 
-        self._client: Optional[docker.DockerClient] = None
+        self._docker_client: Optional[docker.DockerClient] = None
         self._target: Optional[Container] = None
-        self._client_container: Optional[Container] = None
         self._network: Optional[Network] = None
 
     # -----------------------------------------------------------------
@@ -85,32 +80,25 @@ class DockerSandbox(BaseSandbox):
     # -----------------------------------------------------------------
 
     def _docker(self) -> docker.DockerClient:
-        if self._client is None:
-            self._client = docker.from_env()
-        return self._client
+        if self._docker_client is None:
+            self._docker_client = docker.from_env()
+        return self._docker_client
 
     # -----------------------------------------------------------------
     # BaseSandbox Implementation
     # -----------------------------------------------------------------
 
     async def start(self) -> None:
-        """Build images, create network, and start both containers."""
+        """Build target image, create network, and start target container."""
         client = self._docker()
-        logger.info("Starting Docker sandbox...")
+        logger.info("Starting Docker sandbox (target only)...")
 
         try:
-            # 1. Build images
+            # 1. Build target image
             logger.info("Building target server image...")
             client.images.build(
                 path=str(self.build_context / "server"),
                 tag=self.target_image_tag,
-                rm=True,
-            )
-
-            logger.info("Building client image...")
-            client.images.build(
-                path=str(self.build_context / "client"),
-                tag=self.client_image_tag,
                 rm=True,
             )
 
@@ -124,43 +112,27 @@ class DockerSandbox(BaseSandbox):
                 name=self.target_container,
                 network=self.network_name,
                 detach=True,
-                ports={f"{self.target_internal_port}/tcp": None},  # No host port needed (interceptor connects via network)
+                ports={f"{self.target_internal_port}/tcp": self.target_internal_port},
             )
 
             # 4. Wait for target to be ready
             self._wait_for_running(self.target_container, timeout_s=15)
             logger.info("Target server is running.")
-
-            # 5. Start client
-            logger.info(f"Starting client container '{self.client_container}'...")
-            self._client_container = client.containers.run(
-                image=self.client_image_tag,
-                name=self.client_container,
-                network=self.network_name,
-                detach=True,
-                environment={
-                    "TARGET_HOST": self.target_container,
-                    "TARGET_PORT": str(self.target_internal_port),
-                    "SEND_INTERVAL_MS": "1000",
-                },
-            )
-            logger.info("Client is running.")
             logger.info("Docker sandbox started successfully.")
 
         except APIError as e:
             raise SandboxStartError(f"Failed to start Docker sandbox: {e}", driver="docker") from e
 
     async def stop(self) -> None:
-        """Stop and remove all containers and the network."""
+        """Stop and remove the target container and network."""
         client = self._docker()
 
-        for name in [self.client_container, self.target_container]:
-            try:
-                container = client.containers.get(name)
-                container.remove(force=True)
-                logger.info(f"Removed container '{name}'")
-            except NotFound:
-                logger.debug(f"Container '{name}' not found (already removed)")
+        try:
+            container = client.containers.get(self.target_container)
+            container.remove(force=True)
+            logger.info(f"Removed container '{self.target_container}'")
+        except NotFound:
+            logger.debug(f"Container '{self.target_container}' not found (already removed)")
 
         try:
             network = client.networks.get(self.network_name)
@@ -170,7 +142,6 @@ class DockerSandbox(BaseSandbox):
             logger.debug(f"Network '{self.network_name}' not found (already removed)")
 
         self._target = None
-        self._client_container = None
         self._network = None
 
     async def reset_state(self) -> None:
@@ -192,21 +163,7 @@ class DockerSandbox(BaseSandbox):
 
         return ContainerInfo(
             name=self.target_container,
-            host=self.target_container,  # Docker DNS name inside the network
-            port=self.target_internal_port,
-            internal_port=self.target_internal_port,
-            status=container.status,
-            exit_code=container.attrs["State"].get("ExitCode"),
-        )
-
-    async def get_client_info(self) -> ContainerInfo:
-        """Return client container connection info."""
-        container = self._docker().containers.get(self.client_container)
-        container.reload()
-
-        return ContainerInfo(
-            name=self.client_container,
-            host=self.client_container,
+            host=self.target_container,
             port=self.target_internal_port,
             internal_port=self.target_internal_port,
             status=container.status,
@@ -244,11 +201,29 @@ class DockerSandbox(BaseSandbox):
             return None
 
     async def get_network_config(self) -> dict[str, Any]:
-        """Return the sandbox network topology."""
+        """Return the sandbox network topology.
+
+        Resolves the host-accessible address for the target container.
+        When running from the host (not inside Docker), the interceptor
+        needs ``localhost:<mapped_port>`` rather than the Docker DNS name.
+        """
+        host_port = self.target_internal_port
+        try:
+            container = self._docker().containers.get(self.target_container)
+            container.reload()
+            port_bindings = container.attrs.get(
+                "NetworkSettings", {}
+            ).get("Ports", {})
+            port_key = f"{self.target_internal_port}/tcp"
+            if port_key in port_bindings and port_bindings[port_key]:
+                host_port = int(port_bindings[port_key][0]["HostPort"])
+        except Exception:
+            pass
+
         return {
             "network_name": self.network_name,
-            "target_host": self.target_container,
-            "target_port": self.target_internal_port,
+            "target_host": "127.0.0.1",
+            "target_port": host_port,
             "proxy_listen_port": self.proxy_listen_port,
             "sandbox_type": "docker",
         }

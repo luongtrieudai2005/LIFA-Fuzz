@@ -1,80 +1,74 @@
 # =============================================================================
-# LIFA-Fuzz Sandbox — Docker Compose
+# LIFA-Fuzz — Docker Compose
 # =============================================================================
-# Orchestrates the Client, Target Server, and network for Block 1.
-# Traffic flows: Client → Interceptor (proxy) → Target Server
+# Services:
+#   - target_server:  Vulnerable C server (the fuzz target)
+#   - web_dashboard:  Streamlit monitoring UI
+#
+# The Interceptor, Mutator, CrashMonitor, and Client all run on the host
+# via `python main.py`.
 #
 # Usage:
-#   docker compose -f sandbox/docker-compose.yml up --build
+#   # Start target + dashboard:
+#   docker compose -f sandbox/docker-compose.yml up --build -d
+#
+#   # Start fuzzer (host):
+#   LLM_MODE=MOCK python main.py
+#
+#   # Dashboard: http://localhost:8501
+#   # Stop:
 #   docker compose -f sandbox/docker-compose.yml down
 # =============================================================================
 
 services:
   # ---------------------------------------------------------------------------
-  # Target Server — the proprietary protocol we want to fuzz
+  # Vulnerable Target Server — C binary with LIFA protocol + stack overflow
+  # Built from sandbox/target/Dockerfile (compiles vulnerable_server.c)
+  # Access: localhost:9000
   # ---------------------------------------------------------------------------
-  target-server:
+  target_server:
     build:
-      context: ./server
+      context: ./target
       dockerfile: Dockerfile
     container_name: lifa-target-server
     restart: unless-stopped
-    expose:
-      - "9000"        # Only accessible within lifa-network (not host)
+    ports:
+      - "9000:9000"
     networks:
       - lifa-network
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.connect(('0.0.0.0', 9000)); s.close()"]
-      interval: 5s
-      timeout: 3s
+      test: ["CMD-SHELL", "echo 'health' | nc -w 1 localhost 9000 || exit 0"]
+      interval: 10s
+      timeout: 5s
       retries: 3
-      start_period: 3s
+      start_period: 5s
 
   # ---------------------------------------------------------------------------
-  # Interceptor — transparent TCP proxy (Fast Loop, Block 2)
-  # Sits between Client and Server. Captures + mutates traffic.
+  # Web Dashboard — Streamlit real-time monitoring UI
+  # Reads host's shared/ and crashes/ via bind mounts for live metrics.
+  # Access: http://localhost:8501
   # ---------------------------------------------------------------------------
-  interceptor:
+  web_dashboard:
     build:
-      context: ./server  # Reuse server image (Python base); replace with fast-loop image later
+      context: ../web_ui
       dockerfile: Dockerfile
-    container_name: lifa-interceptor
+    container_name: lifa-dashboard
     restart: unless-stopped
-    depends_on:
-      target-server:
-        condition: service_healthy
-    expose:
-      - "8001"        # Client connects here
-    networks:
-      - lifa-network
+    ports:
+      - "8501:8501"
+    volumes:
+      - ../shared:/app/shared:ro        # Bind-mount host shared/ (read-only)
+      - ../crashes:/app/crashes:ro      # Bind-mount host crashes/ (read-only)
     environment:
-      - UPSTREAM_HOST=target-server
-      - UPSTREAM_PORT=9000
-      - LISTEN_PORT=8001
-    command: ["python", "-c", "print('Interceptor placeholder — replace with fast_loop.interceptor')"]
-    # NOTE: In Phase 2, replace the command with the actual Fast Loop entrypoint:
-    #   command: ["python", "-m", "fast_loop.interceptor", "--config", "/app/config.yaml"]
-
-  # ---------------------------------------------------------------------------
-  # Client — sends legitimate traffic through the Interceptor to the Server
-  # ---------------------------------------------------------------------------
-  client:
-    build:
-      context: ./client
-      dockerfile: Dockerfile
-    container_name: lifa-client
-    restart: unless-stopped
-    depends_on:
-      interceptor:
-        condition: service_started
-    networks:
-      - lifa-network
-    environment:
-      - TARGET_HOST=interceptor     # Client connects to the proxy, NOT the server directly
-      - TARGET_PORT=8001            # Proxy listen port
-      - SEND_INTERVAL_MS=1000
+      - LIFA_DATA_DIR=/app
+    healthcheck:
+      test: ["CMD", "python", "-c",
+        "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 networks:
   lifa-network:
     driver: bridge
-    name: lifa-network
