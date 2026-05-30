@@ -41,8 +41,22 @@ evaluation/plots/
 # Docker
 .docker/
 
+# Firecracker — ignore large binaries and kernel source, keep build scripts
+sandbox/firecracker_env/linux-*/
+sandbox/firecracker_env/vmlinux
+sandbox/firecracker_env/rootfs.ext4
+sandbox/firecracker_env/firecracker
+sandbox/firecracker_env/jailer
+sandbox/firecracker_env/busybox
+sandbox/firecracker_env/vulnerable_server
+sandbox/firecracker_env/snapshots/
+sandbox/firecracker_env/release-*/
+
 # Claude Code config (local, not project)
 .claude/
+
+# Environment variables (API keys)
+.env
 
 # Misc
 *.log
