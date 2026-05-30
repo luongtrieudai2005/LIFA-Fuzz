@@ -23,8 +23,7 @@ The Fast Loop runs continuously at maximum speed, using the *current* rule set. 
 ---
 
 ## Architecture
-<img width="1515" height="1038" alt="image" src="https://github.com/user-attachments/assets/7993392b-2533-40a8-bfbe-ea9028667f93" />
-
+<img width="1516" height="1038" alt="image" src="https://github.com/user-attachments/assets/022f1808-1002-44a4-99f5-db7dbda727d5" />
 
 ```mermaid
 graph TB
