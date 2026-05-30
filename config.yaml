@@ -24,6 +24,20 @@ sandbox:
     target_port: 8001            # Interceptor's listen port
     send_interval_ms: 1000
 
+  # Firecracker MicroVM settings (used when driver: "firecracker")
+  firecracker:
+    binary_path: "sandbox/firecracker_env/firecracker"
+    vmlinux_path: "sandbox/firecracker_env/vmlinux"
+    rootfs_path: "sandbox/firecracker_env/rootfs.ext4"
+    snapshot_dir: "sandbox/firecracker_env/snapshots"
+    kernel_args: "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/bin/vulnerable_server ip=172.16.0.2::172.16.0.1:255.255.255.0::eth0:off"
+    mem_size_mb: 256
+    vcpu_count: 2
+    tap_name: "tap-lifa0"
+    host_ip: "172.16.0.1"         # Host-side IP on the TAP bridge
+    vm_ip: "172.16.0.2"           # Static IP assigned to the VM
+    socket_path: "/tmp/firecracker-lifa.sock"
+
 # -----------------------------------------------------------------------------
 # Fast Loop (Block 2)
 # -----------------------------------------------------------------------------
@@ -73,15 +87,39 @@ slow_loop:
   # LLM Agent settings
   llm_agent:
     mode: "REAL"                # "REAL" (calls actual API) or "MOCK" (simulated for testing)
-    provider: "openai"          # litellm provider string (openai, anthropic, etc.)
-    model: "gpt-4o"             # Model name (must be supported by litellm)
+    provider: "openai"          # litellm provider string (openai, anthropic, ollama)
+    model: "glm-5-turbo"        # Model name (must be supported by litellm)
     api_key_env: "OPENAI_API_KEY"  # Environment variable holding the API key
+    api_base: "https://api.z.ai/api/coding/paas/v4"  # Custom API endpoint (empty = provider default)
+    enable_thinking: false      # Disable reasoning/thinking mode (Z.ai GLM needs this)
+    extra_body: {}              # Extra JSON body params passed to the API (e.g. {"enable_thinking": false})
     max_tokens: 4096            # Max tokens for LLM response
     temperature: 0.2            # Low temperature for consistent inference
     timeout_seconds: 60         # Request timeout
     max_retries: 3              # Retry count on API failure
     retry_backoff_ms: 5000      # Base retry backoff
     session_budget_tokens: 0    # Max tokens per session (0 = unlimited)
+
+    # --- Multi-Provider Examples ---
+    # Uncomment ONE block and comment out the defaults above.
+
+    # Anthropic (Claude):
+    #   provider: "anthropic"
+    #   model: "claude-sonnet-4-6"
+    #   api_key_env: "ANTHROPIC_API_KEY"
+    #   api_base: ""
+
+    # ZhipuAI (via OpenAI-compatible endpoint):
+    #   provider: "openai"
+    #   model: "glm-5-turbo"
+    #   api_key_env: "ZHIPUAI_API_KEY"
+    #   api_base: "https://api.z.ai/api/coding/paas/v4"
+
+    # Ollama (local, no API key needed):
+    #   provider: "ollama"
+    #   model: "llama3.2"
+    #   api_key_env: ""
+    #   api_base: ""
 
   # Differential analyzer settings (mathematical pre-processing)
   differential_analyzer:
