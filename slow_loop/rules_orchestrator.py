@@ -43,11 +43,12 @@ from collections import OrderedDict
 from typing import Any, Optional
 
 from shared.logger import get_logger
-from shared.schemas import FieldRule, ProtocolGrammar, RuleType, SemanticRule
+from shared.schemas import FieldRule, MutationStrategy, ProtocolGrammar, RuleType, SemanticRule
 from slow_loop.llm_agent import LLMAgent, estimate_tokens
 from slow_loop.parser import InteractionSession, TrafficParser
 from slow_loop.rule_generator import RuleGenerator
 from slow_loop.differential_analyzer import DifferentialAnalyzer, HeatmapResult
+from slow_loop.ewma_controller import EWMAController
 
 logger = get_logger("slow_loop.rules_orchestrator")
 
@@ -62,25 +63,49 @@ def packet_signature(
 ) -> str:
     """Create a dedup signature from a packet's hex payload.
 
-    The signature is ``<first-N-bytes-hex>:<total-length>``.
-    Packets with the same prefix and length are considered duplicates.
+    The signature is ``<first-N-bytes-hex>:<total-length>:<content-hash>``.
+    The content hash is a lightweight fingerprint of the *middle* portion
+    of the packet (after the prefix, before the last 4 bytes). This makes
+    dedup less aggressive for text protocols like HTTP where many packets
+    share the same method prefix (``GET ``, ``POST``) but have different
+    content (paths, headers, query parameters).
+
+    For binary protocols, the content hash still provides good dedup because
+    structurally identical messages will produce the same hash.
 
     Examples:
         >>> packet_signature("deadbeef00050041", prefix_bytes=4)
-        'deadbeef:8'
-        >>> packet_signature("deadbeef00050042", prefix_bytes=4)
-        'deadbeef:8'  # same type, same length → duplicate
+        'deadbeef:8:deadbeef'  # short packets use full content
 
     Args:
         packet_hex:   Hex-encoded packet payload.
         prefix_bytes: Number of leading bytes to include in the signature.
 
     Returns:
-        A string signature like ``"deadbeef:8"``.
+        A string signature like ``"deadbeef:8:a3f2c1"``.
     """
     prefix = packet_hex[: prefix_bytes * 2]
     length = len(packet_hex) // 2
-    return f"{prefix}:{length}"
+
+    # Content fingerprint: hash the middle portion of the packet.
+    # This distinguishes packets with same prefix+length but different
+    # content (e.g., "GET /path1" vs "GET /path2" in HTTP traffic).
+    # Use a simple rolling XOR over 8-byte chunks — fast, no imports needed.
+    body_start = prefix_bytes * 2
+    body_end = max(body_start, len(packet_hex) - 8)  # exclude last 4 bytes
+    body = packet_hex[body_start:body_end]
+
+    if len(body) >= 8:
+        fingerprint = 0
+        for i in range(0, len(body) - 7, 8):
+            chunk = body[i:i + 8]
+            # XOR-fold 8 hex chars into a 32-bit value
+            fingerprint ^= int(chunk, 16) if len(chunk) == 8 else int(chunk, 16)
+        content_hash = f"{fingerprint:08x}"[-6:]  # last 6 hex digits
+    else:
+        content_hash = body  # short body — use as-is
+
+    return f"{prefix}:{length}:{content_hash}"
 
 
 # =============================================================================
@@ -237,6 +262,9 @@ class RulesOrchestrator:
         max_prompt_tokens: int = 0,
         min_packets_before_infer: int = 5,
         crash_manager: Any = None,
+        ab_mode: str = "llm",
+        ewma_controller: Optional[EWMAController] = None,
+        re_infer_interval_s: float = 300.0,
     ) -> None:
         self.parser = parser
         self.agent = agent
@@ -245,6 +273,18 @@ class RulesOrchestrator:
         self.max_prompt_tokens = max_prompt_tokens
         self.min_packets_before_infer = min_packets_before_infer
         self.crash_manager = crash_manager
+        self.ab_mode: str = ab_mode
+
+        # EWMA Adaptive Controller — coordinates Fast Loop recv() sampling
+        self._ewma: Optional[EWMAController] = ewma_controller
+        self._ewma_epoch_start: float = time.monotonic()
+
+        # Time-based re-inference: force a new inference cycle even when
+        # no new unique packets arrive, as long as enough time has passed.
+        # This prevents the LLM from starving on protocols with few message
+        # types (e.g., HTTP with only GET/POST/HEAD).
+        self._re_infer_interval_s: float = re_infer_interval_s
+        self._last_inference_time: float = time.monotonic()
 
         # Sliding window for dedup
         self._window = SlidingWindow(max_entries=window_size)
@@ -267,6 +307,14 @@ class RulesOrchestrator:
         self._last_error: str = ""
         self._last_cycle_time: float = 0.0
 
+        # C3 fix: Guard to prevent bootstrap rules from overwriting
+        # good LLM-generated rules on budget exhaustion or error fallback.
+        self._llm_rules_active: bool = False
+
+        # A/B mode tracking
+        self._ab_cycle_counter: int = 0
+        self._ab_results_log: list[dict] = []
+
     # -----------------------------------------------------------------
     # Main Pipeline
     # -----------------------------------------------------------------
@@ -288,6 +336,10 @@ class RulesOrchestrator:
         """
         t0 = time.monotonic()
         self._total_cycles += 1
+
+        # M3 fix: Reset EWMA epoch timer at the START of every cycle so that
+        # skipped cycles (insufficient data) don't inflate the next epoch.
+        self._ewma_epoch_start = time.monotonic()
 
         try:
             # ── 1. Read traffic log ─────────────────────────────────
@@ -312,12 +364,19 @@ class RulesOrchestrator:
             )
 
             # ── 3. Check minimum threshold ──────────────────────────
-            if new_count < self.min_packets_before_infer:
+            time_since_last = time.monotonic() - self._last_inference_time
+            re_infer_due = time_since_last >= self._re_infer_interval_s
+
+            if new_count < self.min_packets_before_infer and not re_infer_due:
                 self._skipped_insufficient_data += 1
                 logger.debug(
                     f"Not enough new unique packets ({new_count} < "
                     f"{self.min_packets_before_infer}) — accumulating"
                 )
+                # NOTE: Do NOT call _update_ewma() here — no new metrics
+                # are available on skipped cycles. Calling it would cause
+                # lambda_c to decay proportionally to call frequency rather
+                # than elapsed time (wrong drift toward sparse mode).
                 return {
                     "status": "skipped",
                     "reason": (
@@ -326,6 +385,17 @@ class RulesOrchestrator:
                     ),
                     "packets_available": self._window.size,
                 }
+
+            # Time-based re-inference trigger: even if new_count is below
+            # threshold, force inference when the timer fires. This ensures
+            # the LLM keeps running on protocols with few message types.
+            if new_count < self.min_packets_before_infer and re_infer_due:
+                logger.info(
+                    f"Time-based re-inference triggered "
+                    f"({time_since_last:.0f}s since last inference, "
+                    f"{new_count} new unique packets). "
+                    f"Forcing cycle with {self._window.size} buffered packets."
+                )
 
             # ── 4. Select diverse samples ───────────────────────────
             selected = self._window.get_diverse_sample(
@@ -381,8 +451,10 @@ class RulesOrchestrator:
                 logger.warning(msg)
                 self._last_error = msg
 
-                # Budget exhausted → push bootstrap rules if available
-                if self._last_heatmap:
+                # Budget exhausted → push bootstrap rules ONLY if no LLM
+                # rules have been pushed yet (C3 fix: don't overwrite good
+                # LLM rules with stale heatmap bootstrap rules).
+                if self._last_heatmap and not self._llm_rules_active:
                     bootstrap = self._convert_field_rules(
                         self._last_heatmap.to_field_rules()
                     )
@@ -394,6 +466,11 @@ class RulesOrchestrator:
                             f"  Budget exhausted — pushed {len(bootstrap)} "
                             f"bootstrap rules from heatmap"
                         )
+                elif self._llm_rules_active:
+                    logger.debug(
+                        "  Budget exhausted but LLM rules already active — "
+                        "skipping bootstrap overwrite"
+                    )
 
                 return {
                     "status": "skipped",
@@ -401,12 +478,64 @@ class RulesOrchestrator:
                     "packets_available": self._window.size,
                 }
 
-            # ── 8. Call LLM with math hint ──────────────────────────
+            # ── 8. A/B mode decision ────────────────────────────────
+            use_llm = True
+            if self.ab_mode == "random":
+                use_llm = False
+            elif self.ab_mode == "alternating":
+                use_llm = (self._ab_cycle_counter % 2 == 0)
+            self._ab_cycle_counter += 1
+
+            # H6 fix: A/B "random" mode must NEVER call the LLM.
+            # When use_llm=False and no heatmap exists yet, return early
+            # instead of falling through to the LLM call.
+            if not use_llm:
+                if self._last_heatmap:
+                    bootstrap = self._convert_field_rules(
+                        self._last_heatmap.to_field_rules()
+                    )
+                    if bootstrap:
+                        await self.rule_gen.push_rules(bootstrap)
+                        self._total_rules_pushed += len(bootstrap)
+                        self._bootstrap_count += 1
+                    elapsed = time.monotonic() - t0
+                    self._last_cycle_time = elapsed
+                    self._ab_results_log.append({
+                        "cycle": self._total_cycles,
+                        "mode": "heatmap",
+                        "ab_mode_setting": self.ab_mode,
+                    })
+                    logger.info(
+                        f"Cycle #{self._total_cycles}: A/B mode={self.ab_mode}, "
+                        f"use_llm=False → {len(bootstrap)} heatmap rules pushed"
+                    )
+                    return {
+                        "status": "bootstrap",
+                        "reason": f"A/B mode: {self.ab_mode} (use_llm=False)",
+                        "rules": bootstrap,
+                        "heatmap_groups": len(self._last_heatmap.field_groups),
+                        "packets_available": self._window.size,
+                    }
+                else:
+                    # No heatmap yet — can't produce rules, but must NOT
+                    # fall through to LLM in "random" A/B mode.
+                    logger.debug(
+                        f"Cycle #{self._total_cycles}: A/B mode={self.ab_mode}, "
+                        f"use_llm=False but no heatmap yet — waiting"
+                    )
+                    return {
+                        "status": "skipped_no_heatmap",
+                        "reason": f"A/B mode: {self.ab_mode}, no heatmap available",
+                        "packets_available": self._window.size,
+                    }
+
+            # ── 9. Call LLM with math hint ──────────────────────────
             try:
                 grammar = await self.agent.infer_protocol(
                     payload, math_hint=math_hint
                 )
                 self._total_inferences += 1
+                self._last_inference_time = time.monotonic()  # Reset timer
             except (RuntimeError, ValueError) as llm_err:
                 # LLM failed → fall back to bootstrap rules from heatmap
                 self._errors += 1
@@ -415,7 +544,7 @@ class RulesOrchestrator:
                     f"  LLM inference failed: {llm_err}"
                 )
 
-                if self._last_heatmap:
+                if self._last_heatmap and not self._llm_rules_active:
                     bootstrap = self._convert_field_rules(
                         self._last_heatmap.to_field_rules()
                     )
@@ -439,22 +568,39 @@ class RulesOrchestrator:
                             ),
                             "packets_available": self._window.size,
                         }
+                elif self._llm_rules_active:
+                    logger.debug(
+                        "  LLM failed but existing rules still active — "
+                        "skipping bootstrap overwrite"
+                    )
 
                 raise  # Re-raise if no heatmap available
 
             # ── 9. Generate and push rules ──────────────────────────
             rules: list[SemanticRule] = []
             if grammar.fields:
-                rules = self.rule_gen.grammar_to_rules(grammar)
+                rules = self.rule_gen.grammar_to_rules(
+                    grammar, heatmap=self._last_heatmap
+                )
                 if rules:
-                    await self.rule_gen.push_rules(rules)
+                    await self.rule_gen.push_rules(
+                        rules,
+                        overall_confidence=grammar.confidence,
+                        protocol_name=grammar.protocol_name,
+                    )
                     self._total_rules_pushed += len(rules)
+                    # C3 fix: mark that LLM rules have been pushed so
+                    # bootstrap fallback won't overwrite them.
+                    self._llm_rules_active = True
 
             # ── 10. Crash isolation check ───────────────────────────
             if self.crash_manager:
                 await self._check_crash_isolation()
 
-            # ── 11. Return result ───────────────────────────────────
+            # ── 11. EWMA Adaptive Controller update ──────────────────
+            self._update_ewma()
+
+            # ── 12. Return result ───────────────────────────────────
             elapsed = time.monotonic() - t0
             self._last_cycle_time = elapsed
 
@@ -466,6 +612,12 @@ class RulesOrchestrator:
                 f"math_hint={'yes' if math_hint else 'no'}, "
                 f"took={elapsed:.2f}s"
             )
+
+            self._ab_results_log.append({
+                "cycle": self._total_cycles,
+                "mode": "llm",
+                "ab_mode_setting": self.ab_mode,
+            })
 
             return {
                 "status": "success",
@@ -482,10 +634,36 @@ class RulesOrchestrator:
             }
 
         except ValueError as e:
-            # LLM parse errors — non-fatal
+            # LLM parse errors — non-fatal, try bootstrap fallback
             self._errors += 1
             self._last_error = str(e)
             logger.error(f"LLM parse error in cycle #{self._total_cycles}: {e}")
+
+            # EWMA: update even on error so k stays current
+            self._update_ewma()
+
+            if self._last_heatmap and not self._llm_rules_active:
+                bootstrap = self._convert_field_rules(
+                    self._last_heatmap.to_field_rules()
+                )
+                if bootstrap:
+                    await self.rule_gen.push_rules(bootstrap)
+                    self._total_rules_pushed += len(bootstrap)
+                    self._bootstrap_count += 1
+                    logger.warning(
+                        f"  BOOTSTRAP FALLBACK (parse error): pushed "
+                        f"{len(bootstrap)} rules from DifferentialAnalyzer"
+                    )
+                    return {
+                        "status": "bootstrap",
+                        "reason": f"Parse error, heatmap fallback: {e}",
+                        "rules": bootstrap,
+                        "heatmap_groups": len(
+                            self._last_heatmap.field_groups
+                        ),
+                        "packets_available": self._window.size,
+                    }
+
             return {
                 "status": "error",
                 "reason": f"Parse error: {e}",
@@ -493,10 +671,36 @@ class RulesOrchestrator:
             }
 
         except RuntimeError as e:
-            # LLM API errors — non-fatal
+            # LLM API errors — non-fatal, try bootstrap fallback
             self._errors += 1
             self._last_error = str(e)
             logger.error(f"LLM API error in cycle #{self._total_cycles}: {e}")
+
+            # EWMA: update even on error so k stays current
+            self._update_ewma()
+
+            if self._last_heatmap and not self._llm_rules_active:
+                bootstrap = self._convert_field_rules(
+                    self._last_heatmap.to_field_rules()
+                )
+                if bootstrap:
+                    await self.rule_gen.push_rules(bootstrap)
+                    self._total_rules_pushed += len(bootstrap)
+                    self._bootstrap_count += 1
+                    logger.warning(
+                        f"  BOOTSTRAP FALLBACK (API error): pushed "
+                        f"{len(bootstrap)} rules from DifferentialAnalyzer"
+                    )
+                    return {
+                        "status": "bootstrap",
+                        "reason": f"API error, heatmap fallback: {e}",
+                        "rules": bootstrap,
+                        "heatmap_groups": len(
+                            self._last_heatmap.field_groups
+                        ),
+                        "packets_available": self._window.size,
+                    }
+
             return {
                 "status": "error",
                 "reason": f"API error: {e}",
@@ -511,6 +715,10 @@ class RulesOrchestrator:
                 f"Unexpected error in cycle #{self._total_cycles}: {e}",
                 exc_info=True,
             )
+
+            # EWMA: update even on unexpected error so k stays current
+            self._update_ewma()
+
             return {
                 "status": "error",
                 "reason": f"Unexpected: {e}",
@@ -534,6 +742,8 @@ class RulesOrchestrator:
             "skipped_insufficient_data": self._skipped_insufficient_data,
             "errors": self._errors,
             "bootstrap_count": self._bootstrap_count,
+            "ab_mode": self.ab_mode,
+            "ab_cycle_counter": self._ab_cycle_counter,
             "precision_mode": self._precision_mode,
             "last_error": self._last_error,
             "last_cycle_time_s": round(self._last_cycle_time, 2),
@@ -603,6 +813,9 @@ class RulesOrchestrator:
         """
         rules: list[SemanticRule] = []
         for fr in field_rules:
+            # H4 fix: SKIP fields must not become active mutation rules
+            if fr.mutation_strategy == MutationStrategy.SKIP:
+                continue
             end = fr.offset + fr.length if fr.length > 0 else 65535
             rule = SemanticRule(
                 rule_type=self._strategy_to_rule_type(fr.mutation_strategy),
@@ -636,8 +849,17 @@ class RulesOrchestrator:
 
     @staticmethod
     def _infer_field_type(fr: FieldRule) -> Any:
-        """Guess a FieldType from a FieldRule's properties."""
+        """Guess a FieldType from a FieldRule's properties.
+
+        H8 fix: if the DifferentialAnalyzer already detected the correct
+        endianness and stored it in ``fr.data_type``, use that directly
+        instead of hardcoding little-endian.
+        """
         from shared.schemas import FieldType
+
+        # H8: respect explicitly-detected data_type (includes endianness)
+        if fr.data_type is not None:
+            return fr.data_type
 
         length = fr.length if fr.length > 0 else 0
         if fr.calculation_source:
@@ -675,3 +897,31 @@ class RulesOrchestrator:
                 )
         except Exception as e:
             logger.debug(f"Crash stats check failed: {e}")
+
+    def _update_ewma(self) -> None:
+        """Update EWMA controller with current coverage metrics.
+
+        Called from success and error exit paths in run_cycle().
+        Skipped when insufficient time has elapsed since the last update
+        to avoid spurious lambda_c decay from high-frequency calls with
+        no new metrics (e.g. rapid LLM retries).
+        """
+        if not self._ewma:
+            return
+        epoch_s = time.monotonic() - self._ewma_epoch_start
+        # Minimum epoch duration guard: avoid calling EWMA when the epoch
+        # is too short to carry meaningful new metrics. Without this, rapid
+        # error-retry cycles (e.g. LLM API errors with backoff) cause lambda_c
+        # to decay proportionally to call frequency rather than elapsed time.
+        if epoch_s < 5.0:
+            return
+        fg = (
+            len(self._last_heatmap.field_groups)
+            if self._last_heatmap
+            else 0
+        )
+        self._ewma.update(
+            field_groups_count=fg,
+            epoch_duration_s=epoch_s,
+        )
+        self._ewma_epoch_start = time.monotonic()

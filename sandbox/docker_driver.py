@@ -95,9 +95,10 @@ class DockerSandbox(BaseSandbox):
 
         try:
             # 1. Build target image
-            logger.info("Building target server image...")
+            build_path = str(self.build_context)
+            logger.info(f"Building target server image from {build_path}...")
             client.images.build(
-                path=str(self.build_context / "server"),
+                path=build_path,
                 tag=self.target_image_tag,
                 rm=True,
             )

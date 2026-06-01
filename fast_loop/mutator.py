@@ -1,38 +1,89 @@
 """
 fast_loop/mutator.py
-───────────────────
-Mutation Engine — generates fuzz variants of captured packets.
+--------------------
+Block 2 — Component D: Mutation Engine
 
-Mutation Strategies:
-    1. Random Bit-Flip    — flip one random bit (baseline coverage).
-    2. Byte Substitution  — replace one byte with a random value.
-    3. Boundary Fuzzing   — target numeric fields with 0, MAX, MAX-1.
-    4. Structural         — use SemanticRules to mutate specific fields.
-    5. KILL_SERVER        — inject known crash payloads (configurable ratio).
-    6. Dynamic Rule Reload — periodically loads rules from shared/active_rules.json.
+CORE PROBLEM THIS SOLVES:
+    Naïve fuzzing mutates ALL fields of a packet simultaneously.
+    This is catastrophically bad for crash isolation: if a crash occurs,
+    you cannot determine WHICH of the 6 mutated fields triggered it.
+    You'd need to re-run thousands of tests to pinpoint the root cause.
 
-The engine runs an async ``mutation_loop()`` that:
-    1. Reads the traffic log for new client→server packets.
-    2. Periodically reloads rules from ``shared/active_rules.json``.
-    3. Generates mutated variants based on active rules.
-    4. Queues each variant for injection via ``Interceptor.inject_mutation()``.
-    5. Tracks the last injected packet for crash attribution.
+TWO-MODE SCHEDULING ARCHITECTURE:
+    ┌──────────────────────────────────────────────────────────────────┐
+    │  Mode 1 — RANDOM_SUBSET / WEIGHTED  (default, normal fuzzing)   │
+    │    Pick k random mutable fields per packet.                      │
+    │    High EPS. Broad coverage. Acceptable crash isolation.         │
+    │                                                                  │
+    │  Mode 2 — ONE_AT_A_TIME  (crash investigation, auto-triggered)  │
+    │    Cycle through fields one-by-one. One field mutated per send.  │
+    │    Lower EPS. Perfect crash isolation. Pinpoints exact field.    │
+    │                                                                  │
+    │  Warm-up — ALL_FIELDS  (first 30 s on new connection)           │
+    │    Mutate every field per packet for initial reachability sweep. │
+    │    Crashes logged but do NOT trigger investigation.              │
+    └──────────────────────────────────────────────────────────────────┘
+
+STATE MACHINE:
+    [WARM-UP / ALL_FIELDS]  (first warmup_seconds)
+           │
+           │  warmup deadline reached
+           ▼
+    [NORMAL / RANDOM_SUBSET or WEIGHTED]
+           │
+           │  crash detected (Health Monitor calls set_investigation_mode())
+           ▼
+    [INVESTIGATION / ONE_AT_A_TIME]
+           │
+           │  isolation_budget exhausted → _revert_pending flag set
+           │  (consumed deterministically in the hot loop)
+           ▼
+    [NORMAL / RANDOM_SUBSET or WEIGHTED]
+
+ATOMIC RULE UPDATES:
+    The Slow Loop (Block 3) can push a new SemanticRuleSet at any time.
+    The hot loop MUST NOT be interrupted mid-packet construction.
+    Solution: asyncio.Lock held only during the pointer swap (< 1 µs).
+
+INTERFACES:
+    CONSUMES: asyncio.Queue[PacketRecord] from Interceptor (C)
+              SemanticRuleSet via update_rule_set() from Rule Generator (H)
+    PRODUCES: mutated bytes → Target Server (B) via TCP
+              PacketStatus  → Interceptor (C) via status_callback
+              CrashReport   → CrashManager  via crash_callback
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import math
+import os
 import random
-import struct
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import Callable, Optional
 
 from shared.logger import get_logger
-from shared.schemas import FieldType, RuleType, SemanticRule
+from shared.schemas import (
+    ActiveRuleSet,
+    Direction,
+    FieldRule,
+    FieldType,
+    FuzzTarget,
+    MutationConstraints,
+    MutationStrategy,
+    PacketStatus,
+    SeedSequence,
+    TrafficRecord,
+)
 
+# P3-C: import operators at module level to avoid per-call import lookup
+# in the hot path (_apply_field runs thousands of times per second).
 from fast_loop.mutation_operators import (
-    safe_slice,
     op_bit_flip,
     op_boundary_violation,
     op_buffer_overflow,
@@ -42,512 +93,1814 @@ from fast_loop.mutation_operators import (
     op_random_byte_injection,
 )
 
-if TYPE_CHECKING:
-    from fast_loop.interceptor import Interceptor
+# Type aliases for clarity (these are the same as the underlying types)
+SemanticRuleSet = ActiveRuleSet
+PacketRecord = TrafficRecord
 
-logger = get_logger("fast_loop.mutator")
+log = get_logger("fast_loop.mutator")
 
 
-# =============================================================================
-# Known Crash Payloads — for KILL_SERVER mutation strategy
-# =============================================================================
-# These payloads are known to crash the vulnerable test server (sandbox/server/server.py).
-# In production, this list is empty — real crashes are discovered by the fuzzer.
+# ===========================================================================
+# Known crash payloads (backward compat with tests and e2e)
+# ===========================================================================
+
 KILL_SERVER_PAYLOADS: list[bytes] = [
-    b"\x00\x00\x00\x00",              # Null magic → SIGSEGV (null pointer deref)
+    b"\x00\x00\x00\x00",              # Null magic → SIGSEGV
     b"\xCA\xFE\xBA\xBE",             # Abort magic → SIGABRT
     b"\xDE\xAD\xBE\xEF\xFF\xFF",     # Length overflow → buffer overflow crash
 ]
 
+# P3-B: Human-readable names for kill payloads (attribution)
+_KILL_PAYLOAD_NAMES: list[str] = [
+    "null_magic_crash",
+    "abort_magic_crash",
+    "length_overflow_crash",
+]
 
-class MutationEngine:
-    """Generates and injects fuzzed variants of captured packets.
+
+# ===========================================================================
+# Mutation Mode
+# ===========================================================================
+
+class MutationMode(str, Enum):
+    """
+    Controls which fields are mutated per packet.
+
+    RANDOM_SUBSET  → pick k random mutable fields (default, high EPS)
+    ONE_AT_A_TIME  → one field per packet, cycling (crash isolation)
+    ALL_FIELDS     → mutate every mutable field (max coverage, min isolation)
+    DUMB           → no SemanticRules, random bit-flip fallback
+    """
+    RANDOM_SUBSET = "random_subset"
+    ONE_AT_A_TIME = "one_at_a_time"
+    ALL_FIELDS    = "all_fields"
+    DUMB          = "dumb"
+
+
+# ===========================================================================
+# Schedulers
+# ===========================================================================
+
+class _BaseScheduler:
+    """Abstract base: select which FieldRules to mutate for one packet."""
+
+    def select(self, mutable_fields: list[FieldRule]) -> list[FieldRule]:
+        raise NotImplementedError
+
+    def notify_crash(self) -> None:
+        """Called when a crash is detected (for book-keeping in subclasses)."""
+        pass
+
+    def reset(self) -> None:
+        """Reset internal state."""
+        pass
+
+    @property
+    def description(self) -> str:
+        raise NotImplementedError
+
+
+class RandomSubsetScheduler(_BaseScheduler):
+    """
+    RANDOM_SUBSET: choose k fields at random per packet.
+
+    Default k=2 balances two competing objectives:
+      - Coverage:   low k → explore fewer fields per send → need more sends
+      - Isolation:  high k → harder to pinpoint which field caused a crash
+    k=2 is the empirically recommended starting point.
+
+    P2-A: Supports adaptive k ≈ sqrt(num_fields) when adaptive=True.
 
     Args:
-        interceptor:       The Interceptor to inject mutations into.
-        mode:               "random" (bit-flip only) or "smart" (rule-based + random).
-        mutations_per_packet: Variants per captured packet.
-        random_flip_ratio:   Fraction of mutations that are pure random (vs rule-based).
-        kill_server_ratio:   Fraction of mutations that use known crash payloads (0.0-1.0).
-                            Set to 0.0 in production; only non-zero for testing.
-        max_packet_size:    Cap on mutated packet size.
-        rules_file:         Path to shared/active_rules.json for dynamic rule reload.
-        rule_reload_interval_s: How often to check for new rules (seconds).
+        k: Number of fields to mutate per packet. Clamped to len(mutable_fields).
+        adaptive: If True, k = max(1, min(int(sqrt(n)), n//2 + 1)).
+    """
+
+    def __init__(self, k: int = 2, adaptive: bool = True) -> None:
+        self.k = k
+        self.adaptive = adaptive
+
+    def select(self, mutable_fields: list[FieldRule]) -> list[FieldRule]:
+        if not mutable_fields:
+            return []
+        n = len(mutable_fields)
+        if self.adaptive:
+            k = max(1, min(int(math.isqrt(n)), n // 2 + 1))
+        else:
+            k = min(self.k, n)
+        return random.sample(mutable_fields, k)
+
+    @property
+    def description(self) -> str:
+        mode = "adaptive" if self.adaptive else f"static k={self.k}"
+        return f"RandomSubset({mode})"
+
+
+class OneAtATimeScheduler(_BaseScheduler):
+    """
+    ONE_AT_A_TIME: mutate exactly one field per packet, cycling deterministically.
+
+    Each send targets a different field — tracked by **field name** (not index)
+    so that rule set updates that reorder fields don't break crash isolation.
+
+    This mode is used AUTOMATICALLY when a crash is detected, allowing the
+    system to determine WHICH exact field triggered the vulnerability.
     """
 
     def __init__(
         self,
-        interceptor: "Interceptor",
-        mode: str = "smart",
-        mutations_per_packet: int = 5,
-        random_flip_ratio: float = 0.1,
-        kill_server_ratio: float = 0.0,
-        max_packet_size: int = 65535,
-        rules_file: str = "shared/active_rules.json",
-        rule_reload_interval_s: float = 5.0,
+        budget_per_field: int = 20,
+        isolation_budget: int = 500,
     ) -> None:
-        self.interceptor = interceptor
-        self.mode = mode
-        self.mutations_per_packet = mutations_per_packet
-        self.random_flip_ratio = random_flip_ratio
-        self.kill_server_ratio = kill_server_ratio
-        self.max_packet_size = max_packet_size
+        self.budget_per_field = budget_per_field
+        self.isolation_budget = isolation_budget
+        # H1 fix: track by field name, not index — survives rule reorder.
+        self._cursor_name: Optional[str] = None
+        self._field_names: list[str] = []
+        self._field_hits: dict[str, int] = {}
+        self._sends_this_mode: int = 0
 
-        # ── Dynamic rule management ─────────────────────────────────
-        self._rules: list[SemanticRule] = []
-        self._rules_file = Path(rules_file)
-        self._rule_reload_interval = rule_reload_interval_s
-        self._last_rules_mtime: float = 0.0
+    def select(self, mutable_fields: list[FieldRule]) -> list[FieldRule]:
+        if not mutable_fields:
+            return []
 
-        # ── Coverage tracking ─────────────────────────────────────────
-        self._fuzzed_offsets: set[tuple[int, int]] = set()
-        self._total_mutations: int = 0
-        self._total_packets: int = 0
-        self._total_kills: int = 0
+        # Build name→field lookup and ordered name list
+        name_to_field: dict[str, FieldRule] = {
+            f.field_name: f for f in mutable_fields
+        }
+        field_names = [f.field_name for f in mutable_fields]
 
-        # ── Crash attribution ───────────────────────────────────────────
+        # First call or after reset — start at first field
+        if self._cursor_name is None or self._cursor_name not in name_to_field:
+            # If the current cursor field was removed, find the next one
+            if self._cursor_name is not None and self._field_names:
+                try:
+                    old_idx = self._field_names.index(self._cursor_name)
+                    # Try to find a field in the new list that comes after
+                    for name in field_names:
+                        if name not in self._field_names[:old_idx + 1]:
+                            self._cursor_name = name
+                            break
+                    else:
+                        self._cursor_name = field_names[0] if field_names else None
+                except ValueError:
+                    self._cursor_name = field_names[0] if field_names else None
+            else:
+                self._cursor_name = field_names[0] if field_names else None
+
+            self._field_names = field_names
+
+        if self._cursor_name is None or self._cursor_name not in name_to_field:
+            return []
+
+        chosen = name_to_field[self._cursor_name]
+
+        # Advance cursor after budget_per_field hits on this field
+        self._field_hits[self._cursor_name] = self._field_hits.get(
+            self._cursor_name, 0
+        ) + 1
+        if self._field_hits[self._cursor_name] >= self.budget_per_field:
+            # Move to next field in name order
+            try:
+                cur_idx = field_names.index(self._cursor_name)
+                next_idx = (cur_idx + 1) % len(field_names)
+                self._cursor_name = field_names[next_idx]
+            except ValueError:
+                self._cursor_name = field_names[0] if field_names else None
+            # Reset hits for the new field
+            if self._cursor_name:
+                self._field_hits[self._cursor_name] = 0
+
+        self._field_names = field_names
+        self._sends_this_mode += 1
+        return [chosen]
+
+    def is_budget_exhausted(self, num_fields: int) -> bool:
+        """True when we have cycled through all fields enough times."""
+        return self._sends_this_mode >= self.isolation_budget
+
+    def get_current_field_index(self) -> int:
+        """The 0-based index of the field currently under investigation."""
+        if self._cursor_name and self._field_names:
+            try:
+                return self._field_names.index(self._cursor_name)
+            except ValueError:
+                return 0
+        return 0
+
+    @property
+    def cursor_name(self) -> Optional[str]:
+        """The name of the field currently under investigation."""
+        return self._cursor_name
+
+    def reset(self) -> None:
+        self._cursor_name = None
+        self._field_names = []
+        self._field_hits = {}
+        self._sends_this_mode = 0
+
+    @property
+    def description(self) -> str:
+        return (
+            f"OneAtATime(cursor={self._cursor_name}, "
+            f"sends={self._sends_this_mode}/{self.isolation_budget})"
+        )
+
+
+class AllFieldsScheduler(_BaseScheduler):
+    """
+    ALL_FIELDS: mutate every mutable field per packet.
+    Maximum coverage but zero crash isolation.
+    Useful for initial quick reachability tests and warm-up phase.
+    """
+
+    def select(self, mutable_fields: list[FieldRule]) -> list[FieldRule]:
+        return list(mutable_fields)
+
+    @property
+    def description(self) -> str:
+        return "AllFields"
+
+
+# ===========================================================================
+# P2-B: Weighted Scheduler — strategy-priority field selection
+# ===========================================================================
+
+# Strategy weights: higher = more likely to be selected for mutation.
+# Based on empirical security research — length fields and opcodes produce
+# the majority of exploitable crashes.
+_STRATEGY_WEIGHTS: dict[MutationStrategy, float] = {
+    MutationStrategy.BOUNDARY_VALUES: 4.0,   # length fields: #1 bug source
+    MutationStrategy.DICTIONARY:      3.0,   # opcodes: triggers different code paths
+    MutationStrategy.INCREMENT:       2.5,   # sequence numbers: state confusion
+    MutationStrategy.BIT_FLIP:        1.5,   # flags/enums: subtle state bugs
+    MutationStrategy.CALCULATED:      2.0,   # derived fields: recalculation bugs
+    MutationStrategy.RANDOM_BYTES:    1.0,   # payload: baseline
+    MutationStrategy.FORMAT_STRING:   2.0,   # format string: memory corruption
+    MutationStrategy.TRUNCATE:        1.5,   # truncation: edge cases
+    MutationStrategy.STATIC:          0.0,   # excluded from selection
+    MutationStrategy.SKIP:            0.0,   # excluded from selection
+}
+
+
+class WeightedScheduler(_BaseScheduler):
+    """
+    WEIGHTED: select k fields using strategy-priority weights.
+
+    Fields with BOUNDARY_VALUES strategy are ~4x more likely to be selected
+    than RANDOM_BYTES. Confidence from the LLM further scales the weight
+    (low-confidence fields are penalized).
+
+    Args:
+        k: Base number of fields to select (used when adaptive=False).
+        adaptive: If True, k scales with sqrt(num_fields).
+    """
+
+    def __init__(self, k: int = 2, adaptive: bool = True) -> None:
+        self.k = k
+        self.adaptive = adaptive
+
+    def select(self, mutable_fields: list[FieldRule]) -> list[FieldRule]:
+        if not mutable_fields:
+            return []
+
+        n = len(mutable_fields)
+        if self.adaptive:
+            k = max(1, min(int(math.isqrt(n)), n // 2 + 1))
+        else:
+            k = min(self.k, n)
+
+        # Compute weights: strategy_weight * confidence
+        weights = []
+        for f in mutable_fields:
+            sw = _STRATEGY_WEIGHTS.get(f.mutation_strategy, 1.0)
+            weights.append(sw * max(0.1, f.confidence))
+
+        total = sum(weights)
+        if total == 0:
+            # All fields are SKIP/STATIC — fall back to uniform
+            return random.sample(mutable_fields, min(k, n))
+
+        # Weighted selection without replacement
+        chosen_indices: set[int] = set()
+        max_attempts = k * 10  # prevent infinite loop
+        attempts = 0
+        while len(chosen_indices) < k and attempts < max_attempts:
+            idx = random.choices(range(n), weights=weights, k=1)[0]
+            chosen_indices.add(idx)
+            attempts += 1
+
+        # If we couldn't get k unique indices, fill with remaining
+        if len(chosen_indices) < k:
+            remaining = [i for i in range(n) if i not in chosen_indices]
+            random.shuffle(remaining)
+            chosen_indices.update(remaining[: k - len(chosen_indices)])
+
+        return [mutable_fields[i] for i in chosen_indices]
+
+    @property
+    def description(self) -> str:
+        return (
+            f"Weighted(bv=4.0, dict=3.0, inc=2.5, "
+            f"calc=2.0, bf=1.5, rb=1.0)"
+        )
+
+
+# ===========================================================================
+# Runtime Statistics
+# ===========================================================================
+
+@dataclass
+class MutatorStats:
+    """Live statistics snapshot. Exposed via get_stats()."""
+    mode:                       str                        = MutationMode.DUMB
+    total_sent:                 int                        = 0
+    total_accepted:             int                        = 0
+    total_rejected:             int                        = 0
+    total_timeout:              int                        = 0
+    total_crashes:              int                        = 0
+    current_eps:                float                      = 0.0
+    rule_set_version:           int                        = 0
+    rule_set_id:                str                        = "none"
+    active_fields:              int                        = 0
+    investigation_mode:         bool                       = False
+    investigation_field:        Optional[str]              = None
+    # P2-A: k used this round (for heartbeat logging)
+    k_this_round:               int                        = 0
+    # P1-A: revert pending flag
+    revert_pending:             bool                       = False
+    # P2-C: last investigation summary
+    last_investigation_summary: dict                       = field(default_factory=dict)
+    # EWMA Adaptive Controller telemetry
+    current_k:                 int                        = 200
+    recv_sample_rate:          float                      = 0.0
+    ewma_lambda_c:             float                      = 0.0
+    ewma_regime:               str                        = "sparse"
+
+
+# ===========================================================================
+# Mutation Engine
+# ===========================================================================
+
+class MutationEngine:
+    """
+    High-speed, rule-aware, scheduling-driven packet mutation engine.
+
+    Hot-loop lifecycle:
+        1. Pop seed from queue (or pick from corpus via round-robin)
+        2. Build base payload (from rule set's base_packet or seed)
+        3. Scheduler selects k fields to mutate this round
+        4. Apply per-field mutation strategies
+        5. Send to Target Server
+        6. Record status → feed back to Interceptor for stuck detection
+        7. If CRASH → notify CrashManager + optionally enter investigation mode
+        8. Repeat
+
+    Args:
+        target_host:        Hostname of Target Server (Block 1B).
+        target_port:        Port of Target Server.
+        seed_queue:         asyncio.Queue[PacketRecord] from Interceptor (C).
+        k:                  Fields per packet in RANDOM_SUBSET mode (minimum k).
+        max_eps:            Throttle ceiling (0 = unlimited).
+        connection_timeout: TCP connect timeout in seconds.
+        recv_timeout:       Time to wait for a server response.
+        auto_investigate:   If True, auto-switch to ONE_AT_A_TIME on crash.
+        investigation_budget: Max sends in ONE_AT_A_TIME mode before reverting.
+        connection_mode:    "fresh" (new conn per send) or "stateful" (setup sequence).
+        no_recv:            If True, fire-and-forget mode.
+        adaptive_k:         P2-A: If True, k scales with sqrt(num_fields).
+        use_weighted:       P2-B: If True, use WeightedScheduler in normal mode.
+        budget_per_field:   P2-D: Hits per field in investigation (0 = adaptive).
+        warmup_seconds:     P3-A: Duration of ALL_FIELDS warm-up (0 = disabled).
+    """
+
+    def __init__(
+        self,
+        target_host:          str,
+        target_port:          int,
+        seed_queue:           asyncio.Queue,
+        k:                    int   = 2,
+        max_eps:              int   = 1000,
+        connection_timeout:   float = 1.0,
+        recv_timeout:         float = 0.5,
+        auto_investigate:     bool  = True,
+        investigation_budget: int   = 500,
+        connection_mode:      str   = "fresh",
+        no_recv:              bool  = False,
+        # P2-A: adaptive k scaling
+        adaptive_k:           bool  = True,
+        # P2-B: weighted field selection
+        use_weighted:         bool  = True,
+        # P2-D: configurable investigation budget per field
+        budget_per_field:     int   = 0,
+        # P3-A: warm-up phase
+        warmup_seconds:       float = 30.0,
+    ) -> None:
+        self.target_host         = target_host
+        self.target_port         = target_port
+        self.seed_queue          = seed_queue
+        self.k                   = k
+        self.max_eps             = max_eps
+        self.connection_timeout  = connection_timeout
+        self.recv_timeout        = recv_timeout
+        self.auto_investigate    = auto_investigate
+        self.investigation_budget = investigation_budget
+        self.no_recv             = no_recv
+        self.connection_mode     = connection_mode
+        # P2-A / P2-B / P2-D / P3-A
+        self.adaptive_k          = adaptive_k
+        self.use_weighted        = use_weighted
+        self.budget_per_field    = budget_per_field
+        self.warmup_seconds      = warmup_seconds
+
+        # Active scheduler — swapped atomically on mode change
+        self._scheduler:    _BaseScheduler    = self._make_normal_scheduler()
+        self._mode:         MutationMode      = MutationMode.RANDOM_SUBSET
+        self._sched_lock:   asyncio.Lock      = asyncio.Lock()
+
+        # Bugfix: sync stats.mode with actual initial mode
+        self._stats = MutatorStats()
+        self._stats.mode = self._mode.value
+
+        # Active rule set — swapped atomically by Slow Loop (Block 3)
+        self._rule_set:     Optional[SemanticRuleSet] = None
+
+        # Cached setup packets from ActiveRuleSet (for stateful mode)
+        self._setup_packets: list[bytes] = []
+        self._rule_lock:    asyncio.Lock              = asyncio.Lock()
+
+        # Seed corpus — populated incrementally from seed_queue
+        # Each entry is a SeedSequence (1+ packets from one TCP session).
+        self._corpus:       list[SeedSequence] = []
+
+        # IFPS: Inverse-Frequency Power Schedule seed selection
+        # Tracks how many times each sequence has been used → rare sequences
+        # get higher Energy = 1/(freq+1) → more fuzzing cycles.
+        self._seed_freq:    dict[str, int]     = {}
+
+        # EPS tracking (rolling window of send timestamps)
+        self._eps_window:   deque[float]       = deque(maxlen=200)
+        self._last_eps_log: float              = time.monotonic()
+
+        # Callbacks (set by orchestrator / Health Monitor)
+        self.status_callback: Optional[Callable[[str, PacketStatus], None]] = None
+        self.crash_callback:  Optional[Callable[[bytes, str], None]] = None
+
+        # Control flags
+        self._running: bool = False
+        self._paused:  bool = False
+
+        # P1-A: revert pending flag — deterministic mode revert
+        self._revert_pending: bool = False
+
+        # P3-A: warm-up state
+        self._warmup_done: bool = False
+
+        # Backward compat — accessed by crash_monitor.py
         self._last_injected_packet: bytes = b""
         self._last_injected_rule_id: Optional[str] = None
 
-        # ── Pause state (set by CrashMonitor) ───────────────────────
-        self._paused: bool = False
+        # H3 fix: crash attribution window — stores last N sends so the
+        # crash monitor can see recent history, not just the last packet.
+        self._crash_window: deque = deque(maxlen=100)
 
-    # -----------------------------------------------------------------
-    # Core Mutation API
-    # -----------------------------------------------------------------
+        # Stats (initialized above with correct mode)
+        self._mutation_signatures: set[str] = set()
 
-    async def mutate(self, original_packet: bytes) -> list[bytes]:
-        """Generate mutated variants and inject them via the Interceptor."""
-        self._total_packets += 1
-        variants: list[bytes] = []
+        # Rule file poller — bridges Slow Loop / Math-Only → Fast Loop
+        rule_cfg = self._load_rules_path_from_config()
+        self._rules_file: str = rule_cfg
+        self._last_rules_mtime: float = 0.0
 
-        # ── KILL_SERVER strategy (testing only) ──────────────────────
-        if self.kill_server_ratio > 0 and random.random() < self.kill_server_ratio:
-            payload = random.choice(KILL_SERVER_PAYLOADS)
-            variants.append(payload)
-            self._total_kills += 1
-            self._last_injected_rule_id = "KILL_SERVER"
-            logger.warning(
-                f"KILL_SERVER payload injected ({len(payload)} bytes) "
-                f"[total kills: {self._total_kills}]"
-            )
+        # EWMA Adaptive Controller state — file-based IPC with Slow Loop
+        self._current_k: int = 200          # Sampling interval (K_max default)
+        self._packet_counter: int = 0       # Monotonic — never reset
+        self._recv_count: int = 0           # Number of recv() calls (for telemetry)
+        self._ipc_read_interval: int = 50   # Read adaptive_k.json every N packets
+        self._adaptive_k_path: str = "shared/adaptive_k.json"
+        self._response_buf_path: str = "shared/response_buffer.jsonl"
+        self._adaptive_k_mtime: float = 0.0
+        # Load adaptive config from config.yaml (if present)
+        self._load_adaptive_config_into_self()
+
+        log.info(
+            "MutationEngine initialized",
+            extra={"context": {
+                "target": f"{target_host}:{target_port}",
+                "mode":   self._mode.value,
+                "k":      k,
+                "max_eps": max_eps,
+                "adaptive_k": adaptive_k,
+                "use_weighted": use_weighted,
+                "warmup_seconds": warmup_seconds,
+            }},
+        )
+
+    # -------------------------------------------------------------------
+    # Scheduler factory
+    # -------------------------------------------------------------------
+
+    def _make_normal_scheduler(self) -> _BaseScheduler:
+        """Create the appropriate normal-mode scheduler based on config."""
+        if self.use_weighted:
+            return WeightedScheduler(k=self.k, adaptive=self.adaptive_k)
         else:
-            # Decide split between random and rule-based
-            n_random = max(1, int(self.mutations_per_packet * self.random_flip_ratio))
-            n_rule_based = max(0, self.mutations_per_packet - n_random)
-
-            # Random mutations (baseline)
-            for _ in range(n_random):
-                variant = self.random_bitflip(original_packet)
-                variants.append(variant)
-
-            # Rule-based mutations (smart)
-            if self.mode == "smart" and self._rules:
-                for _ in range(n_rule_based):
-                    variant = self._apply_best_rule(original_packet)
-                    if variant is not None:
-                        variants.append(variant)
-
-        # Inject all variants and track the last injected for crash attribution
-        for v in variants:
-            if len(v) <= self.max_packet_size:
-                await self.interceptor.inject_mutation(v)
-                self._total_mutations += 1
-                self._last_injected_packet = v
-                if not self._last_injected_rule_id:
-                    self._last_injected_rule_id = (
-                        "rule_based" if self._rules else "random"
-                    )
-
-        logger.info(
-            f"Mutated packet #{self._total_packets}: "
-            f"{len(variants)} variants injected "
-            f"(total mutations: {self._total_mutations})"
-        )
-        return variants
-
-    # -----------------------------------------------------------------
-    # Dynamic Rule Reload
-    # -----------------------------------------------------------------
-
-    async def reload_rules(self) -> int:
-        """Reload rules from shared/active_rules.json.
-
-        Uses mtime check to avoid re-parsing every cycle. The Slow Loop
-        writes the file atomically (temp + rename) — on Linux, ``rename()``
-        is atomic within a single filesystem, so the Fast Loop will either
-        see the old file or the new file, never a partial write.
-
-        For extra safety, if a read encounters a JSONDecodeError (possible
-        on NFS or unusual filesystems), we retry with a short backoff.
-
-        Returns:
-            Number of newly loaded rules, or 0 if file is unchanged/missing.
-        """
-        if not self._rules_file.exists():
-            return 0
-
-        try:
-            mtime = self._rules_file.stat().st_mtime
-        except OSError:
-            return 0
-
-        if mtime <= self._last_rules_mtime:
-            return 0
-
-        # Retry read up to 3 times with backoff (handles transient
-        # partial reads on non-atomic filesystems like NFS)
-        max_read_retries = 3
-        for attempt in range(max_read_retries):
-            try:
-                # Use explicit file descriptor (not Path.read_text) to
-                # ensure the file handle is opened atomically relative
-                # to any concurrent rename by the Slow Loop writer.
-                with open(self._rules_file, "r", encoding="utf-8") as f:
-                    data = f.read()
-                rules_data = json.loads(data)
-                break  # Success — exit retry loop
-            except (json.JSONDecodeError, OSError) as e:
-                if attempt < max_read_retries - 1:
-                    logger.debug(
-                        f"Rules file read attempt {attempt + 1} failed "
-                        f"(will retry): {e}"
-                    )
-                    await asyncio.sleep(0.1 * (attempt + 1))
-                else:
-                    logger.warning(
-                        f"Failed to read rules file after {max_read_retries} "
-                        f"attempts (will retry on next cycle): {e}"
-                    )
-                    return 0
-
-        try:
-            new_rules = [
-                SemanticRule.model_validate(r) for r in rules_data
-            ]
-        except Exception as e:
-            logger.warning(f"Invalid rules in file (skipping): {e}")
-            return 0
-
-        added = 0
-        existing_ids = {r.rule_id for r in self._rules}
-        for rule in new_rules:
-            if rule.rule_id not in existing_ids:
-                self._rules.append(rule)
-                existing_ids.add(rule.rule_id)
-                added += 1
-
-        if added > 0:
-            self._last_rules_mtime = mtime
-            logger.info(
-                f"Reloaded {added} new rules from {self._rules_file} "
-                f"(total active: {len(self._rules)})"
-            )
-        return added
-
-    # -----------------------------------------------------------------
-    # Main Mutation Loop (reads traffic log)
-    # -----------------------------------------------------------------
-
-    async def mutation_loop(
-        self,
-        traffic_log_path: str = "shared/raw_traffic.jsonl",
-        poll_interval: float = 2.0,
-    ) -> None:
-        """Main async loop: read traffic log, mutate packets, inject.
-
-        This loop absorbs the mutation logic that was previously inline
-        in ``main.py``. It runs as an independent asyncio task.
-
-        Every ``rule_reload_interval_s`` seconds, it checks for new rules
-        from the Slow Loop.
-
-        Args:
-            traffic_log_path: Path to the JSONL traffic log.
-            poll_interval: Seconds between traffic log polls.
-        """
-        log_path = Path(traffic_log_path)
-        last_pos = 0
-        rule_reload_counter = 0
-        rule_reload_ticks = max(
-            1, int(self._rule_reload_interval / poll_interval)
-        )
-
-        logger.info(
-            f"Mutation loop started (poll={poll_interval}s, "
-            f"rules_file={self._rules_file})"
-        )
-
-        try:
-            while not self._paused and self.interceptor.is_running:
-                # ── Periodic rule reload ─────────────────────────────
-                rule_reload_counter += 1
-                if rule_reload_counter >= rule_reload_ticks:
-                    await self.reload_rules()
-                    rule_reload_counter = 0
-
-                # ── Read traffic log (non-blocking I/O) ────────────────
-                if not log_path.exists():
-                    await asyncio.sleep(poll_interval)
-                    continue
-
-                try:
-                    lines = await asyncio.get_event_loop().run_in_executor(
-                        None, self._read_log_lines, log_path, last_pos
-                    )
-                except OSError:
-                    await asyncio.sleep(poll_interval)
-                    continue
-
-                if len(lines) <= last_pos:
-                    await asyncio.sleep(poll_interval)
-                    continue
-
-                # ── Process new client→server non-mutated packets ──────
-                for line in lines[last_pos:]:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        record = json.loads(line)
-                        if (
-                            record.get("direction") == "client_to_server"
-                            and not record.get("is_mutated")
-                        ):
-                            raw_hex = record.get("payload", "")
-                            if raw_hex and len(raw_hex) >= 8:
-                                raw_data = bytes.fromhex(raw_hex)
-                                await self.mutate(raw_data)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-
-                last_pos = len(lines)
-
-                # ── Stats ────────────────────────────────────────────
-                stats = self.coverage_summary
-                logger.info(
-                    f"Stats: packets={stats['total_packets']} "
-                    f"mutations={stats['total_mutations']} "
-                    f"kills={stats['total_kills']} "
-                    f"rules={stats['active_rules']} "
-                    f"captured={self.interceptor.total_captured} "
-                    f"injected={self.interceptor.total_injected}"
-                )
-
-                await asyncio.sleep(poll_interval)
-
-        except asyncio.CancelledError:
-            pass
-
-        logger.info("Mutation loop stopped.")
-
-    async def _read_log_lines(self, path: Path, from_pos: int) -> list[str]:
-        """Read log file from position, return all lines (blocking helper for executor)."""
-        with open(path, "r", encoding="utf-8") as f:
-            return f.readlines()[from_pos:]
-
-    # -----------------------------------------------------------------
-    # Random Mutations (Baseline)
-    # -----------------------------------------------------------------
-
-    def random_bitflip(self, data: bytes) -> bytes:
-        """Flip one random bit in the packet."""
-        if not data:
-            return data
-        buf = bytearray(data)
-        byte_idx = random.randint(0, len(buf) - 1)
-        bit_idx = random.randint(0, 7)
-        buf[byte_idx] ^= (1 << bit_idx)
-        return bytes(buf)
-
-    def random_byte_substitution(self, data: bytes) -> bytes:
-        """Replace one random byte with a random value."""
-        if not data:
-            return data
-        buf = bytearray(data)
-        idx = random.randint(0, len(buf) - 1)
-        buf[idx] = random.randint(0, 255)
-        return bytes(buf)
-
-    # -----------------------------------------------------------------
-    # Rule-Based Mutations
-    # -----------------------------------------------------------------
-
-    def _apply_best_rule(self, packet: bytes) -> Optional[bytes]:
-        """Apply the highest-priority applicable rule to the packet."""
-        applicable = [
-            r for r in self._rules
-            if r.offset_end <= len(packet) and r.offset_start < r.offset_end
-        ]
-        if not applicable:
-            return self.random_byte_substitution(packet)
-
-        rule = max(applicable, key=lambda r: r.priority)
-        variant = self.apply_rule(packet, rule)
-
-        # Track which rule generated this mutation
-        self._last_injected_rule_id = rule.rule_id
-        return variant
-
-    def apply_rule(self, packet: bytes, rule: SemanticRule) -> Optional[bytes]:
-        """Apply a single semantic rule to a packet.
-
-        Dispatches to the Advanced Binary Mutation Arsenal operators
-        based on ``rule.rule_type``:
-
-        - ``BIT_FLIP``  → op_bit_flip (1–3 random bits)
-        - ``BOUNDARY``   → op_integer_overflow or op_boundary_violation
-        - ``STRUCTURAL`` → op_buffer_overflow, op_format_string, or
-                           op_random_byte_injection
-        - ``STATE``      → drop packet (50 %) or op_omission (50 %)
-
-        OOB safety: ``safe_slice()`` zero-pads the buffer if the LLM
-        hallucinates offsets beyond the packet length.
-
-        Returns:
-            Mutated bytes, or None if the rule drops the packet (STATE type).
-        """
-        # OOB-safe buffer — zero-pads if offsets exceed packet length
-        buf = safe_slice(bytearray(packet), rule.offset_start, rule.offset_end)
-
-        if rule.rule_type == RuleType.BIT_FLIP:
-            buf = op_bit_flip(
-                buf, rule.offset_start, rule.offset_end,
-                rule.field_type, rule.constraints,
-            )
-
-        elif rule.rule_type == RuleType.BOUNDARY:
-            if random.random() < 0.5:
-                buf = op_integer_overflow(
-                    buf, rule.offset_start, rule.offset_end,
-                    rule.field_type, rule.constraints,
-                )
-            else:
-                buf = op_boundary_violation(
-                    buf, rule.offset_start, rule.offset_end,
-                    rule.field_type, rule.constraints,
-                )
-
-        elif rule.rule_type == RuleType.STRUCTURAL:
-            op = random.choice([
-                op_buffer_overflow,
-                op_format_string,
-                op_random_byte_injection,
-            ])
-            buf = op(
-                buf, rule.offset_start, rule.offset_end,
-                rule.field_type, rule.constraints,
-            )
-
-        elif rule.rule_type == RuleType.STATE:
-            # 50 % chance: drop the packet entirely, 50 %: truncate
-            if random.random() < 0.5:
-                return None
-            buf = op_omission(
-                buf, rule.offset_start, rule.offset_end,
-                rule.field_type, rule.constraints,
-            )
-
-        # Track coverage
-        self._fuzzed_offsets.add((rule.offset_start, rule.offset_end))
-
-        # Restore preserved bytes (magic header prefix)
-        if rule.preserve_bytes:
-            buf[: len(rule.preserve_bytes)] = rule.preserve_bytes
-
-        # Restore static values at specific offsets
-        for offset, value in rule.static_values_to_keep.items():
-            if 0 <= offset < len(buf):
-                buf[offset] = value
-
-        return bytes(buf)
-
-    def _pick_boundary_value(self, rule: SemanticRule) -> int:
-        """Pick a boundary value based on field type and constraints."""
-        values = [0, (1 << (rule.field_length * 8)) - 1]
-
-        if rule.constraints.min_value is not None:
-            values.append(rule.constraints.min_value)
-        if rule.constraints.max_value is not None:
-            values.append(rule.constraints.max_value)
-
-        if rule.constraints.invalid_values:
-            values.extend(
-                v for v in rule.constraints.invalid_values if isinstance(v, int)
-            )
-
-        return random.choice(values) if values else 0
-
-    def _pick_structural_value(self, rule: SemanticRule) -> int:
-        """Pick a structural value (increment/decrement/random)."""
-        strategy = random.choice(["increment", "decrement", "random"])
-        if strategy == "random":
-            max_val = (1 << (rule.field_length * 8)) - 1
-            return random.randint(0, max_val)
-        elif strategy == "increment":
-            return 1
-        else:  # decrement
-            return -1
-
-    @staticmethod
-    def _encode_value(value: int, field_type: FieldType, field_len: int) -> bytes:
-        """Encode an integer value according to field type."""
-        fmt_map = {
-            FieldType.UINT8: ("B", 1),
-            FieldType.UINT16_LE: ("<H", 2),
-            FieldType.UINT16_BE: (">H", 2),
-            FieldType.UINT32_LE: ("<I", 4),
-            FieldType.UINT32_BE: (">I", 4),
-            FieldType.INT8: ("b", 1),
-            FieldType.INT16_LE: ("<h", 2),
-            FieldType.INT16_BE: (">h", 2),
-            FieldType.INT32_LE: ("<i", 4),
-            FieldType.INT32_BE: (">i", 4),
-        }
-        if field_type in fmt_map:
-            fmt, size = fmt_map[field_type]
-            return struct.pack(fmt, value)
-        return value.to_bytes(field_len, byteorder="little", signed=False)
-
-    # -----------------------------------------------------------------
-    # Rule Set Management
-    # -----------------------------------------------------------------
-
-    def update_rules(self, new_rules: list[SemanticRule]) -> None:
-        """Hot-swap the active rule set."""
-        existing_ids = {r.rule_id for r in self._rules}
-        added = 0
-        for rule in new_rules:
-            if rule.rule_id not in existing_ids:
-                self._rules.append(rule)
-                existing_ids.add(rule.rule_id)
-                added += 1
-        logger.info(f"Rules updated: +{added} rules (total: {len(self._rules)})")
-
-    # -----------------------------------------------------------------
-    # Pause / Resume (called by CrashMonitor)
-    # -----------------------------------------------------------------
-
-    def pause(self) -> None:
-        """Pause the mutation loop (called by CrashMonitor on crash)."""
-        self._paused = True
-        logger.warning("MutationEngine PAUSED")
-
-    def resume(self) -> None:
-        """Resume the mutation loop (called by CrashMonitor after reset)."""
-        self._paused = False
-        logger.info("MutationEngine RESUMED")
-
-    # -----------------------------------------------------------------
-    # Properties
-    # -----------------------------------------------------------------
+            return RandomSubsetScheduler(k=self.k, adaptive=self.adaptive_k)
+
+    # -------------------------------------------------------------------
+    # Backward Compatibility
+    # -------------------------------------------------------------------
 
     @property
     def coverage_summary(self) -> dict:
+        """Backward-compatible property for telemetry and callers."""
+        s = self._stats
         return {
-            "total_mutations": self._total_mutations,
-            "total_packets": self._total_packets,
-            "total_kills": self._total_kills,
-            "unique_offsets_fuzzed": len(self._fuzzed_offsets),
-            "active_rules": len(self._rules),
+            "total_mutations": s.total_sent,
+            "total_packets": s.total_sent,
+            "total_kills": s.total_crashes,
+            "unique_offsets_fuzzed": len(self._mutation_signatures),
+            "active_rules": s.rule_set_version,
+            "current_eps": s.current_eps,
+            "mode": s.mode,
+            "investigation_mode": s.investigation_mode,
+            "current_k": self._current_k,
+            "recv_sample_rate": self._recv_count / max(1, s.total_sent),
         }
+
+    # -------------------------------------------------------------------
+    # Lifecycle
+    # -------------------------------------------------------------------
+
+    async def run(self) -> None:
+        """Main hot-loop. Run as a long-lived asyncio Task."""
+        self._running = True
+        log.info("MutationEngine hot-loop started", extra={"context": {
+            "mode": self._mode.value,
+            "target": f"{self.target_host}:{self.target_port}",
+        }})
+
+        # Initial seed drain — wait up to 5 s for the first seed
+        for _ in range(50):
+            await self._drain_seeds()
+            if self._corpus:
+                break
+            await asyncio.sleep(0.1)
+
+        if not self._corpus:
+            log.warning("No seeds received after 5 s — entering dumb-fuzz mode")
+            self._corpus.append(self._make_dummy_seed())
+
+        # P3-A: ALL_FIELDS warm-up phase
+        warmup_deadline: float = 0.0
+        if self.warmup_seconds > 0 and not self._warmup_done:
+            log.info(
+                f"Starting ALL_FIELDS warm-up ({self.warmup_seconds}s)",
+                extra={"context": {"warmup_seconds": self.warmup_seconds}},
+            )
+            async with self._sched_lock:
+                self._scheduler = AllFieldsScheduler()
+                self._mode = MutationMode.ALL_FIELDS
+                self._stats.mode = self._mode.value
+            warmup_deadline = time.monotonic() + self.warmup_seconds
+
+        while self._running:
+            if self._paused:
+                await asyncio.sleep(0.05)
+                continue
+
+            # Poll for rule updates from Slow Loop / Math-Only
+            await self._poll_rules_file()
+
+            # EWMA Adaptive Controller: refresh k from Slow Loop every N packets
+            if self._packet_counter % self._ipc_read_interval == 0:
+                self._poll_adaptive_k()
+
+            # Throttle
+            if self.max_eps > 0:
+                await asyncio.sleep(1.0 / self.max_eps)
+
+            await self._drain_seeds()
+
+            # ── Sequence-Aware Fuzzing ──────────────────────────────
+            seed   = self._pick_seed()       # returns SeedSequence
+
+            # Skip empty sequences (shouldn't happen, but defensive)
+            if not seed.packets:
+                continue
+
+            target = self._split_sequence(seed)   # FuzzTarget
+            payload = await self._build_mutant(target.target_seed)
+
+            # IFPS: track sequence frequency for energy-based selection
+            self._seed_freq[seed.sequence_id] = (
+                self._seed_freq.get(seed.sequence_id, 0) + 1
+            )
+
+            # Dispatch: multi-packet sequence vs single-packet legacy path
+            if target.prefix or target.suffix:
+                # Multi-packet sequence: use ⟨Prefix, Target, Suffix⟩
+                status = await self._execute_sequence(target, payload)
+            elif self.connection_mode == "stateful" and self._setup_packets:
+                # Single packet with static setup packets from config
+                status = await self._send_stateful(payload, seed.sequence_id)
+            else:
+                # Single packet: fresh connection per send (legacy)
+                status = await self._send(payload, seed.sequence_id)
+
+            self._update_stats(status, payload)
+
+            # IFPS: periodic cap to prevent unbounded growth.
+            # Cap rather than delete — deleting would cause .get(_, 0) to
+            # return 0, giving the seed maximum Energy (inverting IFPS).
+            if self._stats.total_sent % 10_000 == 0 and self._seed_freq:
+                cap = 999
+                self._seed_freq = {
+                    k: min(v, cap) for k, v in self._seed_freq.items()
+                }
+
+            # Cap mutation signatures to prevent OOM on long fuzzing runs.
+            # FIX: instead of .clear() (which drops coverage to 0, breaking
+            # monotonic coverage plots), keep the latest 80k signatures.
+            if len(self._mutation_signatures) > 100_000:
+                # Discard oldest 20k, keep most recent 80k
+                excess = list(self._mutation_signatures)[:20000]
+                for sig in excess:
+                    self._mutation_signatures.discard(sig)
+
+            # P3-A: warm-up deadline check
+            if warmup_deadline > 0 and time.monotonic() >= warmup_deadline:
+                self._warmup_done = True
+                await self.set_normal_mode()
+                warmup_deadline = 0.0
+                log.info("Warm-up complete — switching to normal mode")
+
+            # P1-A: deterministic revert from ONE_AT_A_TIME → normal
+            if self._revert_pending:
+                self._revert_pending = False
+                self._stats.revert_pending = False
+                await self.set_normal_mode()
+
+            # Auto-switch to investigation mode after a crash
+            # P3-A: skip investigation during warm-up
+            if (
+                status == PacketStatus.CRASH
+                and self.auto_investigate
+                and not (self._mode == MutationMode.ALL_FIELDS and not self._warmup_done)
+            ):
+                await self.set_investigation_mode(
+                    reason=f"crash detected on seed {seed.sequence_id[:8]}"
+                )
+
+        log.info("MutationEngine hot-loop stopped", extra={"context": {
+            "total_sent":  self._stats.total_sent,
+            "crashes":     self._stats.total_crashes,
+            "current_eps": self._stats.current_eps,
+        }})
+
+    async def stop(self) -> None:
+        """Signal the hot-loop to stop cleanly after the current iteration."""
+        self._running = False
+
+    def pause(self) -> None:
+        """Temporarily suspend fuzzing (e.g. while target server restarts)."""
+        self._paused = True
+        log.info("MutationEngine PAUSED")
+
+    def resume(self) -> None:
+        """Resume fuzzing after a pause."""
+        self._paused = False
+        log.info("MutationEngine RESUMED")
+
+    # -------------------------------------------------------------------
+    # Mode Control  (hook for Health Monitor / orchestrator)
+    # -------------------------------------------------------------------
+
+    async def set_investigation_mode(self, reason: str = "") -> None:
+        """Switch to ONE_AT_A_TIME mode for precise crash isolation.
+
+        P1-A fix: If already in ONE_AT_A_TIME, reset the scheduler
+        instead of silently dropping the crash trigger.
+        """
+        async with self._sched_lock:
+            if self._mode == MutationMode.ONE_AT_A_TIME:
+                # P1-A: restart investigation from field 0 with fresh budget
+                if isinstance(self._scheduler, OneAtATimeScheduler):
+                    self._scheduler.reset()
+                    log.warning(
+                        "Crash during investigation — restarting field scan from field 0",
+                        extra={"context": {"reason": reason}},
+                    )
+                return
+
+            # P2-D: adaptive budget_per_field
+            if self.budget_per_field > 0:
+                bpf = self.budget_per_field  # explicit override
+            else:
+                # Adaptive: target ~5s per field at current EPS
+                eps = self._stats.current_eps or 10.0
+                bpf = max(20, min(200, int(5.0 * eps)))
+
+            self._scheduler = OneAtATimeScheduler(
+                budget_per_field=bpf,
+                isolation_budget=self.investigation_budget,
+            )
+            self._mode = MutationMode.ONE_AT_A_TIME
+            self._stats.mode               = self._mode.value
+            self._stats.investigation_mode = True
+
+        log.warning(
+            "MODE → ONE_AT_A_TIME (crash isolation)",
+            extra={"context": {
+                "reason":  reason or "manual",
+                "budget":  self.investigation_budget,
+                "budget_per_field": bpf,
+            }},
+        )
+
+    async def set_normal_mode(self) -> None:
+        """Revert to normal mode (WEIGHTED or RANDOM_SUBSET).
+
+        P2-C: Captures investigation summary before discarding scheduler.
+        """
+        async with self._sched_lock:
+            # P2-C: capture investigation summary before replacing scheduler
+            if isinstance(self._scheduler, OneAtATimeScheduler):
+                self._stats.last_investigation_summary = {
+                    "field_index_at_revert": self._scheduler.get_current_field_index(),
+                    "total_sends": self._scheduler._sends_this_mode,
+                    "field_hits": dict(self._scheduler._field_hits),
+                    "reverted_at": time.monotonic(),
+                    "reason": "budget_exhausted",
+                }
+                log.warning(
+                    "Investigation complete — summary",
+                    extra={"context": self._stats.last_investigation_summary},
+                )
+
+            self._scheduler = self._make_normal_scheduler()
+            self._mode      = MutationMode.RANDOM_SUBSET
+            self._stats.mode               = self._mode.value
+            self._stats.investigation_mode = False
+            self._stats.investigation_field = None
+
+        log.info(
+            "MODE → RANDOM_SUBSET (normal fuzzing resumed)",
+            extra={"context": {
+                "k": self.k,
+                "weighted": self.use_weighted,
+                "adaptive_k": self.adaptive_k,
+            }},
+        )
+
+    async def update_rule_set(self, new_rules: SemanticRuleSet) -> None:
+        """Atomically replace the active SemanticRuleSet.
+
+        P1-B: Auto-transition from DUMB to normal mode when rules arrive.
+        """
+        async with self._rule_lock:
+            old_id = self._rule_set.rule_set_id[:8] if self._rule_set else "none"
+            self._rule_set = new_rules
+            self._stats.rule_set_version += 1
+            self._stats.rule_set_id       = new_rules.rule_set_id[:8]
+            self._stats.active_fields     = len(new_rules.get_mutable_fields())
+
+            # Cache decoded setup packets for stateful mode
+            self._setup_packets = [
+                bytes.fromhex(hp) for hp in new_rules.setup_packets if hp
+            ]
+
+        # P1-B: auto-transition from DUMB → normal when rules arrive
+        if self._mode == MutationMode.DUMB:
+            async with self._sched_lock:
+                self._scheduler = self._make_normal_scheduler()
+                self._mode = MutationMode.RANDOM_SUBSET
+                self._stats.mode = self._mode.value
+                self._stats.investigation_field = None
+            log.info("Rules arrived — transitioning from DUMB to RANDOM_SUBSET")
+
+        log.info(
+            "Rule set updated (atomic swap)",
+            extra={"context": {
+                "old_id":     old_id,
+                "new_id":     new_rules.rule_set_id[:8],
+                "protocol":   new_rules.protocol_name,
+                "mutable":    len(new_rules.get_mutable_fields()),
+                "static":     len(new_rules.get_static_fields()),
+                "confidence": f"{new_rules.overall_confidence:.0%}",
+                "version":    self._stats.rule_set_version,
+            }},
+        )
+
+    def get_stats(self) -> MutatorStats:
+        """Return a snapshot of current runtime statistics."""
+        total = max(1, self._stats.total_sent)
+        return MutatorStats(
+            mode                       = self._mode.value,
+            total_sent                 = self._stats.total_sent,
+            total_accepted             = self._stats.total_accepted,
+            total_rejected             = self._stats.total_rejected,
+            total_timeout              = self._stats.total_timeout,
+            total_crashes              = self._stats.total_crashes,
+            current_eps                = self._stats.current_eps,
+            rule_set_version           = self._stats.rule_set_version,
+            rule_set_id                = self._stats.rule_set_id,
+            active_fields              = self._stats.active_fields,
+            investigation_mode         = self._stats.investigation_mode,
+            investigation_field        = self._stats.investigation_field,
+            k_this_round               = self._stats.k_this_round,
+            revert_pending             = self._stats.revert_pending,
+            last_investigation_summary = dict(self._stats.last_investigation_summary),
+            current_k                  = self._current_k,
+            recv_sample_rate           = self._recv_count / total,
+        )
+
+    def get_crash_window(self) -> list[tuple]:
+        """H3 fix: return recent send history for crash attribution.
+
+        Returns a list of ``(timestamp, payload_bytes, rule_id)`` tuples
+        representing the last N sends.  The CrashMonitor uses this to
+        attribute crashes to the correct packet, not just the most recent.
+        """
+        return list(self._crash_window)
+
+    # -------------------------------------------------------------------
+    # P2-C: Investigation Summary
+    # -------------------------------------------------------------------
+
+    def get_last_investigation_summary(self) -> dict:
+        """Return summary from last completed investigation phase."""
+        return dict(self._stats.last_investigation_summary)
+
+    # -------------------------------------------------------------------
+    # Sequence Splitter — M = ⟨Prefix, Target, Suffix⟩
+    # -------------------------------------------------------------------
+
+    def _split_sequence(self, seq: SeedSequence) -> FuzzTarget:
+        """Split a SeedSequence into ⟨Prefix, Target, Suffix⟩.
+
+        Target index selection uses quadratic weighting:
+            P(i) ∝ (i + 1)²
+        so later packets (deeper protocol states) are selected more often.
+        For a 3-packet FTP session (USER, PASS, LIST), this means:
+            P(index=0) = 1/14, P(index=1) = 4/14, P(index=2) = 9/14
+        """
+        n = len(seq.packets)
+        if n == 0:
+            raise IndexError("Sequence has no packets")
+        if n == 1:
+            return FuzzTarget(
+                prefix=[],
+                target_seed=seq.packets[0],
+                target_index=0,
+                suffix=[],
+                sequence_id=seq.sequence_id,
+            )
+
+        # Quadratic weighting: later packets = deeper states = more interesting
+        weights = [(i + 1) ** 2 for i in range(n)]
+        total = sum(weights)
+        r = random.random() * total
+        cumulative = 0.0
+        target_idx = n - 1  # default to last packet
+        for i, w in enumerate(weights):
+            cumulative += w
+            if r <= cumulative:
+                target_idx = i
+                break
+
+        return FuzzTarget(
+            prefix=[p.raw_bytes for p in seq.packets[:target_idx]],
+            target_seed=seq.packets[target_idx],
+            target_index=target_idx,
+            suffix=[p.raw_bytes for p in seq.packets[target_idx + 1:]],
+            sequence_id=seq.sequence_id,
+        )
+
+    # -------------------------------------------------------------------
+    # EWMA Adaptive Controller — helpers
+    # -------------------------------------------------------------------
+
+    def _should_recv(self) -> bool:
+        """EWMA Adaptive Controller: decide whether this packet should call recv().
+
+        Returns True every current_k-th packet.
+        When no_recv=True, always returns False (fire-and-forget mode).
+        Thread-safe: _packet_counter is only written from the single asyncio hot loop.
+        """
+        if self.no_recv:
+            return False
+        self._packet_counter += 1
+        return (self._packet_counter % max(1, self._current_k)) == 0
+
+    def _record_response_sample(self, response: bytes) -> None:
+        """EWMA Adaptive Controller: append sampled response to shared buffer.
+
+        Fast path: skip if file already large (>80KB ≈ 1000 lines).
+        Non-blocking: write failure is silently ignored (never crash the hot loop).
+        """
+        try:
+            path = self._response_buf_path
+            # Fast size check before open (os.stat is ~200ns)
+            try:
+                if os.stat(path).st_size > 80_000:
+                    return
+            except FileNotFoundError:
+                pass
+            hex_prefix = response[:8].hex() if len(response) >= 8 else response.hex()
+            line = json.dumps({
+                "hex_prefix": hex_prefix,
+                "length": len(response),
+                "ts": round(time.time(), 3),
+            }) + "\n"
+            with open(path, "a") as f:
+                f.write(line)
+        except Exception:
+            pass  # Never crash hot loop for IPC write failure
+
+    def _poll_adaptive_k(self) -> None:
+        """Poll shared/adaptive_k.json for EWMA controller updates.
+
+        Reuses the exact same mtime-check pattern as _poll_rules_file().
+        Non-blocking: if file missing or malformed, keep existing _current_k.
+        """
+        try:
+            path = self._adaptive_k_path
+            if not os.path.exists(path):
+                return
+            mtime = os.path.getmtime(path)
+            if mtime <= self._adaptive_k_mtime:
+                return
+            with open(path) as f:
+                data = json.load(f)
+
+            if isinstance(data, dict) and "current_k" in data:
+                k = int(data["current_k"])
+                self._current_k = max(1, min(k, self._ewma_k_max))  # clamp [1, K_max]
+                self._stats.current_k = self._current_k
+                self._stats.ewma_lambda_c = data.get("lambda_c", 0.0)
+                self._stats.ewma_regime = data.get("regime", "sparse")
+                self._adaptive_k_mtime = mtime
+        except (ValueError, KeyError, TypeError, OSError):
+            pass  # Keep existing _current_k on any parse error
+
+    @staticmethod
+    def _load_adaptive_config() -> dict:
+        """Read adaptive_sampling + ewma_controller config from config.yaml, return with defaults."""
+        defaults = {
+            "ipc_read_interval": 50,
+            "k_default": 200,
+            "adaptive_k_path": "shared/adaptive_k.json",
+            "response_buf_path": "shared/response_buffer.jsonl",
+            "ewma_k_max": 200,
+        }
+        try:
+            import yaml
+            cfg = Path("config.yaml")
+            if cfg.exists():
+                with open(cfg) as f:
+                    data = yaml.safe_load(f) or {}
+                # Fast Loop side (adaptive_sampling)
+                section = (data.get("fast_loop") or {}).get("adaptive_sampling") or {}
+                for key, default in defaults.items():
+                    if key in section:
+                        defaults[key] = section[key]
+                # Slow Loop side (ewma_controller) — K_max is defined here
+                ewma = (data.get("slow_loop") or {}).get("ewma_controller") or {}
+                if "K_max" in ewma:
+                    defaults["ewma_k_max"] = ewma["K_max"]
+        except Exception:
+            pass
+        return defaults
+
+    def _load_adaptive_config_into_self(self) -> None:
+        """Load adaptive config into instance variables."""
+        cfg = self._load_adaptive_config()
+        self._ipc_read_interval = cfg["ipc_read_interval"]
+        self._current_k = cfg["k_default"]
+        self._adaptive_k_path = cfg["adaptive_k_path"]
+        self._response_buf_path = cfg["response_buf_path"]
+        self._ewma_k_max: int = cfg["ewma_k_max"]
+
+    # -------------------------------------------------------------------
+    # Seed Management
+    # -------------------------------------------------------------------
+
+    async def _drain_seeds(self) -> None:
+        """Non-blocking drain: move SeedSequence objects from queue to corpus.
+
+        Backward compatible: bare TrafficRecord objects are automatically
+        wrapped in a single-packet SeedSequence.
+
+        Evicts highest-frequency (least interesting) sequences when corpus
+        exceeds MAX_CORPUS to prevent unbounded memory growth.
+        """
+        MAX_CORPUS = 5000
+
+        while not self.seed_queue.empty():
+            try:
+                item = self.seed_queue.get_nowait()
+                # Backward compat: wrap bare TrafficRecord from legacy callers
+                if isinstance(item, TrafficRecord) and not isinstance(item, SeedSequence):
+                    item = SeedSequence(packets=[item])
+                self._corpus.append(item)
+                self.seed_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+
+        # Evict least-interesting sequences when corpus exceeds cap.
+        # Highest-frequency = most over-fuzzed = least interesting for IFPS.
+        if len(self._corpus) > MAX_CORPUS:
+            scored = [
+                (i, self._seed_freq.get(s.sequence_id, 0))
+                for i, s in enumerate(self._corpus)
+            ]
+            scored.sort(key=lambda x: x[1], reverse=True)
+            # Remove top 20% most-frequent seeds
+            to_remove = set(i for i, _ in scored[: len(scored) // 5])
+            self._corpus = [
+                s for i, s in enumerate(self._corpus) if i not in to_remove
+            ]
+
+    def _pick_seed(self) -> SeedSequence:
+        """Inverse-Frequency Power Schedule (IFPS) seed selection.
+
+        Operates at sequence level: each SeedSequence is one unit.
+        Rarely-used sequences get higher energy and are chosen more often.
+
+        Uses acceptance-rejection sampling — O(1) expected time per
+        selection regardless of corpus size.
+        """
+        n = len(self._corpus)
+        if n == 0:
+            raise IndexError("Corpus is empty")
+        if n == 1:
+            return self._corpus[0]
+
+        # Max energy is 1.0 (freq=0).  Acceptance-rejection:
+        for _ in range(n + 10):  # bounded retries, fallback to uniform
+            idx = random.randint(0, n - 1)
+            freq = self._seed_freq.get(self._corpus[idx].sequence_id, 0)
+            energy = 1.0 / (freq + 1)
+            if random.random() < energy:
+                return self._corpus[idx]
+
+        # Fallback: uniform random (extremely unlikely to reach here)
+        return self._corpus[random.randint(0, n - 1)]
+
+    @staticmethod
+    def _make_dummy_seed() -> SeedSequence:
+        """Generate a minimal dummy seed when no real traffic is available."""
+        dummy = b"\x00" * 16
+        return SeedSequence(
+            packets=[TrafficRecord(
+                direction=Direction.CLIENT_TO_SERVER,
+                raw_data=dummy,
+            )],
+        )
+
+    # -------------------------------------------------------------------
+    # Rule File Poller — bridges Slow Loop / Math-Only → Fast Loop
+    # -------------------------------------------------------------------
+
+    @staticmethod
+    def _load_rules_path_from_config() -> str:
+        """Read rule_output_file from config.yaml, fallback to shared/active_rules.json."""
+        try:
+            import yaml as _yaml
+            _cfg = Path("config.yaml")
+            if _cfg.exists():
+                with open(_cfg) as _f:
+                    data = _yaml.safe_load(_f) or {}
+                # Try rule_generator.rule_output_file first (slow loop path)
+                rg = (data.get("slow_loop") or {}).get("rule_generator") or {}
+                path = rg.get("rule_output_file")
+                if path:
+                    return path
+                # Try fast_loop.rule_watcher.rules_file
+                rw = (data.get("fast_loop") or {}).get("rule_watcher") or {}
+                path = rw.get("rules_file")
+                if path:
+                    return path
+        except Exception:
+            pass
+        return "shared/active_rules.json"
+
+    async def _poll_rules_file(self) -> None:
+        """Poll shared/active_rules.json for new rules from Slow Loop."""
+        path = self._rules_file
+        try:
+            if not os.path.exists(path):
+                return
+            mtime = os.path.getmtime(path)
+            if mtime <= self._last_rules_mtime:
+                return
+            with open(path) as _f:
+                raw = json.loads(_f.read())
+
+            # C4 fix: update mtime BEFORE update_rule_set so that a
+            # failed update doesn't cause infinite retries on same file.
+            self._last_rules_mtime = mtime
+
+            if isinstance(raw, dict):
+                params = dict(raw)
+                params.setdefault("protocol_name", "inferred")
+                # C4 fix: overall_confidence and protocol_name are now
+                # included in the payload by push_rules() — ActiveRuleSet
+                # will pick them up via **params automatically.
+                rule_set = ActiveRuleSet(**params)
+            elif isinstance(raw, list):
+                rule_set = ActiveRuleSet(
+                    protocol_name="inferred",
+                    rules=raw,
+                )
+            else:
+                return
+
+            await self.update_rule_set(rule_set)
+
+        except json.JSONDecodeError as e:
+            log.warning(f"Corrupt rules file {path}: {e}")
+            # Still advance mtime so we don't retry the same corrupt file
+            try:
+                self._last_rules_mtime = os.path.getmtime(path)
+            except OSError:
+                pass
+        except Exception as e:
+            log.warning(f"Error polling rules file: {e}")
+
+    # -------------------------------------------------------------------
+    # Packet Construction — THE CORE ALGORITHM
+    # -------------------------------------------------------------------
+
+    async def _build_mutant(self, seed: PacketRecord) -> bytes:
+        """Build one mutated packet using the active scheduler and rule set."""
+        # Snapshot rule set — avoid holding lock during mutation
+        async with self._rule_lock:
+            rule_set = self._rule_set
+
+        if rule_set is None:
+            # P1-B: properly transition to DUMB mode
+            if self._mode != MutationMode.DUMB:
+                self._mode = MutationMode.DUMB
+                self._stats.mode = "dumb"
+                self._stats.investigation_field = None
+                log.info("No rule set — entering DUMB mode")
+
+            buf = bytearray(seed.raw_bytes)
+            result = self._dumb_mutate(buf)
+            # Clear rule attribution — no rule produced this mutation
+            self._last_injected_rule_id = None
+            # Track mutation signature
+            if buf and len(buf) == len(seed.raw_bytes):
+                for i in range(len(buf)):
+                    if buf[i] != seed.raw_bytes[i]:
+                        self._mutation_signatures.add(f"dumb:{i}:{buf[i]:02x}")
+            return result
+
+        # Choose base payload
+        base = bytearray(seed.raw_bytes)
+        if rule_set.base_packet:
+            try:
+                base = bytearray(bytes.fromhex(rule_set.base_packet))
+            except ValueError:
+                pass
+
+        mutable = rule_set.get_mutable_fields()
+        static  = rule_set.get_static_fields()
+
+        # Apply STATIC fields first (always overwrite — preserve magic bytes)
+        for f in static:
+            base = _apply_field(base, f)
+
+        # Ask scheduler which fields to mutate this round
+        async with self._sched_lock:
+            chosen = self._scheduler.select(mutable)
+            if self._mode == MutationMode.ONE_AT_A_TIME and chosen:
+                self._stats.investigation_field = chosen[0].field_name
+            # P2-A: track k used this round
+            self._stats.k_this_round = len(chosen)
+            if (
+                self._mode == MutationMode.ONE_AT_A_TIME
+                and isinstance(self._scheduler, OneAtATimeScheduler)
+                and self._scheduler.is_budget_exhausted(len(mutable))
+            ):
+                # P1-A: set flag instead of fire-and-forget
+                self._revert_pending = True
+                self._stats.revert_pending = True
+
+        # Apply mutations for the chosen subset
+        # Bugfix: when k>1, force length-preserving mutations so that
+        # an operator that inserts/deletes bytes doesn't corrupt the
+        # offsets of subsequent fields.
+        multi = len(chosen) > 1
+        for f in chosen:
+            base = _apply_field(base, f, preserve_length=multi)
+            # Track mutation signature per field+strategy+offset
+            start = f.offset
+            length = f.length if f.length != -1 else len(base) - start
+            for off in range(start, min(start + length, len(base))):
+                self._mutation_signatures.add(
+                    f"rule:{f.field_name}:{f.mutation_strategy}:{off}"
+                )
+
+        # Track which rules were applied for crash attribution
+        if chosen:
+            self._last_injected_rule_id = ",".join(f.field_name for f in chosen)
+        else:
+            self._last_injected_rule_id = None
+
+        return bytes(base)
+
+    # -------------------------------------------------------------------
+    # Network Send
+    # -------------------------------------------------------------------
+
+    async def _send(self, payload: bytes, seed_id: str) -> PacketStatus:
+        """Open a fresh TCP connection and send one mutated payload."""
+        status = PacketStatus.TIMEOUT
+        writer = None
+
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(self.target_host, self.target_port),
+                timeout=self.connection_timeout,
+            )
+
+            writer.write(payload)
+            await writer.drain()
+
+            # EWMA Adaptive Controller: sample recv() every current_k-th packet
+            if self._should_recv():
+                self._recv_count += 1
+                try:
+                    resp = await asyncio.wait_for(
+                        reader.read(4096), timeout=self.recv_timeout
+                    )
+                    status = PacketStatus.ACCEPTED if resp else PacketStatus.REJECTED
+                    if resp:
+                        self._record_response_sample(resp)
+                except asyncio.TimeoutError:
+                    status = PacketStatus.TIMEOUT
+            else:
+                # Fire-and-forget: assume accepted, crash detected separately
+                status = PacketStatus.ACCEPTED
+
+        except (ConnectionRefusedError, ConnectionResetError, BrokenPipeError):
+            status = PacketStatus.CRASH
+            log.error(
+                "Target CRASH (connection refused/reset)",
+                extra={"context": {
+                    "payload_hex": payload.hex()[:48],
+                    "len":         len(payload),
+                }},
+            )
+            if self.crash_callback:
+                self.crash_callback(payload, "connection_refused")
+
+        except asyncio.TimeoutError:
+            status = PacketStatus.TIMEOUT
+
+        except OSError as exc:
+            # Other OS errors (e.g. network unreachable) — not crashes
+            log.warning("Send error", extra={"context": {"err": str(exc)[:80]}})
+            status = PacketStatus.TIMEOUT
+
+        finally:
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+        # Backward compat — crash_monitor reads these
+        self._last_injected_packet = payload
+        # H3 fix: append to crash attribution window
+        self._crash_window.append((time.monotonic(), payload, self._last_injected_rule_id))
+
+        # Feed result back to Interceptor for stuck detection
+        if self.status_callback:
+            self.status_callback(seed_id, status)
+
+        return status
+
+    # -------------------------------------------------------------------
+    # Stateful Send (multi-step handshake on one connection)
+    # -------------------------------------------------------------------
+
+    async def _send_stateful(
+        self, payload: bytes, seed_id: str
+    ) -> PacketStatus:
+        """Send setup packets + mutated payload on ONE TCP connection."""
+        status = PacketStatus.TIMEOUT
+        writer = None
+
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(self.target_host, self.target_port),
+                timeout=self.connection_timeout,
+            )
+
+            # 1. Send setup packets sequentially
+            for setup_pkt in self._setup_packets:
+                writer.write(setup_pkt)
+                await writer.drain()
+                try:
+                    await asyncio.wait_for(
+                        reader.read(4096), timeout=self.recv_timeout
+                    )
+                except (asyncio.TimeoutError, Exception):
+                    pass
+
+            # 2. Send the mutated payload
+            writer.write(payload)
+            await writer.drain()
+
+            # 3. Read final response — EWMA adaptive sampling
+            if self._should_recv():
+                self._recv_count += 1
+                try:
+                    resp = await asyncio.wait_for(
+                        reader.read(4096), timeout=self.recv_timeout
+                    )
+                    status = PacketStatus.ACCEPTED if resp else PacketStatus.REJECTED
+                    if resp:
+                        self._record_response_sample(resp)
+                except asyncio.TimeoutError:
+                    status = PacketStatus.TIMEOUT
+            else:
+                status = PacketStatus.ACCEPTED
+
+        except (ConnectionRefusedError, ConnectionResetError, BrokenPipeError):
+            status = PacketStatus.CRASH
+            log.error(
+                "Target CRASH (stateful, connection refused/reset)",
+                extra={"context": {
+                    "payload_hex": payload.hex()[:48],
+                    "len":         len(payload),
+                }},
+            )
+            if self.crash_callback:
+                self.crash_callback(payload, "connection_refused")
+
+        except asyncio.TimeoutError:
+            status = PacketStatus.TIMEOUT
+
+        except OSError as exc:
+            log.warning("Stateful send error", extra={"context": {"err": str(exc)[:80]}})
+            status = PacketStatus.TIMEOUT
+
+        finally:
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+        # Backward compat — crash_monitor reads these
+        self._last_injected_packet = payload
+        # H3 fix: append to crash attribution window
+        self._crash_window.append((time.monotonic(), payload, self._last_injected_rule_id))
+
+        # Feed result back to Interceptor for stuck detection
+        if self.status_callback:
+            self.status_callback(seed_id, status)
+
+        return status
+
+    # -------------------------------------------------------------------
+    # Sequence Send (Prefix → Mutated Target → Suffix on one connection)
+    # -------------------------------------------------------------------
+
+    async def _execute_sequence(
+        self, target: FuzzTarget, mutated_payload: bytes
+    ) -> PacketStatus:
+        """Send ⟨Prefix, Mutated_Target, Suffix⟩ on ONE TCP connection.
+
+        This implements the SOTA M = ⟨Prefix, Mutated_Target, Suffix⟩ paradigm
+        for stateful protocol fuzzing:
+          Step A: Open one TCP connection
+          Step B: Send prefix packets verbatim (drive server into deep state)
+          Step C: Send mutated target packet (the fuzzing payload)
+          Step D: Send suffix packets verbatim (optional structural integrity)
+          Step E: Close connection
+
+        The returned PacketStatus reflects the server's response to the
+        mutated target ONLY — prefix/suffix responses are drained but ignored.
+        """
+        status = PacketStatus.TIMEOUT
+        writer = None
+
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(self.target_host, self.target_port),
+                timeout=self.connection_timeout,
+            )
+
+            # Step B: Send prefix packets verbatim — drain response after each
+            for pkt_bytes in target.prefix:
+                writer.write(pkt_bytes)
+                await writer.drain()
+                try:
+                    await asyncio.wait_for(
+                        reader.read(4096), timeout=self.recv_timeout
+                    )
+                except (asyncio.TimeoutError, Exception):
+                    pass  # server may not respond to every prefix packet
+
+            # Step C: Send mutated target — EWMA adaptive sampling
+            writer.write(mutated_payload)
+            await writer.drain()
+
+            if self._should_recv():
+                self._recv_count += 1
+                try:
+                    resp = await asyncio.wait_for(
+                        reader.read(4096), timeout=self.recv_timeout
+                    )
+                    status = PacketStatus.ACCEPTED if resp else PacketStatus.REJECTED
+                    if resp:
+                        self._record_response_sample(resp)
+                except asyncio.TimeoutError:
+                    status = PacketStatus.TIMEOUT
+            else:
+                status = PacketStatus.ACCEPTED
+
+            # Step D: Send suffix packets verbatim
+            for pkt_bytes in target.suffix:
+                writer.write(pkt_bytes)
+                await writer.drain()
+                try:
+                    await asyncio.wait_for(
+                        reader.read(4096), timeout=self.recv_timeout
+                    )
+                except (ConnectionResetError, BrokenPipeError):
+                    # Server crashed during suffix — the mutated target caused it.
+                    # In no_recv mode, status is still ACCEPTED — override to CRASH.
+                    if status != PacketStatus.CRASH:
+                        status = PacketStatus.CRASH
+                    # FIX: fire crash_callback so CrashManager sees this crash
+                    if self.crash_callback:
+                        self.crash_callback(mutated_payload, "suffix_crash")
+                    break
+                except (asyncio.TimeoutError, Exception):
+                    pass
+
+        except (ConnectionRefusedError, ConnectionResetError, BrokenPipeError):
+            status = PacketStatus.CRASH
+            log.error(
+                "Target CRASH (sequence, connection refused/reset)",
+                extra={"context": {
+                    "payload_hex": mutated_payload.hex()[:48],
+                    "len":         len(mutated_payload),
+                    "target_idx":  target.target_index,
+                }},
+            )
+            if self.crash_callback:
+                self.crash_callback(mutated_payload, "connection_refused")
+
+        except asyncio.TimeoutError:
+            status = PacketStatus.TIMEOUT
+
+        except OSError as exc:
+            log.warning(
+                "Sequence send error",
+                extra={"context": {"err": str(exc)[:80]}},
+            )
+            status = PacketStatus.TIMEOUT
+
+        finally:
+            # Step E: Close — always, even on error
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+        # Backward compat — crash_monitor reads this (only mutated target)
+        self._last_injected_packet = mutated_payload
+        # H3 fix: append to crash attribution window
+        self._crash_window.append((time.monotonic(), mutated_payload, self._last_injected_rule_id))
+
+        if self.status_callback:
+            self.status_callback(target.sequence_id, status)
+
+        return status
+
+    # -------------------------------------------------------------------
+    # Dumb Fallback
+    # -------------------------------------------------------------------
+
+    @staticmethod
+    def _dumb_mutate(buf: bytearray) -> bytes:
+        """
+        Last-resort mutation: flip one random bit.
+        Used when no SemanticRuleSet is loaded yet.
+        """
+        if not buf:
+            return bytes(buf)
+        i = random.randrange(len(buf))
+        b = random.randrange(8)
+        buf[i] ^= (1 << b)
+        return bytes(buf)
+
+    # -------------------------------------------------------------------
+    # Stats & EPS Tracking
+    # -------------------------------------------------------------------
+
+    def _update_stats(self, status: PacketStatus, payload: bytes) -> None:
+        """Update rolling counters and compute EPS every 5 seconds."""
+        now = time.monotonic()
+        self._eps_window.append(now)
+
+        self._stats.total_sent += 1
+        if status == PacketStatus.ACCEPTED:
+            self._stats.total_accepted += 1
+        elif status == PacketStatus.REJECTED:
+            self._stats.total_rejected += 1
+        elif status == PacketStatus.TIMEOUT:
+            self._stats.total_timeout += 1
+        elif status == PacketStatus.CRASH:
+            self._stats.total_crashes += 1
+
+        # Log EPS every 5 seconds
+        if now - self._last_eps_log >= 5.0 and len(self._eps_window) > 1:
+            window_s = self._eps_window[-1] - self._eps_window[0]
+            eps = len(self._eps_window) / window_s if window_s > 0 else 0.0
+            self._stats.current_eps = round(eps, 1)
+            self._last_eps_log = now
+
+            log.info(
+                "Fuzzing heartbeat",
+                extra={"context": {
+                    "eps":      f"{eps:.1f}",
+                    "mode":     self._mode.value,
+                    "k":        self._stats.k_this_round,
+                    "sent":     self._stats.total_sent,
+                    "crashes":  self._stats.total_crashes,
+                    "rejected": self._stats.total_rejected,
+                    "rules_v":  self._stats.rule_set_version,
+                    "fields":   self._stats.active_fields,
+                    "ewma_k":   self._current_k,
+                    "recv_rate": f"{self._recv_count / max(1, self._stats.total_sent):.1%}",
+                }},
+            )
+
+
+# ===========================================================================
+# P3-B: Kill Payload Dispatch
+# ===========================================================================
+
+async def send_kill_payloads(engine: MutationEngine) -> list[dict]:
+    """Send all KILL_SERVER_PAYLOADS with proper attribution.
+
+    P3-B: Each kill payload is sent with a named rule_id and
+    does NOT trigger investigation mode. Returns a list of
+    result dicts with payload name and status.
+
+    This function should be called by the orchestrator or test harness,
+    NOT from the hot loop.
+    """
+    results: list[dict] = []
+    for idx, payload in enumerate(KILL_SERVER_PAYLOADS):
+        name = _KILL_PAYLOAD_NAMES[idx] if idx < len(_KILL_PAYLOAD_NAMES) else f"kill_{idx}"
+        rule_id = f"kill_payload:{name}"
+
+        # Set attribution before send
+        engine._last_injected_rule_id = rule_id
+        engine._last_injected_packet = payload
+
+        status = await engine._send(payload, f"kill_{idx}")
+        crash_type = f"kill_payload:{name}" if status == PacketStatus.CRASH else None
+
+        if status == PacketStatus.CRASH:
+            log.critical(
+                f"Kill payload confirmed crash: {name}",
+                extra={"context": {
+                    "payload_name": name,
+                    "rule_id": rule_id,
+                }},
+            )
+            # Fire crash callback with proper attribution
+            if engine.crash_callback:
+                engine.crash_callback(payload, crash_type or "kill_payload")
+
+        results.append({
+            "name": name,
+            "rule_id": rule_id,
+            "status": status.value,
+            "crash": status == PacketStatus.CRASH,
+        })
+
+    return results
+
+
+# ===========================================================================
+# Field Mutation — Pure Functions (no side effects, easily unit-tested)
+# P3-C: Integrated with mutation_operators.py for sophisticated mutations
+# ===========================================================================
+
+
+def _endian_for_type(field_type: FieldType) -> str:
+    """Return ``"little"`` or ``"big"`` byte order for a FieldType.
+
+    Any FieldType whose value contains ``"_le"`` is little-endian;
+    everything else defaults to big-endian.
+    """
+    if "_le" in field_type.value:
+        return "little"
+    return "big"
+
+def _apply_field(
+    buf: bytearray,
+    rule: FieldRule,
+    preserve_length: bool = False,
+) -> bytearray:
+    """
+    Apply a single FieldRule to a mutable bytearray.
+
+    All mutation logic lives here, outside the MutationEngine class,
+    so it can be unit-tested without any async machinery.
+
+    P3-C: Dispatches to mutation_operators.py for BOUNDARY_VALUES,
+    RANDOM_BYTES, BIT_FLIP, FORMAT_STRING, and TRUNCATE strategies.
+    Falls back to inline logic for DICTIONARY, CALCULATED, INCREMENT,
+    STATIC, and SKIP.
+
+    Bugfix (preserve_length): When multiple fields are mutated in one
+    packet (k > 1), an operator that inserts or deletes bytes shifts
+    all subsequent field offsets — silently corrupting the packet.
+    When preserve_length=True, all mutations are constrained to be
+    in-place (same buffer length before and after).
+
+    Args:
+        buf:             Mutable bytearray representing the full packet payload.
+        rule:            The FieldRule describing how to mutate one field.
+        preserve_length: If True, only use length-preserving mutations.
+                         Set True when k > 1 fields are mutated per packet.
+
+    Returns:
+        The same bytearray (modified in-place and returned for chaining).
+    """
+    start = rule.offset
+    if start >= len(buf):
+        return buf
+
+    length     = rule.length if rule.length != -1 else len(buf) - start
+    end        = min(start + length, len(buf))
+    actual_len = end - start
+    if actual_len <= 0:
+        return buf
+
+    s = rule.mutation_strategy
+    constraints = MutationConstraints()  # default: no constraints
+    # Type-aware dispatch: use explicit data_type from rule if available,
+    # otherwise infer from byte length (defaults to big-endian).
+    field_type = rule.data_type if rule.data_type else _infer_field_type(actual_len)
+
+    if s == MutationStrategy.STATIC:
+        if rule.static_value:
+            try:
+                src = bytes.fromhex(rule.static_value)
+                n   = min(len(src), actual_len)
+                buf[start:start + n] = src[:n]
+            except ValueError:
+                pass
+
+    elif s == MutationStrategy.BOUNDARY_VALUES:
+        # P3-C: dispatch to operators — 70% integer overflow, 30% boundary violation
+        # Both operators are length-preserving (replace in-place).
+        if random.random() < 0.7:
+            buf = op_integer_overflow(buf, start, end, field_type, constraints)
+        else:
+            buf = op_boundary_violation(buf, start, end, field_type, constraints)
+
+    elif s == MutationStrategy.RANDOM_BYTES:
+        if preserve_length:
+            # Multi-field safe: pure in-place replace, zero length change.
+            buf[start:end] = os.urandom(actual_len)
+        else:
+            # Single-field: full operator with inject/overflow modes.
+            if random.random() < 0.7 or rule.length != -1:
+                buf = op_random_byte_injection(buf, start, end, field_type, constraints)
+            else:
+                # Buffer overflow only for variable-length fields
+                if len(buf) <= 65536:
+                    buf = op_buffer_overflow(buf, start, end, field_type, constraints)
+                else:
+                    buf[start:end] = os.urandom(actual_len)
+
+    elif s == MutationStrategy.BIT_FLIP:
+        # Always length-preserving — safe for multi-field.
+        buf = op_bit_flip(buf, start, end, field_type, constraints)
+
+    elif s == MutationStrategy.FORMAT_STRING:
+        if preserve_length:
+            # Multi-field safe: truncate/truncate payload to fit field exactly.
+            payload = random.choice(_FORMAT_STRING_PAYLOADS_SLICE)
+            payload = payload[:actual_len]
+            # Pad if shorter
+            if len(payload) < actual_len:
+                payload = payload + b"\x00" * (actual_len - len(payload))
+            buf[start:start + actual_len] = payload
+        else:
+            buf = op_format_string(buf, start, end, field_type, constraints)
+
+    elif s == MutationStrategy.TRUNCATE:
+        if preserve_length:
+            # Multi-field safe: can't truncate — use random bytes instead
+            # to still mutate the field without destroying subsequent fields.
+            buf[start:end] = os.urandom(actual_len)
+        else:
+            buf = op_omission(buf, start, end, field_type, constraints)
+
+    elif s == MutationStrategy.INCREMENT:
+        byte_order = _endian_for_type(field_type)
+        current = int.from_bytes(buf[start:end], byte_order)
+        max_val = (1 << (actual_len * 8)) - 1
+        new_val = (current + 1) & max_val
+        buf[start:end] = new_val.to_bytes(actual_len, byte_order)
+
+    elif s == MutationStrategy.CALCULATED:
+        payload_start = start + actual_len
+        payload_len   = max(0, len(buf) - payload_start)
+        byte_order = _endian_for_type(field_type)
+        try:
+            buf[start:end] = payload_len.to_bytes(actual_len, byte_order)
+        except OverflowError:
+            pass
+
+    elif s == MutationStrategy.DICTIONARY:
+        if rule.dictionary_values:
+            try:
+                hex_val = random.choice(rule.dictionary_values)
+                src = bytes.fromhex(hex_val)
+                # H2 fix: when preserve_length=True (multi-field mode),
+                # pad or truncate to exactly actual_len so buffer length
+                # doesn't change and subsequent field offsets stay valid.
+                if preserve_length:
+                    if len(src) < actual_len:
+                        src = src + b"\x00" * (actual_len - len(src))
+                    else:
+                        src = src[:actual_len]
+                else:
+                    src = src[:actual_len]
+                buf[start:start + len(src)] = src
+            except (ValueError, IndexError):
+                pass
+
+    elif s == MutationStrategy.SKIP:
+        pass
+
+    # Post-mutation: null-terminate STRING fields.
+    # Applied only when:
+    #   1. field_type is STRING and field has room (actual_len > 1)
+    #   2. Strategy produces string-like output (not numeric strategies
+    #      like INCREMENT/CALCULATED — nulling would corrupt the integer)
+    #   3. Buffer wasn't resized (preserve_length=True or in-place strategy)
+    #   4. Null position is still within bounds (guards TRUNCATE shrinking buf)
+    _STRING_SAFE_STRATEGIES = {
+        MutationStrategy.RANDOM_BYTES,
+        MutationStrategy.STATIC,
+        MutationStrategy.BIT_FLIP,
+        MutationStrategy.FORMAT_STRING,
+        MutationStrategy.DICTIONARY,
+    }
+    if (
+        field_type == FieldType.STRING
+        and s in _STRING_SAFE_STRATEGIES
+        and preserve_length  # buffer wasn't resized
+        and actual_len > 1
+        and start + actual_len - 1 < len(buf)  # bounds guard
+    ):
+        buf[start + actual_len - 1] = 0x00
+
+    return buf
+
+
+def _infer_field_type(byte_len: int) -> FieldType:
+    """Infer FieldType from byte length for operator dispatch."""
+    _LEN_TO_TYPE: dict[int, FieldType] = {
+        1: FieldType.UINT8,
+        2: FieldType.UINT16_BE,
+        4: FieldType.UINT32_BE,
+    }
+    return _LEN_TO_TYPE.get(byte_len, FieldType.BYTES)
+
+
+# Pre-sliced format-string payloads for preserve_length mode
+# (avoids importing the full list from mutation_operators each call)
+_FORMAT_STRING_PAYLOADS_SLICE: list[bytes] = [
+    b"%s%s%s%s%n",
+    b"%x%x%x%x%x",
+    b"%p%p%p%p",
+    b"%n%d%s%p",
+    b"%s" * 50,
+    b"AAAA%p%p%p%p%p%p%p%p%p%p",
+    b"%08x.%08x.%08x.%08x",
+    b"%%%dc%%%d$s%%%d$n",
+    b"%n" * 20,
+]

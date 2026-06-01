@@ -378,14 +378,10 @@ class FirecrackerSandbox(BaseSandbox):
         self,
         binary_path: str = "sandbox/firecracker_env/firecracker",
         vmlinux_path: str = "sandbox/firecracker_env/vmlinux",
-        rootfs_path: str = "sandbox/firecracker_env/rootfs.ext4",
+        rootfs_path: str = "",
         snapshot_dir: str = "sandbox/firecracker_env/snapshots",
-        kernel_args: str = (
-            "console=ttyS0 reboot=k panic=1 pci=off"
-            " root=/dev/vda rw"
-            " init=/bin/vulnerable_server"
-            " ip=172.16.0.2::172.16.0.1:255.255.255.0::eth0:off"
-        ),
+        kernel_args: str = "",
+        target_name: str = "vulnerable_server",
         mem_size_mb: int = 256,
         vcpu_count: int = 2,
         tap_name: str = "tap-lifa0",
@@ -394,11 +390,29 @@ class FirecrackerSandbox(BaseSandbox):
         target_port: int = 9000,
         socket_path: str = "/tmp/firecracker-lifa.sock",
     ) -> None:
+        # Target-aware defaults for rootfs and kernel args
+        fc_env = "sandbox/firecracker_env"
+        if not rootfs_path:
+            if target_name == "lighttpd":
+                rootfs_path = f"{fc_env}/rootfs_lighttpd.ext4"
+            else:
+                rootfs_path = f"{fc_env}/rootfs.ext4"
+        if not kernel_args:
+            base_args = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw"
+            if target_name == "lighttpd":
+                kernel_args = f"{base_args} init=/init"
+            else:
+                kernel_args = (
+                    f"{base_args} init=/bin/vulnerable_server"
+                    " ip=172.16.0.2::172.16.0.1:255.255.255.0::eth0:off"
+                )
+
         self.binary_path = Path(binary_path)
         self.vmlinux_path = Path(vmlinux_path)
         self.rootfs_path = Path(rootfs_path)
         self.snapshot_dir = Path(snapshot_dir)
         self.kernel_args = kernel_args
+        self.target_name = target_name
         self.mem_size_mb = mem_size_mb
         self.vcpu_count = vcpu_count
         self.tap_name = tap_name

@@ -533,10 +533,37 @@ class TestConstructor:
         assert sb.binary_path == Path("sandbox/firecracker_env/firecracker")
         assert sb.vmlinux_path == Path("sandbox/firecracker_env/vmlinux")
         assert sb.rootfs_path == Path("sandbox/firecracker_env/rootfs.ext4")
+        assert sb.target_name == "vulnerable_server"
+        assert "init=/bin/vulnerable_server" in sb.kernel_args
         assert sb.mem_size_mb == 256
         assert sb.vcpu_count == 2
         assert sb.vm_ip == "172.16.0.2"
         assert sb.target_port == 9000
+
+    def test_lighttpd_target_defaults(self) -> None:
+        """target_name='lighttpd' should select lighttpd rootfs + init=/init."""
+        sb = FirecrackerSandbox(target_name="lighttpd")
+        assert sb.rootfs_path == Path("sandbox/firecracker_env/rootfs_lighttpd.ext4")
+        assert sb.kernel_args == (
+            "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init"
+        )
+        assert sb.target_name == "lighttpd"
+
+    def test_explicit_rootfs_overrides_target(self) -> None:
+        """Explicit rootfs_path should not be overridden by target_name."""
+        sb = FirecrackerSandbox(
+            target_name="lighttpd",
+            rootfs_path="/custom/rootfs.ext4",
+        )
+        assert sb.rootfs_path == Path("/custom/rootfs.ext4")
+
+    def test_explicit_kernel_args_overrides_target(self) -> None:
+        """Explicit kernel_args should not be overridden by target_name."""
+        sb = FirecrackerSandbox(
+            target_name="lighttpd",
+            kernel_args="console=ttyS0 root=/dev/vda",
+        )
+        assert sb.kernel_args == "console=ttyS0 root=/dev/vda"
 
     def test_custom_paths(self, tmp_path: Path) -> None:
         sb = FirecrackerSandbox(

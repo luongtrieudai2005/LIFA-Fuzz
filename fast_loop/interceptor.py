@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -75,11 +76,12 @@ class Interceptor:
         self._running: bool = False
         self._total_captured: int = 0
         self._total_injected: int = 0
+        self._total_dropped: int = 0  # packets dropped due to write queue full
 
         # ── Pause / Resume ───────────────────────────────────────────
-        # asyncio.Event: set = paused, clear = running.
-        # The injection loop awaits on this event, so paused mutations
-        # queue up and are processed when resumed.
+        # asyncio.Event: set = running, clear = paused.
+        # FIX: original code had inverted semantics (set=paused) which
+        # caused _injection_loop to block forever when running.
         self._pause_event: asyncio.Event = asyncio.Event()
 
         # Mutation injection queue
@@ -100,7 +102,7 @@ class Interceptor:
     async def start(self) -> None:
         """Start the proxy server, injection task, and log writer."""
         self._running = True
-        self._pause_event.clear()  # Ensure we start in running state
+        self._pause_event.set()  # Start in RUNNING state (set = running)
 
         # Ensure log directory exists
         self.traffic_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -146,7 +148,7 @@ class Interceptor:
         Existing mutations in the queue are preserved and will be
         flushed on resume.
         """
-        self._pause_event.set()
+        self._pause_event.clear()  # clear = paused
         logger.warning(
             "Interceptor PAUSED — injection stopped, new connections rejected"
         )
@@ -157,13 +159,13 @@ class Interceptor:
         Called by the CrashMonitor after the target server has been
         verified alive again following a crash reset.
         """
-        self._pause_event.clear()
+        self._pause_event.set()  # set = running
         logger.info("Interceptor RESUMED — injection and connections active")
 
     @property
     def is_paused(self) -> bool:
         """Whether the interceptor is currently paused."""
-        return self._pause_event.is_set()
+        return not self._pause_event.is_set()  # set = running, clear = paused
 
     # -----------------------------------------------------------------
     # Connection Handling
@@ -181,13 +183,14 @@ class Interceptor:
             return
 
         # ── Pause check: reject new connections when paused ────────
-        if self._pause_event.is_set():
+        if not self._pause_event.is_set():  # not set = paused
             client_writer.close()
             return
 
         self._active_connections += 1
         peer = client_writer.get_extra_info("peername")
-        logger.info(f"New connection from {peer} (active: {self._active_connections})")
+        conn_session_id = uuid.uuid4().hex[:8]
+        logger.info(f"New connection from {peer} (active: {self._active_connections}, session: {conn_session_id})")
 
         try:
             server_reader, server_writer = await asyncio.wait_for(
@@ -200,13 +203,13 @@ class Interceptor:
             self._active_connections -= 1
             return
 
-        # Two relay tasks
+        # Two relay tasks — each gets the session_id for packet grouping
         c2s = asyncio.create_task(
-            self._relay(client_reader, server_writer, Direction.CLIENT_TO_SERVER),
+            self._relay(client_reader, server_writer, Direction.CLIENT_TO_SERVER, conn_session_id),
             name=f"relay-c2s-{peer}",
         )
         s2c = asyncio.create_task(
-            self._relay(server_reader, client_writer, Direction.SERVER_TO_CLIENT),
+            self._relay(server_reader, client_writer, Direction.SERVER_TO_CLIENT, conn_session_id),
             name=f"relay-s2c-{peer}",
         )
 
@@ -234,6 +237,7 @@ class Interceptor:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         direction: Direction,
+        session_id: str = "",
     ) -> None:
         """Relay data, capturing each chunk."""
         try:
@@ -242,7 +246,7 @@ class Interceptor:
                 if not data:
                     break
 
-                await self.capture_packet(direction, data)
+                await self.capture_packet(direction, data, session_id=session_id)
                 writer.write(data)
                 await writer.drain()
         except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError):
@@ -263,15 +267,19 @@ class Interceptor:
         raw_data: bytes,
         is_mutated: bool = False,
         mutation_id: Optional[str] = None,
+        session_id: str = "",
     ) -> TrafficRecord:
         """Capture a packet and enqueue for non-blocking log write.
 
         Writes a simplified JSONL entry (LLM-optimized format):
             {"timestamp": float, "direction": str, "payload": hex_string, ...}
         """
-        self._total_captured += 1
+        # Only count legitimate (non-mutated) traffic in total_captured.
+        # Re-injected mutations are counted in total_injected instead.
+        if not is_mutated:
+            self._total_captured += 1
 
-        # Write simplified JSONL entry
+        # Write simplified JSONL entry — include session_id for sequence grouping
         entry = json.dumps({
             "timestamp": time.time(),
             "direction": direction.value,
@@ -279,12 +287,14 @@ class Interceptor:
             "length": len(raw_data),
             "is_mutated": is_mutated,
             "mutation_id": mutation_id,
+            "session_id": session_id,
         })
 
         # Non-blocking: push to write queue, drops if full
         try:
             self._write_queue.put_nowait(entry)
         except asyncio.QueueFull:
+            self._total_dropped += 1
             logger.warning("Traffic log write queue full, dropping entry")
 
         logger.debug(
@@ -296,6 +306,7 @@ class Interceptor:
             raw_data=raw_data,
             is_mutated=is_mutated,
             mutation_id=mutation_id,
+            session_id=session_id,
         )
 
     async def _log_writer_loop(self) -> None:
@@ -368,10 +379,12 @@ class Interceptor:
                     is_mutated=True,
                     mutation_id="injected",
                 )
-                logger.info(
+                logger.debug(
                     f"Injected mutation #{self._total_injected} "
                     f"({len(mutated_data)} bytes)"
                 )
+                if self._total_injected % 100 == 0:
+                    logger.info(f"  Injected {self._total_injected} mutations so far")
 
             except (ConnectionRefusedError, asyncio.TimeoutError, OSError) as e:
                 logger.warning(f"Injection failed (target may be down): {e}")
@@ -403,3 +416,8 @@ class Interceptor:
     @property
     def total_injected(self) -> int:
         return self._total_injected
+
+    @property
+    def total_dropped(self) -> int:
+        """Number of packets dropped due to write queue overflow."""
+        return self._total_dropped

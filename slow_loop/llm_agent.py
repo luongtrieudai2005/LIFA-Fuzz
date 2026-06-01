@@ -45,8 +45,9 @@ import asyncio
 import json
 import os
 import re
+import time
 from datetime import datetime, timezone
-from typing import Any, Union
+from typing import Any, Optional, Union
 
 from shared.logger import get_logger
 from shared.schemas import ProtocolGrammar, TrafficRecord
@@ -66,6 +67,18 @@ except ImportError:
         "litellm is not installed — LLM inference will be unavailable. "
         "Install with: pip install litellm"
     )
+
+
+# =============================================================================
+# Model Pricing (USD per 1M tokens)
+# =============================================================================
+MODEL_PRICING: dict[str, dict[str, float]] = {
+    "glm-5-turbo":                 {"input_per_m": 0.60,  "output_per_m": 1.92},
+    "gpt-4o":                      {"input_per_m": 2.50,  "output_per_m": 10.00},
+    "gpt-4o-mini":                 {"input_per_m": 0.15,  "output_per_m": 0.60},
+    "claude-sonnet-4-20250514":    {"input_per_m": 3.00,  "output_per_m": 15.00},
+    "default":                     {"input_per_m": 1.00,  "output_per_m": 2.00},
+}
 
 
 # =============================================================================
@@ -279,14 +292,19 @@ trigger a memory corruption vulnerability. Use the following priority guide:
 
 ## FIELD TYPE REFERENCE
 
-The `field_type` MUST be one of these exact values:
-- Numeric: `uint8`, `uint16_le`, `uint16_be`, `uint32_le`, `uint32_be`
-- Signed: `int8`, `int16_le`, `int16_be`, `int32_le`, `int32_be`
-- Text: `string`
-- Raw: `bytes`
-- Discrete: `enum`
-- Boolean: `bool`
-- Unused: `reserved`
+The `field_type` MUST be one of exactly 8 values:
+- `uint8`         — unsigned 8-bit integer
+- `uint16_le`     — unsigned 16-bit little-endian
+- `uint16_be`     — unsigned 16-bit big-endian
+- `uint32_le`     — unsigned 32-bit little-endian
+- `uint32_be`     — unsigned 32-bit big-endian
+- `bytes`         — raw unstructured bytes (payloads, unknown regions, padding)
+- `enum`          — discrete set of values (opcodes, command types, flags)
+- `string`        — null-terminated or length-delimited text
+
+NOTE: For signed fields, use the unsigned type of the same width.
+NOTE: For boolean fields, use `enum` with `possible_values: ["00", "01"]`.
+NOTE: For padding/reserved regions, use `bytes` with `is_constant: true`.
 
 ## MUTATION STRATEGY REFERENCE
 
@@ -329,8 +347,10 @@ You MUST respond with a single valid JSON object matching this exact schema:
 
 ## CRITICAL RULES
 1. Byte offsets are 0-indexed. Be PRECISE with offset_start and offset_end.
-2. offset_end is EXCLUSIVE (Python-style). A field spanning bytes 0-3: \
-   offset_start=0, offset_end=4.
+2. offset_end is EXCLUSIVE (Python-style slice convention). \
+   EXAMPLE: Bytes at positions 0,1,2,3 → offset_start=0, offset_end=4. \
+   Byte at position 4 alone → offset_start=4, offset_end=5. \
+   WRONG: offset_start=0, offset_end=3 (this covers only 3 bytes, not 4).
 3. If multiple packets share identical bytes at the same offset, those are \
    constant/magic bytes → mark `is_constant: true`.
 4. Length fields typically appear just before the variable-length payload \
@@ -340,7 +360,39 @@ You MUST respond with a single valid JSON object matching this exact schema:
 7. Always include a "reasoning" field explaining your analysis.
 8. Respond with ONLY the JSON object — no markdown, no explanation.
 
-Now analyze the traffic below and infer the protocol wire format.
+## EXAMPLE OUTPUT
+
+Here is a correct example for a simple 3-field binary protocol:
+Packet: de ad be ef  00 07  48 65 6c 6c 6f 0d 0a
+        [magic 4B ] [len2B] [payload 7B          ]
+
+Correct output:
+{
+    "protocol_name": "example_tlv",
+    "description": "Simple TLV protocol with magic header and length-prefixed payload",
+    "magic_bytes": "deadbeef",
+    "fields": [
+        {"name": "magic",   "offset_start": 0, "offset_end": 4,
+         "field_type": "bytes", "is_constant": true,
+         "mutation_strategy": "static",
+         "description": "Magic header 0xDEADBEEF — constant across all packets"},
+        {"name": "length",  "offset_start": 4, "offset_end": 6,
+         "field_type": "uint16_be", "is_constant": false,
+         "mutation_strategy": "boundary_values",
+         "description": "Big-endian length field = 7, matches remaining payload bytes"},
+        {"name": "payload", "offset_start": 6, "offset_end": -1,
+         "field_type": "bytes", "is_constant": false,
+         "mutation_strategy": "random_bytes",
+         "description": "Variable-length payload data"}
+    ],
+    "total_header_size": 6, "min_packet_size": 6, "max_packet_size": 65535,
+    "confidence": 0.92,
+    "reasoning": "Bytes 0-3 are constant 0xDEADBEEF across packets → magic header. \
+Bytes 4-5 decode as uint16_be=7 which equals the remaining 7 bytes → length field. \
+Bytes 6 onwards vary in content and length → variable payload."
+}
+
+Now analyze the actual traffic below and infer the protocol wire format.
 """
 
 SYSTEM_PROMPT_FUSION_APPEND = """\
@@ -387,12 +439,8 @@ You MUST follow these rules:
 """
 
 TRAFFIC_SAMPLE_TEMPLATE = """\
---- Packet #{index} ---
-Direction: {direction}
-Length: {length} bytes
-Hex:     {hex_data}
-ASCII:   {ascii_repr}
-Mutated: {is_mutated}
+--- Packet #{index} (Direction: {direction}, Length: {length}B) ---
+{hex_xxd}
 """
 
 
@@ -435,20 +483,29 @@ class LLMAgent:
         provider: str = "openai",
         model: str = "gpt-4o",
         api_key: str = "",
+        api_base: str = "",
         max_tokens: int = 4096,
         temperature: float = 0.2,
         timeout_seconds: int = 60,
         max_retries: int = 3,
         session_budget_tokens: int = 0,
+        session_budget_usd: float = 0.0,
+        cache_file: str = "shared/last_known_grammar.json",
+        circuit_retry_after_s: float = 300.0,
+        context_window: int = 128_000,
+        prompt_truncation_strategy: str = "truncate",
     ) -> None:
         self.provider = provider
         self.model = model
         self.api_key = api_key
+        self.api_base = api_base
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
         self.session_budget_tokens = session_budget_tokens
+        self.session_budget_usd = session_budget_usd
+        self.enable_thinking = True  # Override via setter after init
 
         # Runtime stats
         self._total_inferences: int = 0
@@ -456,6 +513,27 @@ class LLMAgent:
         self._session_tokens_used: int = 0
         self._last_response: str = ""
         self._last_error: str = ""
+
+        # Fallback cache — survives transient LLM failures
+        self._last_known_good_grammar: Optional[ProtocolGrammar] = None
+        self._consecutive_failures: int = 0
+
+        # Cost tracking (USD)
+        self.cost_per_inference: float = 0.0
+        self.total_cost_usd: float = 0.0
+        # session_budget_usd is already set above from the constructor param
+
+        # Context window guard
+        self.context_window: int = context_window
+        self.prompt_truncation_strategy: str = prompt_truncation_strategy
+
+        # Resilience: persistent cache and circuit breaker
+        self._cache_file: str = cache_file
+        self._circuit_retry_after_s: float = circuit_retry_after_s
+        self._circuit_open_until: float = 0.0  # monotonic timestamp; 0 = closed
+
+        # Load persistent cache from disk (survives process restarts)
+        self._load_cache()
 
     # -----------------------------------------------------------------
     # Core Inference Pipeline
@@ -491,13 +569,31 @@ class LLMAgent:
         """
         prompt = self._build_prompt_from_input(traffic_input, math_hint=math_hint)
 
+        # ── Context window guard ─────────────────────────────────────
+        estimated = estimate_tokens(prompt)
+        if estimated > self.context_window:
+            if self.prompt_truncation_strategy == "error":
+                raise RuntimeError(
+                    f"Prompt exceeds context window "
+                    f"({estimated} > {self.context_window} tokens)"
+                )
+            elif self.prompt_truncation_strategy == "truncate":
+                max_chars = int(
+                    len(prompt) * (self.context_window * 0.9 / estimated)
+                )
+                prompt = prompt[:max_chars]
+                logger.warning(
+                    f"Prompt truncated to {max_chars} chars "
+                    f"(estimated {estimated} > {self.context_window} tokens)"
+                )
+
         logger.info(
             f"Starting protocol inference "
             f"(mode={'MOCK' if is_mock_mode() else 'REAL'}, "
             f"model={self.model}, prompt={len(prompt)} chars)"
         )
 
-        # ── Budget gate ────────────────────────────────────────────
+        # ── Budget gate (tokens) ────────────────────────────────────
         if (
             self.session_budget_tokens > 0
             and self._session_tokens_used >= self.session_budget_tokens
@@ -512,10 +608,70 @@ class LLMAgent:
             self._log_error(RuntimeError(msg), prompt)
             raise RuntimeError(msg)
 
-        response_text = await self.call_llm(prompt)
+        # ── Budget gate (USD) ──────────────────────────────────────
+        if (
+            self.session_budget_usd > 0
+            and self.total_cost_usd >= self.session_budget_usd
+        ):
+            msg = (
+                f"Session cost budget exhausted "
+                f"(${self.total_cost_usd:.4f}/${self.session_budget_usd:.2f}). "
+                f"Skipping inference."
+            )
+            logger.warning(msg)
+            self._last_error = msg
+            self._log_error(RuntimeError(msg), prompt)
+            raise RuntimeError(msg)
+
+        # ── Fallback gate ─────────────────────────────────────────
+        # If the LLM has failed 3+ times in a row, short-circuit and
+        # return the last known good grammar instead of attempting
+        # another call.  This prevents crash-loops in the Slow Loop
+        # during transient API outages.
+        if (
+            self._consecutive_failures >= 3
+            and self._last_known_good_grammar is not None
+        ):
+            logger.warning(
+                f"LLM failed {self._consecutive_failures}x consecutively — "
+                "returning cached grammar as fallback"
+            )
+            self._total_inferences += 1
+            return self._last_known_good_grammar
+
+        try:
+            response_text = await self.call_llm(prompt)
+        except RuntimeError:
+            # call_llm() exhausted all retries — fallback immediately
+            if self._last_known_good_grammar is not None:
+                logger.warning(
+                    "LLM call failed — returning cached grammar as fallback"
+                )
+                self._total_inferences += 1
+                return self._last_known_good_grammar
+            # No cache available — propagate to caller (orchestrator)
+            raise
+
         self._last_response = response_text
 
-        grammar = self.parse_response(response_text)
+        try:
+            grammar = self.parse_response(response_text)
+        except ValueError:
+            # API call succeeded but response was malformed.
+            # Do NOT increment _consecutive_failures — that tracks API
+            # failures, not parse errors.  Return cached grammar if available.
+            if self._last_known_good_grammar is not None:
+                logger.warning(
+                    "LLM response parse failed — returning cached grammar"
+                )
+                self._total_inferences += 1
+                return self._last_known_good_grammar
+            raise
+
+        # Cache successful grammar for fallback + persist to disk
+        self._last_known_good_grammar = grammar
+        self._save_cache()
+        self._consecutive_failures = 0
 
         self._total_inferences += 1
         logger.info(
@@ -531,6 +687,126 @@ class LLMAgent:
         return grammar
 
     # -----------------------------------------------------------------
+    # Fallback & Reset
+    # -----------------------------------------------------------------
+
+    def _local_fallback(self) -> Optional[ProtocolGrammar]:
+        """Return the last successfully inferred grammar (or None).
+
+        Used by ``infer_protocol()`` when the LLM API is persistently
+        unavailable.  The cached grammar allows the Slow Loop to keep
+        producing rules from a previously successful inference rather
+        than crashing.
+        """
+        if self._last_known_good_grammar is not None:
+            logger.warning(
+                "Falling back to cached grammar from previous inference "
+                f"(protocol={self._last_known_good_grammar.protocol_name})"
+            )
+            return self._last_known_good_grammar
+        return None
+
+    def _save_cache(self) -> None:
+        """Persist ``_last_known_good_grammar`` to the cache file.
+
+        Uses atomic write (temp + rename) to avoid partial reads.
+        Silently ignores errors — the cache is a best-effort optimization.
+        """
+        if self._last_known_good_grammar is None:
+            return
+
+        from pathlib import Path as _Path
+
+        try:
+            out = _Path(self._cache_file)
+            out.parent.mkdir(parents=True, exist_ok=True)
+
+            data = self._last_known_good_grammar.model_dump(mode="json")
+
+            # Atomic write — same pattern as _log_inference
+            tmp = out.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, default=str, ensure_ascii=False)
+            tmp.rename(out)
+
+            logger.debug(f"Grammar cache saved to {self._cache_file}")
+        except Exception as e:
+            logger.debug(f"Failed to save grammar cache: {e}")
+
+    def _load_cache(self) -> None:
+        """Load ``_last_known_good_grammar`` from the cache file.
+
+        Called during ``__init__`` to restore state across process restarts.
+        Silently ignores errors (missing file, corrupted data, schema mismatch).
+        """
+        from pathlib import Path as _Path
+
+        try:
+            path = _Path(self._cache_file)
+            if not path.exists():
+                return
+
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+
+            self._last_known_good_grammar = ProtocolGrammar.model_validate(data)
+            logger.info(
+                f"Loaded cached grammar from {self._cache_file} "
+                f"(protocol={self._last_known_good_grammar.protocol_name})"
+            )
+        except json.JSONDecodeError:
+            logger.warning(
+                f"Cache file {self._cache_file} is corrupted — ignoring"
+            )
+        except Exception as e:
+            logger.debug(f"Failed to load grammar cache: {e}")
+
+    def reset(self) -> None:
+        """Clear cached grammar, failure counter, circuit breaker, and cache file.
+
+        Call this to force a fresh LLM inference on the next cycle
+        (e.g., after a config change, manual operator trigger, or after
+        fixing an API key that was causing 401 errors).
+        """
+        self._last_known_good_grammar = None
+        self._consecutive_failures = 0
+        self._circuit_open_until = 0.0
+
+        # Delete the persistent cache file
+        from pathlib import Path as _Path
+
+        try:
+            cache_path = _Path(self._cache_file)
+            if cache_path.exists():
+                cache_path.unlink()
+                logger.info(f"Deleted cache file: {self._cache_file}")
+        except Exception as e:
+            logger.debug(f"Failed to delete cache file: {e}")
+
+        logger.info("LLMAgent cache, failure counter, and circuit breaker reset")
+
+    @property
+    def stats(self) -> dict[str, Any]:
+        """Return a snapshot of agent runtime statistics."""
+        return {
+            "total_inferences": self._total_inferences,
+            "total_tokens_used": self._total_tokens_used,
+            "session_tokens_used": self._session_tokens_used,
+            "session_budget_tokens": self.session_budget_tokens,
+            "cost_per_inference": self.cost_per_inference,
+            "total_cost_usd": round(self.total_cost_usd, 4),
+            "session_budget_usd": self.session_budget_usd,
+            "consecutive_failures": self._consecutive_failures,
+            "circuit_open": self._circuit_open_until > time.monotonic(),
+            "circuit_retry_after_s": self._circuit_retry_after_s,
+            "cache_file": self._cache_file,
+            "model": self.model,
+            "provider": self.provider,
+            "api_base": self.api_base,
+            "last_error": self._last_error,
+        }
+
+    # -----------------------------------------------------------------
     # Prompt Construction
     # -----------------------------------------------------------------
 
@@ -539,8 +815,16 @@ class LLMAgent:
     ) -> str:
         """Construct the user prompt from traffic samples.
 
-        Formats each sample as a readable hex dump with ASCII augmentation,
+        Formats each sample as an xxd-style hex dump with offset rulers,
         then concatenates them into a single prompt string.
+
+        Key design decisions:
+            - Mutated packets are FILTERED OUT to prevent the LLM from
+              inferring protocol structure from corrupted/fuzzed payloads.
+            - The math heatmap is placed BEFORE traffic samples so the
+              LLM treats it as a prior, not an afterthought.
+            - xxd-style formatting with offset rulers eliminates off-by-one
+              errors in offset_start/offset_end.
 
         Args:
             samples: Traffic records to include in the prompt.
@@ -552,31 +836,41 @@ class LLMAgent:
         if not samples:
             return "No traffic samples available for analysis."
 
+        # Filter out mutated packets — they corrupt grammar inference.
+        clean_samples = [s for s in samples if not s.is_mutated]
+        if not clean_samples:
+            return "No clean (non-mutated) traffic samples available for analysis."
+
         parts: list[str] = []
-        for idx, sample in enumerate(samples):
+        for idx, sample in enumerate(clean_samples):
             hex_str = sample.raw_data.hex() if sample.raw_data else ""
-            ascii_repr = _hex_to_ascii(hex_str)
+            hex_xxd = _format_hex_xxd(hex_str)
             parts.append(
                 TRAFFIC_SAMPLE_TEMPLATE.format(
                     index=idx,
                     direction=sample.direction.value,
                     length=len(sample.raw_data),
-                    hex_data=hex_str,
-                    ascii_repr=ascii_repr,
-                    is_mutated=sample.is_mutated,
+                    hex_xxd=hex_xxd,
                 )
             )
 
         header = (
-            f"Analyze {len(samples)} network traffic packets below.\n"
-            f"Each packet shows hex data alongside its ASCII representation.\n"
+            f"Analyze {len(clean_samples)} clean network traffic packets below.\n"
+            f"Each packet shows hex data with byte-offset rulers.\n"
             f"Identify magic bytes, length fields, checksums, enum values, "
             f"and any repeating structural patterns.\n\n"
         )
-        prompt = header + "\n".join(parts)
 
+        # Heatmap BEFORE samples — LLM reads top-to-bottom, so the
+        # mathematical priors establish a framework before seeing raw bytes.
+        prompt = header
         if math_hint:
-            prompt += "\n\n" + math_hint + "\n"
+            prompt += math_hint + "\n\n"
+            prompt += (
+                "Using the heatmap above as priors, "
+                "analyze the raw packets below:\n\n"
+            )
+        prompt += "\n".join(parts)
 
         return prompt
 
@@ -588,9 +882,18 @@ class LLMAgent:
         """Route to the correct prompt builder based on input type."""
         if isinstance(traffic_input, dict):
             # Pre-formatted payload from TrafficParser.format_for_llm()
-            prompt = json.dumps(traffic_input, indent=2, ensure_ascii=False)
+            traffic_str = json.dumps(
+                traffic_input, indent=2, ensure_ascii=False
+            )
+            # Heatmap BEFORE traffic — same rationale as build_prompt()
+            prompt = ""
             if math_hint:
-                prompt += "\n\n" + math_hint + "\n"
+                prompt += math_hint + "\n\n"
+                prompt += (
+                    "Using the mathematical heatmap above as priors, "
+                    "analyze the traffic sessions below:\n\n"
+                )
+            prompt += traffic_str
             prompt += (
                 "\n\nAnalyze the traffic sessions above and infer the "
                 "protocol wire format. Output a single JSON object."
@@ -633,6 +936,14 @@ class LLMAgent:
             RuntimeError: If REAL mode and litellm is not installed or
                 no API key is set, or call fails after all retries.
         """
+        # ── Circuit breaker ────────────────────────────────────────────
+        if self._circuit_open_until > 0 and time.monotonic() < self._circuit_open_until:
+            remaining = self._circuit_open_until - time.monotonic()
+            raise RuntimeError(
+                f"Circuit breaker is OPEN — skipping API call "
+                f"(cooldown remaining: {remaining:.0f}s)"
+            )
+
         # ── MOCK mode: return simulated response ───────────────────
         if is_mock_mode():
             logger.info(
@@ -649,14 +960,25 @@ class LLMAgent:
             raise RuntimeError(
                 "litellm is not installed. Install with: pip install litellm"
             )
-        if not self.api_key:
+        if not self.api_key and self.provider != "ollama":
             raise RuntimeError(
                 "No API key configured. Set the appropriate environment "
                 f"variable (e.g., OPENAI_API_KEY for provider={self.provider})."
             )
 
+        # Build system prompt — only include fusion instructions when
+        # math_hint was actually provided.  Sending fusion instructions
+        # without a heatmap causes the LLM to hallucinate a non-existent
+        # "MATHEMATICAL PRE-ANALYSIS block" → ~30% more spurious fields.
+        system_content = SYSTEM_PROMPT
+        # Check if this inference cycle had a math hint by inspecting
+        # the prompt for the heatmap marker.  This is safe because
+        # build_prompt() injects it deterministically.
+        if "MATHEMATICAL PRE-ANALYSIS" in prompt:
+            system_content += SYSTEM_PROMPT_FUSION_APPEND
+
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT + SYSTEM_PROMPT_FUSION_APPEND},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": prompt},
         ]
 
@@ -675,16 +997,33 @@ class LLMAgent:
                 if self.provider and "/" not in self.model:
                     model_str = f"{self.provider}/{self.model}"
 
-                response = await litellm.acompletion(
+                # Build call kwargs — conditionally add api_base for
+                # custom endpoints (ZhipuAI, vLLM, etc.)
+                call_kwargs: dict[str, Any] = dict(
                     model=model_str,
                     messages=messages,
                     max_tokens=self.max_tokens,
                     temperature=self.temperature,
                     timeout=self.timeout_seconds,
-                    api_key=self.api_key,
                     # Force structured JSON output
                     response_format={"type": "json_object"},
                 )
+
+                # Pass API key when set (Ollama may have empty key)
+                if self.api_key:
+                    call_kwargs["api_key"] = self.api_key
+
+                # Pass custom api_base when configured
+                if self.api_base:
+                    call_kwargs["api_base"] = self.api_base
+
+                if not self.enable_thinking:
+                    call_kwargs["extra_body"] = {
+                        **call_kwargs.get("extra_body", {}),
+                        "enable_thinking": False,
+                    }
+
+                response = await litellm.acompletion(**call_kwargs)
 
                 content = response.choices[0].message.content
                 if not content:
@@ -695,20 +1034,57 @@ class LLMAgent:
                     tokens = response.usage.total_tokens or 0
                     self._total_tokens_used += tokens
                     self._session_tokens_used += tokens
+
+                    # Track USD cost
+                    pricing = MODEL_PRICING.get(
+                        self.model, MODEL_PRICING["default"]
+                    )
+                    input_cost = (
+                        (response.usage.prompt_tokens or 0)
+                        / 1_000_000
+                        * pricing["input_per_m"]
+                    )
+                    output_cost = (
+                        (response.usage.completion_tokens or 0)
+                        / 1_000_000
+                        * pricing["output_per_m"]
+                    )
+                    self.cost_per_inference = round(input_cost + output_cost, 6)
+                    self.total_cost_usd += self.cost_per_inference
+
                     logger.debug(
                         f"Token usage: prompt={response.usage.prompt_tokens}, "
                         f"completion={response.usage.completion_tokens}, "
-                        f"total={tokens}"
+                        f"total={tokens}, "
+                        f"cost=${self.cost_per_inference:.4f}"
                     )
 
                 # Clear last error on success
                 self._last_error = ""
+                self._circuit_open_until = 0.0  # Reset circuit breaker
                 return content
 
             except Exception as e:
                 last_error = e
                 error_name = type(e).__name__
                 error_msg = str(e).lower()
+
+                # ── Auth errors: abort immediately, no retry ──────────
+                if _is_auth_error(error_name, error_msg):
+                    logger.critical(
+                        f"Authentication failed — API key may be invalid. "
+                        f"Not retrying. [{error_name}]: {e}"
+                    )
+                    self._last_error = f"[AUTH] {error_name}: {e}"
+                    self._log_error(e, prompt)
+                    self._consecutive_failures += 1
+                    self._circuit_open_until = (
+                        time.monotonic() + self._circuit_retry_after_s
+                    )
+                    raise RuntimeError(
+                        f"Authentication error — not retrying: "
+                        f"[{error_name}] {e}"
+                    ) from e
 
                 # ── Categorize error for appropriate backoff ────
                 backoff = self._compute_backoff(
@@ -731,6 +1107,14 @@ class LLMAgent:
                     self._last_error = f"[{error_name}] {e}"
                     self._log_error(e, prompt)
 
+        # All retries exhausted — increment failure counter
+        self._consecutive_failures += 1
+        self._circuit_open_until = time.monotonic() + self._circuit_retry_after_s
+        logger.warning(
+            f"Circuit breaker OPENED for {self._circuit_retry_after_s}s "
+            f"(consecutive_failures={self._consecutive_failures})"
+        )
+
         raise RuntimeError(
             f"LLM API call failed after {self.max_retries} attempts: "
             f"{last_error}"
@@ -739,11 +1123,10 @@ class LLMAgent:
     def _compute_backoff(
         self, attempt: int, error_name: str, error_msg: str
     ) -> float:
-        """Compute backoff delay based on error type and attempt number.
+        """Compute backoff delay with jitter based on error type and attempt.
 
-        Rate limits get the longest backoff.
-        Timeouts get a standard backoff.
-        Everything else gets standard exponential backoff.
+        Uses exponential backoff with ±25% random jitter to prevent
+        thundering herd when multiple instances retry simultaneously.
 
         Args:
             attempt:    Current attempt number (1-based).
@@ -751,8 +1134,10 @@ class LLMAgent:
             error_msg:  Lowercase error message string.
 
         Returns:
-            Backoff delay in seconds.
+            Backoff delay in seconds (with jitter applied).
         """
+        import random
+
         # Rate limit (429) → aggressive backoff
         if (
             "ratelimit" in error_name.lower()
@@ -760,22 +1145,27 @@ class LLMAgent:
             or "429" in error_msg
             or "rate_limit" in error_name.lower()
         ):
-            return min(2 ** (attempt + 2), 120)
+            base = min(2 ** (attempt + 2), 120)
 
         # Timeout → standard backoff (don't punish too hard)
-        if "timeout" in error_name.lower() or "timeout" in error_msg:
-            return min(2 ** attempt, 30)
+        elif "timeout" in error_name.lower() or "timeout" in error_msg:
+            base = min(2 ** attempt, 30)
 
         # API connection / network errors → moderate backoff
-        if (
+        elif (
             "connection" in error_name.lower()
             or "connection" in error_msg
             or "network" in error_msg
         ):
-            return min(2 ** attempt, 60)
+            base = min(2 ** attempt, 60)
 
         # Default → standard exponential backoff
-        return min(2 ** attempt, 60)
+        else:
+            base = min(2 ** attempt, 60)
+
+        # Apply ±25% jitter to prevent synchronized retries
+        jitter = base * 0.25 * (2 * random.random() - 1)
+        return max(0.5, base + jitter)
 
     # -----------------------------------------------------------------
     # Response Parsing
@@ -834,29 +1224,18 @@ class LLMAgent:
         try:
             grammar = ProtocolGrammar.model_validate(data)
         except Exception as e:
+            # Log the raw response for debugging before raising
+            logger.error(
+                f"LLM response schema validation failed: {e}\n"
+                f"Response data: {json.dumps(data, indent=2, ensure_ascii=False)[:1000]}"
+            )
+            self._log_error(e, response_text[:2000])
             raise ValueError(
                 f"LLM response does not match ProtocolGrammar schema: {e}\n"
                 f"Response data: {json.dumps(data, indent=2)[:500]}"
             ) from e
 
         return grammar
-
-    # -----------------------------------------------------------------
-    # Properties
-    # -----------------------------------------------------------------
-
-    @property
-    def stats(self) -> dict[str, Any]:
-        """Return inference statistics."""
-        return {
-            "total_inferences": self._total_inferences,
-            "total_tokens_used": self._total_tokens_used,
-            "session_tokens_used": self._session_tokens_used,
-            "session_budget": self.session_budget_tokens,
-            "model": self.model,
-            "provider": self.provider,
-            "last_error": self._last_error,
-        }
 
     # -----------------------------------------------------------------
     # Inference Logging (for Web Dashboard)
@@ -964,6 +1343,19 @@ class LLMAgent:
 # =============================================================================
 
 
+def _is_auth_error(error_name: str, error_msg: str) -> bool:
+    """Check if an error is an authentication/authorization failure.
+
+    Auth errors should NOT be retried — the API key is invalid or revoked.
+    """
+    auth_patterns = [
+        "401", "unauthorized", "authentication", "invalid api key",
+        "invalid_api_key", "access denied", "forbidden",
+    ]
+    combined = (error_name + " " + error_msg).lower()
+    return any(p in combined for p in auth_patterns)
+
+
 def _hex_to_ascii(hex_str: str) -> str:
     """Convert a hex string to a human-readable ASCII representation.
 
@@ -984,6 +1376,47 @@ def _hex_to_ascii(hex_str: str) -> str:
         byte_val = int(hex_str[i : i + 2], 16)
         result.append(chr(byte_val) if 0x20 <= byte_val <= 0x7E else ".")
     return "".join(result)
+
+
+def _format_hex_xxd(hex_str: str, bytes_per_row: int = 16) -> str:
+    """Format hex as xxd-style dump with offset rulers.
+
+    Each row shows: offset, hex bytes, and ASCII representation.
+    This makes byte offsets immediately readable by the LLM,
+    eliminating off-by-one errors in offset_start/offset_end.
+
+    Example output::
+
+        0000:  de ad be ef 00 07 48 65  6c 6c 6f 0d 0a 00 00 00  |.......Hello.....|
+        0010:  01 02 03                                          |...|
+
+    Args:
+        hex_str:       Hex string of the packet payload.
+        bytes_per_row: Number of bytes per row (default 16).
+
+    Returns:
+        xxd-formatted string.
+    """
+    raw = bytes.fromhex(hex_str) if hex_str else b""
+    if not raw:
+        return "(empty packet)"
+    lines: list[str] = []
+    for i in range(0, len(raw), bytes_per_row):
+        chunk = raw[i : i + bytes_per_row]
+        # Two groups of 8 bytes for readability
+        hex_parts = []
+        for j, b in enumerate(chunk):
+            if j == 8:
+                hex_parts.append(" ")
+            hex_parts.append(f"{b:02x}")
+        hex_line = " ".join(hex_parts)
+        ascii_line = "".join(
+            chr(b) if 0x20 <= b <= 0x7E else "." for b in chunk
+        )
+        lines.append(
+            f"  {i:04x}:  {hex_line:<{bytes_per_row * 3}}  |{ascii_line}|"
+        )
+    return "\n".join(lines)
 
 
 def estimate_tokens(text: str) -> int:

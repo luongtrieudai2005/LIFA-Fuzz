@@ -10,17 +10,18 @@ PROBLEM:
 
 SOLUTION — Two-level deduplication:
 
-    Level 1 (Primary):   SHA256(raw_payload)[:16]
+    Level 1 (Primary):   SHA256(raw_payload)[0:16]  — 128-bit exact match
         The exact byte sequence that triggered the crash.
         Two packets that are byte-for-byte identical get the same signature.
         This is the FAST path — O(1) lookup after hashing.
 
-    Level 2 (Secondary): SHA256(payload[:16] + len_bytes)[:8]
-        Structural similarity: same header, different payload.
+    Level 2 (Secondary): XXH64(head24 ‖ len_be32 ‖ simple_fold(p))[0:6]  — 48-bit
+        Lightweight hybrid structural signature that captures:
+          - First 24 bytes  → protocol header / fixed fields
+          - uint32_BE(|p|)  → payload length
+          - simple_fold(p)  → content fingerprint (middle_8 + XOR fold)
         Two crashes are "structurally similar" if they share the same
-        first 16 bytes (likely the same fixed header / mutation field combo).
-        This catches crashes where only the payload varies but the
-        triggering field is identical.
+        header structure, length, and overall content pattern.
 
 FILE LAYOUT:
     crash_pocs/
@@ -53,9 +54,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import xxhash
 import os
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -77,8 +79,8 @@ class CrashEntry:
     One entry exists per UNIQUE signature regardless of how many times
     the identical packet triggered the crash.
     """
-    signature:       str            # SHA256(payload)[:16] — primary key
-    struct_sig:      str            # SHA256(payload[:16] + len_bytes)[:8]
+    signature:       str            # σ₁ hex — SHA256(payload)[0:16] → 32 hex chars
+    struct_sig:      str            # σ₂ hex — XXH64(head24‖len_be32‖fold)[0:6] → 12 hex chars
     first_seen:      str            # ISO-8601 UTC
     last_seen:       str            # ISO-8601 UTC
     total_hits:      int            # Total times this signature appeared
@@ -115,9 +117,164 @@ class CrashStatistics:
     dedup_ratio:         float           # duplicate_hits / total_hits
     struct_buckets:      int             # Unique structural signatures
     top_signatures:      list[dict]      # Top 5 by hit count
-    crash_types:         dict[str, int]  # crash_type → count
+    crash_types:         dict[str, int]  # crash_type → total hits per type
     poc_directory:       str
     index_file:          str
+    first_crash_time:    Optional[str]   = None  # ISO-8601 of first unique crash
+
+
+# ===========================================================================
+# Signature Functions — Two-Level Hybrid Structural Dedup
+# ===========================================================================
+#
+# σ₁ (Primary — exact match, 128-bit):
+#     SHA256(payload)[0:16]
+#     Guarantees zero false positives: byte-for-byte identical payloads only.
+#
+# σ₂ (Structural — similarity group, 48-bit):
+#     XXH64( head24 ‖ uint32_BE(|p|) ‖ simple_fold(p) )[0:6]
+#     Groups crashes by protocol header + length + content fingerprint.
+#
+# simple_fold(p):
+#     |p| < 32 → p (full payload — too short to compress)
+#     |p| ≥ 32 → middle_8(p) ‖ xor_fold(p)  → 16 bytes
+#     Captures spatial locality (middle) + global integrity (XOR fold).
+# ============================================================================
+
+_MAX_STRUCTURAL_REPS = 5  # Max representative samples per σ₂ group
+
+
+def compute_sigma1(payload: bytes) -> bytes:
+    """Primary signature — SHA256(payload)[0:16], 128-bit.
+
+    Collision probability is negligible for any realistic fuzzing session
+    (birthday bound ≈ 2⁻⁶⁴ at 2³² unique crashes).  Full SHA256 is
+    computed but only the first 16 bytes are kept to reduce storage.
+
+    FIX: When payload is empty (no offending packet found), incorporate
+    a timestamp so each empty-payload crash gets a unique signature.
+    Without this, ALL crashes without packet attribution collide into
+    a single "unique" crash, severely undercounting.
+
+    Returns:
+        16 raw bytes.
+    """
+    if not payload:
+        import time as _time
+        return hashlib.sha256(
+            b"__empty_crash__" + str(_time.monotonic_ns()).encode()
+        ).digest()[:16]
+    return hashlib.sha256(payload).digest()[:16]
+
+
+def compute_simple_fold(payload: bytes) -> bytes:
+    """Content fingerprint for the structural signature.
+
+    For short payloads (|p| < 32) the full content is returned — there
+    isn't enough data to compress meaningfully.
+
+    For longer payloads, two independent digests are combined:
+      - middle_8: 8 bytes at offset |p|//2  (spatial locality — the
+        mutation target often sits near the middle of a fuzzed packet)
+      - xor_fold:  XOR of all 8-byte chunks (big-endian) across the
+        entire payload.  Last chunk is zero-padded if < 8 bytes.
+        Not positional by itself (XOR is commutative), but combined
+        with middle_8 the full simple_fold IS position-sensitive.
+
+    Returns:
+        |p| < 32 → payload itself (variable length)
+        |p| ≥ 32 → exactly 16 bytes (middle_8 ‖ xor_fold)
+    """
+    n = len(payload)
+    if n < 32:
+        return payload
+
+    # Middle 8 bytes — captures the region around the mutation point
+    mid = n // 2
+    middle_8 = payload[mid:mid + 8]
+
+    # XOR fold — iterate 8-byte chunks (big-endian)
+    xor_fold = 0
+    full_chunks = n // 8
+    for i in range(full_chunks):
+        xor_fold ^= int.from_bytes(payload[i * 8:(i + 1) * 8], "big")
+
+    remainder = n % 8
+    if remainder:
+        last = payload[full_chunks * 8:] + b"\x00" * (8 - remainder)
+        xor_fold ^= int.from_bytes(last, "big")
+
+    return middle_8 + xor_fold.to_bytes(8, "big")
+
+
+def compute_sigma2(payload: bytes) -> bytes:
+    """Structural signature — XXH64(head24 ‖ len_be32 ‖ fold)[0:6], 48-bit.
+
+    XXH64 is ~10× faster than SHA256 on short inputs, making this cheap
+    enough for the hot loop.  The 48-bit output gives ≈ 2²⁴ collision
+    birthday bound — more than enough to group a few thousand crashes.
+
+    Components:
+        head24    = payload[:24]     (protocol header / fixed fields)
+        len_be32  = uint32_BE(|p|)   (payload length)
+        fold      = simple_fold(p)   (content fingerprint)
+
+    Returns:
+        6 raw bytes.
+    """
+    head24   = payload[:24]
+    len_be32 = len(payload).to_bytes(4, "big")
+    fold     = compute_simple_fold(payload)
+    return xxhash.xxh64(head24 + len_be32 + fold).digest()[:6]
+
+
+def get_structural_key(payload: bytes) -> str:
+    """Return σ₂ as a hex string (12 chars) — suitable as dict key."""
+    return compute_sigma2(payload).hex()
+
+
+def batch_process_crashes(crashes: list[bytes]) -> dict[str, dict]:
+    """Two-level deduplication over a batch of crash payloads.
+
+    Algorithm:
+        1. Group all payloads by σ₂ (structural similarity)
+        2. Within each σ₂ group, subgroup by σ₁ (exact match)
+        3. Keep up to _MAX_STRUCTURAL_REPS representative payloads per group
+
+    Args:
+        crashes: List of raw crash payloads.
+
+    Returns:
+        {
+            sigma2_hex: {
+                "total":            int,          # total payloads in this group
+                "unique_variants":  int,          # distinct σ₁ values
+                "representatives":  list[bytes],  # ≤ 5 sample payloads
+            },
+            ...
+        }
+    """
+    # Two-level grouping: σ₂ → σ₁ → [payloads]
+    groups: dict[str, dict[str, list[bytes]]] = {}
+
+    for payload in crashes:
+        s2 = get_structural_key(payload)
+        s1 = compute_sigma1(payload).hex()
+        groups.setdefault(s2, {}).setdefault(s1, []).append(payload)
+
+    # Collapse into result
+    result: dict[str, dict] = {}
+    for s2, exact_groups in groups.items():
+        total = sum(len(v) for v in exact_groups.values())
+        unique = len(exact_groups)
+        reps = [v[0] for v in list(exact_groups.values())[:_MAX_STRUCTURAL_REPS]]
+        result[s2] = {
+            "total": total,
+            "unique_variants": unique,
+            "representatives": reps,
+        }
+
+    return result
 
 
 # ===========================================================================
@@ -180,12 +337,56 @@ class CrashManager:
                 with open(index_path, "r", encoding="utf-8") as f:
                     raw = json.load(f)
 
+                migrated = 0
                 for sig, entry_dict in raw.get("crashes", {}).items():
+                    # Schema migration: old entries used 16-char hex sigs (64-bit SHA256),
+                    # new entries use 32-char hex sigs (128-bit SHA256[0:16]).
+                    # Old struct_sig was 8 chars (SHA256-based), new is 12 chars (XXH64-based).
+                    # Mismatched lengths mean old entries can never match new signatures,
+                    # so we migrate them by recomputing from the PoC file on disk.
+                    if len(sig) != 32:
+                        poc_path = self.crash_dir / entry_dict.get("poc_path", "")
+                        if poc_path.exists():
+                            old_payload = poc_path.read_bytes()
+                            new_sig = compute_sigma1(old_payload).hex()
+                            new_struct = get_structural_key(old_payload)
+                            entry_dict["signature"] = new_sig
+                            entry_dict["struct_sig"] = new_struct
+                            # Rename PoC + report files to new sig
+                            new_poc = self.crash_dir / f"{new_sig}.bin"
+                            new_rpt = self.crash_dir / f"{new_sig}.report.json"
+                            if not new_poc.exists():
+                                poc_path.rename(new_poc)
+                            if (self.crash_dir / f"{sig}.report.json").exists():
+                                (self.crash_dir / f"{sig}.report.json").rename(new_rpt)
+                            entry_dict["poc_path"] = str(
+                                new_poc.relative_to(self.crash_dir)
+                            )
+                            entry_dict["report_path"] = str(
+                                new_rpt.relative_to(self.crash_dir)
+                            )
+                            sig = new_sig
+                            migrated += 1
+                        else:
+                            # PoC file missing — skip stale entry
+                            continue
+
                     entry = CrashEntry(**entry_dict)
+                    # FIX: verify duplicate_count invariant on load.
+                    # If corrupted, repair from total_hits.
+                    if entry.duplicate_count != entry.total_hits - 1:
+                        entry.duplicate_count = entry.total_hits - 1
                     self._index[sig] = entry
                     self._struct_map.setdefault(entry.struct_sig, set()).add(sig)
 
                 self._total_hits = sum(e.total_hits for e in self._index.values())
+
+                if migrated:
+                    self._persist_index_sync()  # Rewrite with new-format keys
+                    log.info(
+                        "Migrated %d crash entries to v2 signature format",
+                        migrated,
+                    )
 
                 log.info(
                     "Crash index loaded",
@@ -218,8 +419,8 @@ class CrashManager:
         Record a crash event and apply deduplication.
 
         Algorithm:
-            1. Compute primary_sig   = SHA256(payload)[:16]
-            2. Compute struct_sig    = SHA256(payload[:16] + len_bytes)[:8]
+            1. Compute primary_sig   = SHA256(payload)[0:16] (128-bit)
+            2. Compute struct_sig    = XXH64(head24‖len_be32‖fold)[0:6] (48-bit)
             3. If primary_sig in _index → duplicate: increment counter, return
             4. Else → new crash: save PoC, save report, update index + disk
 
@@ -245,7 +446,7 @@ class CrashManager:
                 entry = self._index[primary_sig]
                 entry.duplicate_count += 1
                 entry.total_hits      += 1
-                entry.last_seen        = datetime.utcnow().isoformat()
+                entry.last_seen        = datetime.now(timezone.utc).isoformat()
                 siblings = list(self._struct_map.get(struct_sig, set()) - {primary_sig})
 
                 log.debug(
@@ -273,7 +474,7 @@ class CrashManager:
             # ---------------------------------------------------------------
             # New unique crash path
             # ---------------------------------------------------------------
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
 
             poc_path    = self.crash_dir / f"{primary_sig}.bin"
             report_path = self.crash_dir / f"{primary_sig}.report.json"
@@ -343,7 +544,7 @@ class CrashManager:
     async def is_known(self, payload: bytes) -> bool:
         """
         Quick check: has this exact payload been seen before?
-        O(1) after SHA256 computation — safe to call in the hot loop.
+        O(1) after SHA256[0:16] computation — safe to call in the hot loop.
         """
         sig = self._compute_primary_sig(payload)
         async with self._lock:
@@ -365,10 +566,12 @@ class CrashManager:
                 reverse=True,
             )[:5]
 
-            # Crash type distribution
+            # Crash type distribution — counts total hits per type, not just
+            # unique signatures. FIX: was counting unique signatures per type,
+            # which understates actual crash frequency per type.
             types: dict[str, int] = {}
             for e in self._index.values():
-                types[e.crash_type] = types.get(e.crash_type, 0) + 1
+                types[e.crash_type] = types.get(e.crash_type, 0) + e.total_hits
 
             return CrashStatistics(
                 unique_crashes  = unique,
@@ -388,6 +591,12 @@ class CrashManager:
                 crash_types     = types,
                 poc_directory   = str(self.crash_dir),
                 index_file      = str(self.crash_dir / self.INDEX_FILENAME),
+                # FIX: precise first crash time from earliest CrashEntry,
+                # not from coarse telemetry snapshot granularity.
+                first_crash_time = (
+                    min(e.first_seen for e in self._index.values())
+                    if self._index else None
+                ),
             )
 
     async def get_all_entries(self) -> list[CrashEntry]:
@@ -408,36 +617,24 @@ class CrashManager:
             return [self._index[s] for s in sigs if s in self._index]
 
     # -----------------------------------------------------------------------
-    # Signature Computation
+    # Signature Computation (delegates to module-level functions)
     # -----------------------------------------------------------------------
 
     @staticmethod
     def _compute_primary_sig(payload: bytes) -> str:
-        """
-        Primary deduplication key: SHA256(full payload), first 16 hex chars.
+        """Primary dedup key: SHA256(payload)[0:16] → 32 hex chars (128-bit).
 
-        Collision probability at 2^64 possible values is negligible for
-        any realistic fuzzing session. Full SHA256 is computed for
-        correctness but only 16 chars (8 bytes = 64 bits) are stored.
-
-        sha256(payload).hexdigest()[:16]
+        Delegates to compute_sigma1() and converts to hex string.
         """
-        return hashlib.sha256(payload).hexdigest()[:16]
+        return compute_sigma1(payload).hex()
 
     @staticmethod
     def _compute_struct_sig(payload: bytes) -> str:
-        """
-        Secondary structural signature: SHA256(header_16B + len_bytes)[:8].
+        """Structural key: XXH64(head24‖len_be32‖fold)[0:6] → 12 hex chars (48-bit).
 
-        Two payloads with the same first 16 bytes and same total length
-        get the same structural signature, enabling discovery of crash
-        VARIANTS (same trigger field, different payload content).
-
-        sha256(payload[:16] + len(payload).to_bytes(4, 'big')).hexdigest()[:8]
+        Delegates to get_structural_key().
         """
-        header   = payload[:16]
-        len_bytes = len(payload).to_bytes(4, "big")
-        return hashlib.sha256(header + len_bytes).hexdigest()[:8]
+        return get_structural_key(payload)
 
     # -----------------------------------------------------------------------
     # File I/O (synchronous — intentional, crashes are rare)
@@ -477,7 +674,7 @@ class CrashManager:
 
         payload = {
             "meta": {
-                "last_updated":    datetime.utcnow().isoformat(),
+                "last_updated":    datetime.now(timezone.utc).isoformat(),
                 "unique_crashes":  len(self._index),
                 "total_hits":      self._total_hits,
                 "struct_buckets":  len(self._struct_map),

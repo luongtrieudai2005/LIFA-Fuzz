@@ -15,7 +15,7 @@ ALGORITHM (per byte offset i):
     │ 2. Compute:                                                     │
     │    H(V_i)   = -Σ p(v) · log₂ p(v)         ← Shannon Entropy   │
     │    σ²(V_i)  = Σ (v − μ)² / n              ← Variance          │
-    │    τ(V_i)   = (C − D) / (n(n−1)/2)        ← Kendall's Tau     │
+    │    τ_b(V_i) = (C − D) / √((n₀−T_y)·n₀)   ← Kendall's Tau-b   │
     │    r_L(V_i) = Cov(V_i, L) / (σ_V · σ_L)  ← Pearson w/ Length │
     │                                                                 │
     │ 3. Label:                                                       │
@@ -43,12 +43,12 @@ import math
 import struct
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
 from shared.logger import get_logger
-from shared.schemas import FieldRule, MutationStrategy
+from shared.schemas import FieldRule, FieldType, MutationStrategy
 
 log = get_logger("slow_loop.differential_analyzer")
 
@@ -163,6 +163,9 @@ class FieldGroup:
 
     @property
     def length(self) -> int:
+        """Byte length of the group. Returns -1 for variable-length groups."""
+        if self.end == -1:
+            return -1
         return self.end - self.start
 
     @property
@@ -170,7 +173,7 @@ class FieldGroup:
         """Map OffsetLabel → MutationStrategy for SemanticRuleSet generation."""
         mapping = {
             OffsetLabel.STATIC:       MutationStrategy.STATIC,
-            OffsetLabel.CALCULATED:   MutationStrategy.CALCULATED if self.sub_type == CalcSubType.LENGTH_FIELD else MutationStrategy.INCREMENT,
+            OffsetLabel.CALCULATED:   MutationStrategy.CALCULATED if self.sub_type == CalcSubType.LENGTH_FIELD else MutationStrategy.RANDOM_BYTES,
             OffsetLabel.HIGH_ENTROPY: MutationStrategy.RANDOM_BYTES,
             OffsetLabel.LOW_ENTROPY:  MutationStrategy.BIT_FLIP,
             OffsetLabel.UNKNOWN:      MutationStrategy.SKIP,
@@ -234,77 +237,73 @@ class HeatmapResult:
 
     def to_llm_hint(self) -> str:
         """
-        Format the heatmap as a human-readable hint block for the LLM prompt.
+        Format the heatmap as a token-efficient hint block for the LLM prompt.
+
+        P3-I: Uses pipe-delimited columns instead of Unicode box-drawing chars.
+        Saves ~200 tokens per hint (~40% reduction) with no information loss.
 
         This is injected verbatim into the LLM's system/user message.
         Goal: give the LLM a pre-computed head start so it focuses on
         semantic naming and confirmation rather than raw byte discovery.
         """
-        label_icons = {
-            OffsetLabel.STATIC:       "❄  STATIC      ",
-            OffsetLabel.CALCULATED:   "⚙  CALCULATED  ",
-            OffsetLabel.HIGH_ENTROPY: "🔥 HIGH_ENTROPY",
-            OffsetLabel.LOW_ENTROPY:  "〰 LOW_ENTROPY  ",
-            OffsetLabel.UNKNOWN:      "?  UNKNOWN     ",
+        label_tags = {
+            OffsetLabel.STATIC:       "STATIC",
+            OffsetLabel.CALCULATED:   "CALC",
+            OffsetLabel.HIGH_ENTROPY: "HIGH",
+            OffsetLabel.LOW_ENTROPY:  "LOW",
+            OffsetLabel.UNKNOWN:      "UNKN",
         }
 
         lines = [
-            "╔══════════════════════════════════════════════════════════════════╗",
-            "║   MATHEMATICAL PRE-ANALYSIS  (computed before LLM — trust this) ║",
-            "╚══════════════════════════════════════════════════════════════════╝",
-            f"  Packets: {self.packet_count}  │  "
-            f"Length: {self.min_length}–{self.max_length} B  │  "
-            f"Analyzed depth: {self.analysis_depth} B",
+            "## MATHEMATICAL PRE-ANALYSIS (computed before LLM — trust this)",
+            f"Packets: {self.packet_count} | "
+            f"Length: {self.min_length}-{self.max_length}B | "
+            f"Depth: {self.analysis_depth}B",
             "",
-            "  BYTE-LEVEL HEATMAP:",
-            "  ┌────────┬────────────────┬────────┬──────────┬──────────────────────┐",
-            "  │ Offset │ Label          │  H(X)  │    σ²    │ Notes                │",
-            "  ├────────┼────────────────┼────────┼──────────┼──────────────────────┤",
+            "offset | label | H(X)  | variance | notes",
+            "-------|-------|-------|----------|------",
         ]
 
         for off, s in sorted(self.offset_stats.items()):
-            icon    = label_icons.get(s.label, "?")
-            h_str   = f"{s.entropy:6.3f}"
-            var_str = f"{s.variance:8.1f}"
+            tag = label_tags.get(s.label, "?")
+            h_str = f"{s.entropy:.3f}"
+            var_str = f"{s.variance:.1f}"
 
             if s.label == OffsetLabel.STATIC:
-                note = f"const=0x{s.constant_value:02X}   conf={s.confidence:.2f}"
+                note = f"const=0x{s.constant_value:02X} conf={s.confidence:.2f}"
             elif s.label == OffsetLabel.CALCULATED:
                 if s.sub_type == CalcSubType.LENGTH_FIELD:
                     note = f"r={s.best_corr:+.3f} enc={s.best_encoding}"
                 else:
-                    note = f"tau={s.kendall_tau:+.3f} (monotonic inc)"
+                    note = f"tau={s.kendall_tau:+.3f} (monotonic)"
             elif s.label == OffsetLabel.HIGH_ENTROPY:
-                note = f"unique={s.unique_count:3d}/256  conf={s.confidence:.2f}"
+                note = f"unique={s.unique_count}/256 conf={s.confidence:.2f}"
             else:
-                note = f"unique={s.unique_count:3d}  conf={s.confidence:.2f}"
+                note = f"unique={s.unique_count} conf={s.confidence:.2f}"
 
-            lines.append(f"  │  {off:4d}  │ {icon} │ {h_str} │ {var_str} │ {note:<20} │")
+            lines.append(f"{off:5d}  | {tag:5s} | {h_str:5s} | {var_str:8s} | {note}")
 
         lines += [
-            "  └────────┴────────────────┴────────┴──────────┴──────────────────────┘",
             "",
-            "  INFERRED FIELD GROUPS (use as strong structural hints):",
+            "### Inferred Field Groups (strong structural hints):",
         ]
 
         for g in self.field_groups:
-            span    = f"[{g.start:02d}–{g.end - 1:02d}]" if g.length > 1 else f"[{g.start:02d}    ]"
-            icon    = label_icons.get(g.label, "?")
-            strat   = g.suggested_strategy.value
-            hex_val = f"0x{g.static_hex}" if g.static_hex else ""
+            span = f"[{g.start:02d}-{g.end - 1:02d}]" if g.length > 1 else f"[{g.start:02d}]"
+            tag = label_tags.get(g.label, "?")
+            strat = g.suggested_strategy.value
+            hex_val = f" val=0x{g.static_hex}" if g.static_hex else ""
             lines.append(
-                f"    {span} {icon}  {g.length:2d}B  "
-                f"strategy={strat:<16} {hex_val}  conf={g.confidence:.2f}"
+                f"  {span} {tag:5s} {g.length:2d}B "
+                f"strategy={strat}{hex_val} conf={g.confidence:.2f}"
             )
 
         lines += [
             "",
-            "  INSTRUCTION TO LLM:",
-            "  The heatmap above is MATHEMATICALLY COMPUTED — not guessed.",
-            "  Your task: confirm field names, identify semantic purpose,",
-            "  and flag any CHECKSUM or SEQUENCE patterns not yet captured.",
-            "  Do NOT re-derive what is already marked STATIC or HIGH_ENTROPY.",
-            "═" * 68,
+            "### Instruction",
+            "The heatmap is MATHEMATICALLY COMPUTED, not guessed.",
+            "Your task: name fields, identify semantics, flag CHECKSUM/SEQUENCE patterns.",
+            "Do NOT re-derive what is already marked STATIC or HIGH_ENTROPY.",
         ]
         return "\n".join(lines)
 
@@ -317,8 +316,24 @@ class HeatmapResult:
         This closes the gap between "no rules" and "LLM response" — the
         analyzer output is typically available in <1 ms.
         """
+        # Map encoding strings from _best_length_correlation to FieldType
+        _ENC_TO_FIELD_TYPE: dict[str, FieldType] = {
+            "uint8":     FieldType.UINT8,
+            "uint16_le": FieldType.UINT16_LE,
+            "uint16_be": FieldType.UINT16_BE,
+            "uint32_le": FieldType.UINT32_LE,
+            "uint32_be": FieldType.UINT32_BE,
+        }
+
         rules: list[FieldRule] = []
         for i, g in enumerate(self.field_groups):
+            # Propagate endian info from first offset's best_encoding
+            data_type: Optional[FieldType] = None
+            if g.label == OffsetLabel.CALCULATED and g.sub_type == CalcSubType.LENGTH_FIELD:
+                stat = self.offset_stats.get(g.start)
+                if stat and stat.best_encoding in _ENC_TO_FIELD_TYPE:
+                    data_type = _ENC_TO_FIELD_TYPE[stat.best_encoding]
+
             rule = FieldRule(
                 field_name         = f"field_{i:02d}_{g.label.value.lower()}",
                 offset             = g.start,
@@ -326,6 +341,7 @@ class HeatmapResult:
                 mutation_strategy  = g.suggested_strategy,
                 static_value       = g.static_hex if g.label == OffsetLabel.STATIC else None,
                 calculation_source = "payload" if (g.sub_type == CalcSubType.LENGTH_FIELD) else None,
+                data_type          = data_type,
                 notes              = g.notes or f"Auto-inferred by DifferentialAnalyzer (conf={g.confidence:.2f})",
                 confidence         = g.confidence,
             )
@@ -404,40 +420,148 @@ def _pearson_r(xs: list[float], ys: list[float]) -> float:
     return num / (den_x * den_y)
 
 
-def _kendall_tau(values: list[int]) -> float:
+def _kendall_tau(values: list[int], max_samples: int = 200) -> float:
     """
     Kendall's rank correlation coefficient τ.
 
     Measures monotonic trend in the ORDER values appear (i.e., over time).
-    τ = (C − D) / (n·(n−1)/2)
-      C = concordant pairs (values[j] > values[i] when j > i)
-      D = discordant pairs (values[j] < values[i] when j > i)
+
+    Uses Kendall tau-b which correctly handles ties (common in byte data):
+
+        τ_b = (C − D) / √((C + D + T_x) · (C + D + T_y))
+
+    With x = capture index (always unique, T_x = 0):
+
+        τ_b = (C − D) / √((total_pairs − T_y) · total_pairs)
+
+    Where:
+        C = concordant pairs
+        D = discordant pairs (= index inversions after sorting by value)
+        T_y = tied pairs in the value dimension
+        total_pairs = n·(n−1)/2
+
+    Algorithm: modified merge-sort inversion counting on indices after
+    stable-sorting (value, index) pairs by value.  Equal values are NOT
+    counted as inversions — they go into T_y.
 
     τ > +0.75 → strong monotonic increase  → SEQUENCE_NUMBER
     τ < −0.75 → strong monotonic decrease  → (rare, e.g., countdown)
     |τ| < 0.75 → no clear trend
 
-    Complexity: O(n²) — acceptable for n < 200 packets.
+    P1-D fix: Input is stride-sampled to max_samples to cap array size.
+
+    Complexity: O(min(n, max_samples) · log(min(n, max_samples)))
 
     Args:
-        values: Byte values in capture order.
+        values:      Byte values in capture order.
+        max_samples: Cap input size via stride sampling (default 200).
 
     Returns:
-        τ ∈ [-1.0, +1.0].
+        τ_b ∈ [-1.0, +1.0].
+
+    Edge cases:
+        [1,2,3,4,5]       →  1.0  (perfect increasing)
+        [5,4,3,2,1]       → -1.0  (perfect decreasing)
+        [1,1,1,1,1]       →  0.0  (all tied)
+        [1,2,1,2,1]       →  0.0  (ambiguous with ties)
+        n < 4             →  0.0  (not enough data)
     """
     n = len(values)
+
+    # Stride-based downsampling to cap O(n log n) cost
+    if n > max_samples:
+        step = n / max_samples
+        values = [values[int(i * step)] for i in range(max_samples)]
+        n = max_samples
+
     if n < 4:
         return 0.0
-    concordant = discordant = 0
-    for i in range(n):
-        for j in range(i + 1, n):
-            diff = values[j] - values[i]
-            if diff > 0:
-                concordant += 1
-            elif diff < 0:
-                discordant += 1
-    total = n * (n - 1) // 2
-    return (concordant - discordant) / total if total else 0.0
+
+    total_pairs = n * (n - 1) // 2
+
+    # Step 1: Stable-sort (value, index) pairs by value.
+    # Python's sorted() is stable (Timsort) — tied values keep original order.
+    pairs = sorted(enumerate(values), key=lambda p: p[1])
+    sorted_values  = [p[1] for p in pairs]
+    sorted_indices = [p[0] for p in pairs]
+
+    # Step 2: Count inversions among indices = D (discordant pairs).
+    # After stable-sort by value, an inversion of indices means:
+    #   a higher-valued element appears earlier in capture order → discordant.
+    _, D = _merge_sort_inversions(sorted_indices)
+
+    # Step 3: Count tied value pairs = T_y.
+    # For k equal values in sorted order: k·(k-1)/2 tied pairs.
+    T_y = _count_ties(sorted_values)
+
+    # Step 4: Compute Kendall tau-b.
+    C = total_pairs - D - T_y
+    denom_sq = (total_pairs - T_y) * total_pairs
+
+    if denom_sq <= 0:
+        return 0.0  # All pairs are tied
+
+    return (C - D) / math.sqrt(denom_sq)
+
+
+def _merge_sort_inversions(arr: list[int]) -> tuple[list[int], int]:
+    """Count inversions using modified merge sort.  O(n log n).
+
+    An inversion is a pair (i, j) where i < j but arr[i] > arr[j].
+    Equal elements (arr[i] == arr[j]) are NOT counted as inversions.
+
+    Returns (sorted_copy, inversion_count).
+    """
+    n = len(arr)
+    if n <= 1:
+        return arr[:], 0
+
+    # Divide
+    mid = n // 2
+    left,  left_inv  = _merge_sort_inversions(arr[:mid])
+    right, right_inv = _merge_sort_inversions(arr[mid:])
+
+    # Conquer: merge while counting cross-inversions
+    merged = []
+    inversions = left_inv + right_inv
+    i = j = 0
+
+    while i < len(left) and j < len(right):
+        # <= (not <) ensures equal elements do NOT count as inversions
+        if left[i] <= right[j]:
+            merged.append(left[i])
+            i += 1
+        else:
+            merged.append(right[j])
+            # All remaining elements in left are greater → each is an inversion
+            inversions += len(left) - i
+            j += 1
+
+    # Append leftovers
+    merged.extend(left[i:])
+    merged.extend(right[j:])
+
+    return merged, inversions
+
+
+def _count_ties(sorted_values: list[int]) -> int:
+    """Count tied pairs in a sorted list of values.
+
+    For each group of k consecutive equal values: k·(k-1)/2 tied pairs.
+    """
+    ties = 0
+    i = 0
+    n = len(sorted_values)
+    while i < n:
+        j = i + 1
+        # Scan past all values equal to sorted_values[i]
+        while j < n and sorted_values[j] == sorted_values[i]:
+            j += 1
+        k = j - i  # size of this equal-value group
+        if k > 1:
+            ties += k * (k - 1) // 2
+        i = j
+    return ties
 
 
 def _try_decode_int(data: bytes, fmt: str, size: int) -> Optional[int]:
@@ -485,6 +609,10 @@ class DifferentialAnalyzer:
         h_high_min:       float = _H_HIGH_MIN,
         corr_length_min:  float = _CORR_LENGTH_MIN,
         tau_mono_min:     float = _TAU_MONO_MIN,
+        # P1-D: cap τ input to avoid O(n²) blowup on large corpora
+        max_tau_samples:  int   = 200,
+        # P2-A: stop analysis after N consecutive HIGH_ENTROPY offsets
+        early_stop_consecutive: int = 10,
     ) -> None:
         self.max_depth       = max_depth
         self.min_packets     = min_packets
@@ -494,6 +622,8 @@ class DifferentialAnalyzer:
         self.h_high_min      = h_high_min
         self.corr_length_min = corr_length_min
         self.tau_mono_min    = tau_mono_min
+        self.max_tau_samples = max_tau_samples
+        self.early_stop_consecutive = early_stop_consecutive
 
     # -----------------------------------------------------------------------
     # Public API
@@ -537,31 +667,59 @@ class DifferentialAnalyzer:
         # Step 1: Compute per-offset statistics
         # -------------------------------------------------------------------
         all_stats: dict[int, OffsetStats] = {}
+        consecutive_high: int = 0  # P2-A: track HIGH_ENTROPY streak
+        effective_depth: int = analysis_depth
+
         for offset in range(analysis_depth):
             stats = self._analyze_offset(offset, packets, lengths)
             if stats is not None:
                 all_stats[offset] = stats
 
+                # P2-A: early-stop on consecutive HIGH_ENTROPY offsets
+                if stats.label == OffsetLabel.HIGH_ENTROPY:
+                    consecutive_high += 1
+                    if consecutive_high >= self.early_stop_consecutive:
+                        # Truncate: keep offsets up to the start of this streak
+                        effective_depth = max(0, offset - self.early_stop_consecutive + 1)
+                        # Remove the HIGH_ENTROPY streak offsets
+                        for trim_off in range(effective_depth, offset + 1):
+                            all_stats.pop(trim_off, None)
+                        log.info(
+                            "Early-stop: %d consecutive HIGH_ENTROPY offsets — "
+                            "trimming analysis to %d bytes",
+                            consecutive_high, effective_depth,
+                        )
+                        break
+                else:
+                    consecutive_high = 0
+
         # -------------------------------------------------------------------
         # Step 2: Cluster into field groups
         # -------------------------------------------------------------------
-        groups = self._cluster_into_fields(all_stats, analysis_depth)
+        groups = self._cluster_into_fields(all_stats, effective_depth)
+
+        # P2-E: Merge split multi-byte CALCULATED fields
+        groups = self._merge_calculated_neighbors(groups, all_stats)
 
         # Mark the final group as variable-length if max_len > min_len
         if groups and max_len > min_len:
             last = groups[-1]
             if last.label == OffsetLabel.HIGH_ENTROPY:
+                # H9 fix: set end=-1 so to_field_rules() produces length=-1
+                # for variable-length payloads (previously only notes were set,
+                # making the g.end != -1 check in to_field_rules() dead code).
+                last.end = -1
                 last.notes = (
                     f"Variable-length payload. "
                     f"Observed range: {min_len - last.start}–{max_len - last.start} B"
                 )
 
         result = HeatmapResult(
-            analyzed_at    = datetime.utcnow(),
+            analyzed_at    = datetime.now(timezone.utc),
             packet_count   = len(packets),
             min_length     = min_len,
             max_length     = max_len,
-            analysis_depth = analysis_depth,
+            analysis_depth = effective_depth,
             offset_stats   = all_stats,
             field_groups   = groups,
         )
@@ -613,7 +771,13 @@ class DifferentialAnalyzer:
         var     = _variance(values_here)
         unique  = len(set(values_here))
         samples = sorted(set(values_here))[:8]
-        tau     = _kendall_tau(values_here)
+
+        # P1-D: skip τ for HIGH_ENTROPY offsets — they're never sequence numbers.
+        # This avoids O(n²) τ computation on ~60% of offsets (the payload region).
+        if H <= self.h_high_min:
+            tau = _kendall_tau(values_here, max_samples=self.max_tau_samples)
+        else:
+            tau = 0.0
 
         # Length correlation across all integer encodings
         best_corr, best_enc, best_ref = self._best_length_correlation(
@@ -643,6 +807,32 @@ class DifferentialAnalyzer:
             confidence     = confidence,
         )
 
+    @staticmethod
+    def _compute_header_candidates(all_lengths: list[int]) -> list[int]:
+        """P2-G: Derive candidate header sizes from observed packet lengths.
+
+        Instead of a hardcoded list, we use the data to generate plausible
+        header_size values. The key insight: payload_length = total_length - header_size.
+        The header_size should be ≤ min(all_lengths) and typically aligns to
+        common field sizes (1, 2, 4 bytes).
+
+        Returns a sorted list of candidate header sizes including 0 (total length).
+        """
+        min_len = min(all_lengths)
+        max_len = max(all_lengths)
+        candidates: set[int] = {0}
+
+        # Core candidates: common field sizes around minimum length
+        for base in range(max(0, min_len - 4), min(max_len + 1, min_len + 17)):
+            candidates.add(base)
+
+        # Also try specific sizes that often appear in protocol headers
+        for typical in [2, 4, 6, 8, 12, 16, 20, 24, 32]:
+            if typical <= max_len:
+                candidates.add(typical)
+
+        return sorted(candidates)
+
     def _best_length_correlation(
         self,
         offset:      int,
@@ -661,9 +851,10 @@ class DifferentialAnalyzer:
         best_enc    = ""
         best_ref    = ""
 
-        # Candidate "header sizes" to try: the field might encode
-        # payload length = total_length - header_size
-        header_guesses = [0, 4, 5, 6, 7, 8, 10, 12, 14, 16]
+        # P2-G: Data-driven header candidates instead of hardcoded list.
+        # The field might encode payload_length = total_length - header_size.
+        # We derive candidates from the observed packet length distribution.
+        header_guesses = self._compute_header_candidates(all_lengths)
 
         for enc_name, (fmt, size) in _INT_ENCODINGS.items():
             # Extract parsed integer values for packets that have offset + size bytes
@@ -728,7 +919,14 @@ class DifferentialAnalyzer:
             return OffsetLabel.HIGH_ENTROPY, None, min(confidence, 0.95)
 
         # --- LOW ENTROPY (structured but variable) ---
-        confidence = 1.0 - _scale(H, 0.0, self.h_low_max)
+        # P1-B fix: handle gap zone (h_low_max < H < h_high_min) gracefully.
+        # Old code: confidence = 1.0 - _scale(H, 0.0, h_low_max) → 0.0 for H > h_low_max.
+        # New: within LOW_MAX → confidence decreases with H; above → lower floor.
+        if H <= self.h_low_max:
+            confidence = 1.0 - _scale(H, 0.0, self.h_low_max)
+        else:
+            # Gap zone: moderate entropy, lower confidence, but not zero
+            confidence = max(0.2, 1.0 - _scale(H, self.h_low_max, 8.0))
         return OffsetLabel.LOW_ENTROPY, None, max(0.4, confidence)
 
     # -----------------------------------------------------------------------
@@ -830,6 +1028,68 @@ class DifferentialAnalyzer:
 
         flush(analysis_depth)
         return groups
+
+    def _merge_calculated_neighbors(
+        self,
+        groups: list[FieldGroup],
+        all_stats: dict[int, OffsetStats],
+    ) -> list[FieldGroup]:
+        """P2-E: Merge split multi-byte CALCULATED fields.
+
+        Problem: A uint16_be length field at offset 4 spans bytes 4-5.
+        Offset 4 gets CALCULATED (uint16 decode correlates), offset 5 gets
+        a different label (single-byte decode doesn't correlate). Clustering
+        splits them into two separate FieldGroups.
+
+        Fix: If a CALCULATED singleton group is immediately followed by a
+        non-STATIC group whose total span matches a multi-byte encoding
+        (2 or 4 bytes), merge them and propagate the CALCULATED label.
+        """
+        if len(groups) < 2:
+            return groups
+
+        # Encoding sizes that could span multiple bytes
+        # M5 fix: include 3 (24-bit) and 8 (64-bit) field sizes
+        multi_byte_sizes = {2, 3, 4, 8}
+
+        merged: list[FieldGroup] = []
+        i = 0
+        while i < len(groups):
+            g = groups[i]
+
+            # Check: singleton CALCULATED(LENGTH_FIELD) followed by non-STATIC neighbor
+            if (
+                g.label == OffsetLabel.CALCULATED
+                and g.sub_type == CalcSubType.LENGTH_FIELD.value
+                and g.length == 1
+                and i + 1 < len(groups)
+                and groups[i + 1].label != OffsetLabel.STATIC
+            ):
+                neighbor = groups[i + 1]
+                combined_len = g.length + neighbor.length
+
+                if combined_len in multi_byte_sizes:
+                    # Merge: extend the CALCULATED group to cover both
+                    enc = g.notes.split("enc=")[-1].split(",")[0] if "enc=" in g.notes else ""
+                    ref = g.notes.split("ref=")[-1].split(")")[0] if "ref=" in g.notes else ""
+
+                    merged_group = FieldGroup(
+                        start=g.start,
+                        end=neighbor.end,
+                        label=OffsetLabel.CALCULATED,
+                        sub_type=CalcSubType.LENGTH_FIELD.value,
+                        confidence=max(g.confidence, neighbor.confidence),
+                        notes=f"Multi-byte length field ({enc}, ref={ref}, "
+                              f"r={g.confidence:.3f}, {combined_len}B merged)",
+                    )
+                    merged.append(merged_group)
+                    i += 2  # skip both groups
+                    continue
+
+            merged.append(g)
+            i += 1
+
+        return merged
 
 
 # ===========================================================================

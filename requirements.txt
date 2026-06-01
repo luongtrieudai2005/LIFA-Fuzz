@@ -27,8 +27,12 @@ pytest-asyncio>=0.23.0      # Async test support for pytest
 pytest-mock>=3.14.0         # Mocking library
 pytest-cov>=5.0.0           # Coverage reporting
 
+# --- Hashing (high-performance) ---
+xxhash>=3.0.0               # XXH64 for fast structural signatures
+
 # --- Utilities ---
 rich>=13.7.0                # Pretty-printing for CLI output
 click>=8.1.7                # CLI argument parsing
 tenacity>=8.2.0             # Retry logic with backoff
 structlog>=24.1.0           # Structured logging (optional, alternative to stdlib logging)
+python-dotenv>=1.0.0        # .env file loading for API keys and configuration

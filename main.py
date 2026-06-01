@@ -50,9 +50,16 @@ from typing import Any, Optional
 
 from shared.logger import get_logger, setup_root_logger, shutdown_logging
 from shared.sandbox_abstraction import BaseSandbox, get_driver
+from shared.runtime_state import (
+    PipelineState, TargetState, ClientState, InterceptorState,
+    MutatorState, SlowLoopState, RuleSetState,
+    write_runtime_state, read_slow_loop_state, RUNTIME_STATE_FILE,
+)
+from dotenv import load_dotenv
 
 # Import sandbox drivers so they self-register via register_driver()
 import sandbox.docker_driver  # noqa: F401 — registers "docker" driver
+import sandbox.firecracker_driver  # noqa: F401 — registers "firecracker" driver (Phase 4)
 
 # Setup logging before anything else
 setup_root_logger(level="INFO", log_format="json")
@@ -126,6 +133,180 @@ def stop_slow_loop(proc: Optional[subprocess.Popen]) -> None:
 
 
 # =============================================================================
+# Runtime State Writer (background task — feeds the dashboard)
+# =============================================================================
+
+
+async def _state_writer_task(
+    sandbox: BaseSandbox,
+    interceptor: Any,
+    client_proc: Any,
+    mutator: Any,
+    crash_monitor: Any,
+    crash_manager: Any,
+    slow_loop_proc: Optional[subprocess.Popen],
+    driver_name: str,
+    target_host: str,
+    target_port: int,
+    start_time: float,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Background task: aggregate state from all components every 2s.
+
+    Writes shared/runtime_state.json for the dashboard to read.
+    Each component read is wrapped in its own try/except so one
+    failure does not prevent the others from being written.
+    """
+    state_path = RUNTIME_STATE_FILE
+
+    while not shutdown_event.is_set():
+        try:
+            now = time.time()
+            uptime = time.monotonic() - start_time
+
+            # ── Target ────────────────────────────────────────────────
+            target_alive = None
+            try:
+                target_alive = await sandbox.is_target_alive()
+            except Exception:
+                pass
+
+            target = TargetState(
+                alive=target_alive,
+                sandbox_driver=driver_name,
+                host=target_host,
+                port=target_port,
+            )
+
+            # ── Client ────────────────────────────────────────────────
+            client_alive = None
+            client_pid = None
+            try:
+                client_alive = client_proc.is_alive
+                client_pid = client_proc.pid
+            except Exception:
+                pass
+
+            client = ClientState(alive=client_alive, pid=client_pid)
+
+            # ── Interceptor ───────────────────────────────────────────
+            # NOTE: MutationEngine sends directly to the target (bypasses
+            # the Interceptor), so interceptor.total_injected is always 0.
+            # We use mutator's total_sent as the authoritative injection count.
+            captured = active_conns = 0
+            injected = 0
+            paused = False
+            try:
+                captured = interceptor.total_captured
+                active_conns = interceptor.active_connections
+                paused = interceptor.is_paused
+            except Exception:
+                pass
+            try:
+                injected = mutator._stats.total_sent
+            except Exception:
+                pass
+
+            interceptor_state = InterceptorState(
+                captured=captured,
+                injected=injected,
+                active_connections=active_conns,
+                paused=paused,
+            )
+
+            # ── Mutator ───────────────────────────────────────────────
+            try:
+                ms = mutator.get_stats()
+                mutator_state = MutatorState(
+                    mode=ms.mode,
+                    k=mutator.k,
+                    current_eps=ms.current_eps,
+                    total_sent=ms.total_sent,
+                    total_accepted=ms.total_accepted,
+                    total_rejected=ms.total_rejected,
+                    total_crashes=ms.total_crashes,
+                    investigation_mode=ms.investigation_mode,
+                    rule_set_version=ms.rule_set_version,
+                )
+            except Exception:
+                mutator_state = MutatorState()
+
+            # ── Slow Loop ─────────────────────────────────────────────
+            sl_alive = None
+            sl_pid = None
+            try:
+                if slow_loop_proc is not None:
+                    sl_alive = slow_loop_proc.poll() is None
+                    sl_pid = slow_loop_proc.pid
+            except Exception:
+                pass
+
+            # Merge state from slow_loop_state.json (written by subprocess)
+            sl_data = read_slow_loop_state()
+            if sl_data:
+                slow_loop_state = SlowLoopState(
+                    alive=sl_alive if sl_alive is not None else sl_data.get("alive"),
+                    pid=sl_pid or sl_data.get("pid"),
+                    last_cycle_time=sl_data.get("last_cycle_time", ""),
+                    total_cycles=sl_data.get("total_cycles", 0),
+                    total_inferences=sl_data.get("total_inferences", 0),
+                    total_rules_pushed=sl_data.get("total_rules_pushed", 0),
+                    last_error=sl_data.get("last_error", ""),
+                )
+            else:
+                slow_loop_state = SlowLoopState(alive=sl_alive, pid=sl_pid)
+
+            # ── Crash Manager ─────────────────────────────────────────
+            unique_crashes = 0
+            total_hits = 0
+            try:
+                if crash_manager is not None:
+                    crash_stats = await crash_manager.get_statistics()
+                    unique_crashes = crash_stats.unique_crashes
+                    total_hits = crash_stats.total_hits
+            except Exception:
+                pass
+
+            # ── Rule Set ──────────────────────────────────────────────
+            rule_set = RuleSetState()
+            try:
+                rules_path = Path("shared/active_rules.json")
+                if rules_path.exists():
+                    raw = json.loads(rules_path.read_text(encoding="utf-8"))
+                    rules_list = raw if isinstance(raw, list) else raw.get("rules", [])
+                    rule_set = RuleSetState(
+                        version=mutator_state.rule_set_version,
+                        total_rules=len(rules_list),
+                    )
+                    # Try to extract protocol/confidence from orchestrator data
+            except Exception:
+                pass
+
+            # ── Assemble & write ──────────────────────────────────────
+            pipeline_status = "running" if target_alive else "degraded"
+
+            state = PipelineState(
+                timestamp=now,
+                uptime_seconds=uptime,
+                pipeline_status=pipeline_status,
+                target=target,
+                client=client,
+                interceptor=interceptor_state,
+                mutator=mutator_state,
+                slow_loop=slow_loop_state,
+                rule_set=rule_set,
+                unique_crashes=unique_crashes,
+                total_crash_hits=total_hits,
+            )
+            write_runtime_state(state, state_path)
+
+        except Exception as e:
+            logger.warning(f"State writer error: {e}")
+
+        await asyncio.sleep(2.0)
+
+
+# =============================================================================
 # Main Pipeline
 # =============================================================================
 
@@ -145,11 +326,38 @@ async def run_pipeline(
     # Track background tasks for clean shutdown
     background_tasks: list[asyncio.Task] = []
     slow_loop_proc: Optional[subprocess.Popen] = None
+    pipeline_start_time = time.monotonic()
 
     try:
         # ── 1. Sandbox ────────────────────────────────────────────
         driver_cls = get_driver(driver_name)
         logger.info(f"Using sandbox driver: {driver_cls.__name__}")
+
+        # Pre-flight check for Firecracker: /dev/kvm must be accessible
+        if driver_name == "firecracker":
+            kvm_path = Path("/dev/kvm")
+            if not kvm_path.exists():
+                logger.error(
+                    "Firecracker requires KVM but /dev/kvm is missing. "
+                    "Enable KVM in your hypervisor/VM settings, or revert "
+                    "to the Docker driver:  --driver docker"
+                )
+                raise RuntimeError(
+                    "/dev/kvm not found — Firecracker requires hardware "
+                    "virtualization support.  Revert with --driver docker."
+                )
+            if not os.access(str(kvm_path), os.R_OK | os.W_OK):
+                logger.error(
+                    "/dev/kvm exists but this user lacks read/write access. "
+                    "Fix with:  sudo chmod 666 /dev/kvm  "
+                    "or add yourself to the kvm group.  "
+                    "Alternatively, revert with --driver docker"
+                )
+                raise RuntimeError(
+                    "/dev/kvm not accessible (permission denied). "
+                    "Revert with --driver docker."
+                )
+            logger.info("KVM available — Firecracker driver ready")
 
         sandbox: BaseSandbox = driver_cls()
 
@@ -204,23 +412,30 @@ async def run_pipeline(
         # ── 4. Mutation Engine ─────────────────────────────────────
         from fast_loop.mutator import MutationEngine
 
+        seed_queue: asyncio.Queue = asyncio.Queue()
+
         mutator = MutationEngine(
-            interceptor=interceptor,
-            mode="smart",
-            mutations_per_packet=5,
-            kill_server_ratio=kill_server_ratio,
+            target_host=target_host,
+            target_port=target_port,
+            seed_queue=seed_queue,
+            k=2,
+            max_eps=1000,
         )
 
         # ── 5. Crash Monitor ──────────────────────────────────────
         from fast_loop.crash_monitor import CrashMonitor
+        from shared.crash_manager import CrashManager
 
         crashes_dir = Path("./crashes")
         crashes_dir.mkdir(parents=True, exist_ok=True)
+
+        crash_manager = CrashManager(crash_dir=str(crashes_dir))
 
         crash_monitor = CrashMonitor(
             sandbox=sandbox,
             interceptor=interceptor,
             mutator=mutator,
+            crash_manager=crash_manager,
             poll_interval_ms=500,
             crash_corpus_dir=str(crashes_dir),
             auto_reset=True,
@@ -234,17 +449,149 @@ async def run_pipeline(
 
         # ── 6. Mutation Loop ───────────────────────────────────────
         mutation_task = asyncio.create_task(
-            mutator.mutation_loop(
-                traffic_log_path=traffic_log,
-                poll_interval=2.0,
-            ),
+            mutator.run(),
             name="mutation_loop",
         )
         background_tasks.append(mutation_task)
 
+        # ── 6b. Seed Feeder (Sequence-Aware) ──────────────────────
+        # Adapter: read JSONL traffic log → group by session_id → push
+        # SeedSequence objects into seed_queue for the MutationEngine.
+        from shared.schemas import Direction, SeedSequence, TrafficRecord
+
+        async def _feed_seed_queue() -> None:
+            """Read JSONL traffic log, group C2S packets by session_id,
+            and push SeedSequence objects into the mutator queue.
+
+            Session buffering: packets accumulate per session_id until the
+            session is idle for > session_timeout seconds, then the whole
+            sequence is flushed as one SeedSequence.
+            """
+            last_pos = 0
+            last_size = 0
+            session_timeout = 2.0   # seconds before flushing a session buffer
+            # session_id → {"packets": [TrafficRecord, ...], "last_seen": float}
+            session_buffers: dict[str, dict] = {}
+
+            while not _shutdown_event.is_set():
+                try:
+                    p = Path(traffic_log)
+                    if not p.exists():
+                        await asyncio.sleep(1.0)
+                        continue
+                    cur_size = p.stat().st_size
+                    # Detect file rotation/truncation — reset position
+                    if cur_size < last_size:
+                        last_pos = 0
+                        session_buffers.clear()
+                    last_size = cur_size
+
+                    with open(p) as f:
+                        lines = f.readlines()
+                    # Clamp last_pos in case of external truncation
+                    if last_pos > len(lines):
+                        last_pos = 0
+                    now = time.time()
+                    for line in lines[last_pos:]:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if (
+                            rec.get("direction") == "client_to_server"
+                            and not rec.get("is_mutated")
+                        ):
+                            raw_hex = rec.get("payload", rec.get("raw_hex", ""))
+                            # FIX: accept all non-empty payloads (was >= 8 hex
+                            # chars = 4 bytes, dropping legitimate 1-3 byte
+                            # protocol packets like ACKs and status bytes).
+                            if raw_hex and len(raw_hex) >= 2:
+                                sid = rec.get("session_id", "")
+                                tr = TrafficRecord(
+                                    direction=Direction.CLIENT_TO_SERVER,
+                                    raw_data=bytes.fromhex(raw_hex),
+                                    session_id=sid,
+                                    timestamp=rec.get("timestamp", time.time()),
+                                )
+                                if sid:
+                                    # Buffer by session for sequence grouping
+                                    buf = session_buffers.setdefault(
+                                        sid,
+                                        {"packets": [], "last_seen": now},
+                                    )
+                                    buf["packets"].append(tr)
+                                    buf["last_seen"] = now
+                                else:
+                                    # No session_id — emit as single-packet sequence
+                                    await seed_queue.put(
+                                        SeedSequence(packets=[tr])
+                                    )
+                    last_pos = len(lines)
+
+                    # Flush session buffers that have been idle too long
+                    expired = [
+                        sid
+                        for sid, buf in session_buffers.items()
+                        if now - buf["last_seen"] >= session_timeout
+                        and buf["packets"]
+                    ]
+                    for sid in expired:
+                        buf = session_buffers.pop(sid)
+                        await seed_queue.put(
+                            SeedSequence(
+                                session_id=sid,
+                                packets=buf["packets"],
+                            )
+                        )
+
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
+
+            # Final flush: emit any remaining buffered sessions on shutdown
+            for sid, buf in list(session_buffers.items()):
+                if buf["packets"]:
+                    try:
+                        await seed_queue.put(
+                            SeedSequence(session_id=sid, packets=buf["packets"])
+                        )
+                    except Exception:
+                        pass
+            session_buffers.clear()
+
+        seed_feeder_task = asyncio.create_task(
+            _feed_seed_queue(), name="seed_feeder"
+        )
+        background_tasks.append(seed_feeder_task)
+
         # ── 7. Slow Loop Daemon ────────────────────────────────────
         llm_mode = os.environ.get("LLM_MODE", "REAL").upper()
         slow_loop_proc = await start_slow_loop()
+
+        # ── 7b. Runtime State Writer ───────────────────────────────
+        # Background task: aggregates state from all components every 2s
+        # and writes shared/runtime_state.json for the dashboard.
+        state_writer = asyncio.create_task(
+            _state_writer_task(
+                sandbox=sandbox,
+                interceptor=interceptor,
+                client_proc=client_proc,
+                mutator=mutator,
+                crash_monitor=crash_monitor,
+                crash_manager=crash_manager,
+                slow_loop_proc=slow_loop_proc,
+                driver_name=driver_name,
+                target_host=target_host,
+                target_port=target_port,
+                start_time=pipeline_start_time,
+                shutdown_event=_shutdown_event,
+            ),
+            name="state_writer",
+        )
+        background_tasks.append(state_writer)
 
         # ── Startup Banner ─────────────────────────────────────────
         logger.info(
@@ -273,14 +620,13 @@ async def run_pipeline(
             now = time.monotonic()
             if now - last_stats_time >= stats_interval:
                 stats = mutator.coverage_summary
+                ms = mutator.get_stats()
                 logger.info(
                     "Fuzzing stats",
                     extra={"context": {
-                        "eps": round(
-                            interceptor.total_injected / max(1, now - time.monotonic() + stats_interval), 1
-                        ),
+                        "eps": ms.current_eps,
                         "packets_captured": interceptor.total_captured,
-                        "packets_injected": interceptor.total_injected,
+                        "packets_injected": ms.total_sent,
                         "mutations": stats["total_mutations"],
                         "kills": stats["total_kills"],
                         "active_rules": stats["active_rules"],
@@ -313,6 +659,7 @@ async def run_pipeline(
         # 3. Final stats
         try:
             stats = mutator.coverage_summary
+            ms = mutator.get_stats()
             logger.info(
                 "Final stats",
                 extra={"context": {
@@ -323,7 +670,7 @@ async def run_pipeline(
                     "active_rules": stats["active_rules"],
                     "total_crashes": crash_monitor.total_crashes,
                     "total_captured": interceptor.total_captured,
-                    "total_injected": interceptor.total_injected,
+                    "total_injected": ms.total_sent,
                 }},
             )
         except Exception:
@@ -379,6 +726,21 @@ async def stop_and_cleanup(driver_name: str = "docker") -> None:
 
 
 def main():
+    # Load .env file first (manual env vars take precedence)
+    load_dotenv(override=False)
+
+    # Load config for default sandbox driver
+    import yaml
+    _config_path = Path("config.yaml")
+    _cfg: dict[str, Any] = {}
+    if _config_path.exists():
+        try:
+            with open(_config_path, encoding="utf-8") as f:
+                _cfg = yaml.safe_load(f) or {}
+        except Exception:
+            pass
+    _default_driver = _cfg.get("sandbox", {}).get("driver", "docker")
+
     parser = argparse.ArgumentParser(
         description="LIFA-Fuzz Master Orchestrator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -404,8 +766,8 @@ Examples:
     parser.add_argument(
         "--driver",
         choices=["docker", "firecracker"],
-        default="docker",
-        help="Sandbox backend driver (default: docker)",
+        default=_default_driver,
+        help=f"Sandbox backend driver (default: {_default_driver}, from config.yaml)",
     )
     parser.add_argument(
         "--stop",

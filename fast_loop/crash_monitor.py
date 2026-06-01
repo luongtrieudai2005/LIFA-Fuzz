@@ -8,6 +8,7 @@ Responsibilities:
     - On crash: log the offending packet, timestamp, and exit code.
     - Pause the Interceptor and Mutation Engine immediately.
     - Save the offending packet as a PoC artifact (JSON + .bin) in /crashes/.
+    - Record the crash through ``CrashManager`` for deduplication (if provided).
     - Call ``sandbox.reset_state()`` to restore the target.
     - Resume the Interceptor and Mutation Engine once the target is alive.
 
@@ -37,11 +38,14 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from shared.logger import get_logger
 from shared.sandbox_abstraction import BaseSandbox
 from shared.schemas import CrashRecord, Signal
+
+if TYPE_CHECKING:
+    from shared.crash_manager import CrashManager
 
 logger = get_logger("fast_loop.crash_monitor")
 
@@ -75,6 +79,9 @@ class CrashMonitor:
         mutator:            The MutationEngine instance (for pause/resume
                             and last-injected-packet tracking).
                             Can be None if managed externally.
+        crash_manager:      Optional CrashManager for crash deduplication.
+                            When provided, every crash is recorded through it
+                            so duplicate PoCs are filtered out automatically.
         poll_interval_ms:   How often to check target status (milliseconds).
         crash_corpus_dir:   Directory to save crash artifacts (JSON + .bin).
         auto_reset:         Whether to automatically reset the target after a crash.
@@ -86,6 +93,7 @@ class CrashMonitor:
         sandbox: BaseSandbox,
         interceptor: Any = None,
         mutator: Any = None,
+        crash_manager: Optional[CrashManager] = None,
         poll_interval_ms: int = 500,
         crash_corpus_dir: str = "./crashes",
         auto_reset: bool = True,
@@ -94,6 +102,7 @@ class CrashMonitor:
         self.sandbox = sandbox
         self.interceptor = interceptor
         self.mutator = mutator
+        self.crash_manager = crash_manager
         self.poll_interval_ms = poll_interval_ms
         self.crash_corpus_dir = Path(crash_corpus_dir)
         self.auto_reset = auto_reset
@@ -136,7 +145,14 @@ class CrashMonitor:
                     crash_info = await self.sandbox.get_last_crash_info()
                     exit_code = crash_info.exit_code if crash_info else 0
                     await self.on_crash(exit_code)
-                    was_alive = False
+                    # After on_crash() → restart_target() → resume_interceptor(),
+                    # the target may already be alive again.  Check and update
+                    # was_alive so we don't miss a rapid re-crash:
+                    #   was_alive=False + alive=False → missed crash.
+                    try:
+                        was_alive = await self.sandbox.is_target_alive()
+                    except Exception:
+                        was_alive = False
 
                 elif not was_alive and alive:
                     # State transition: crashed → running (after reset)
@@ -186,16 +202,28 @@ class CrashMonitor:
         )
 
         # 2. Get offending packet from mutator's tracking
+        # H5 fix: prefer the public API (register_offending_packet) first,
+        # then fall back to the crash window, then to private fields.
         offending_packet = b""
         rule_id = None
-        if self.mutator is not None:
+
+        # Primary: data registered via register_offending_packet()
+        if self._last_offending_packet:
+            offending_packet = self._last_offending_packet
+            rule_id = self._last_mutation_rule_id
+
+        # Secondary: crash attribution window (H3 fix)
+        if not offending_packet and self.mutator is not None:
+            _get_window = getattr(self.mutator, "get_crash_window", None)
+            if _get_window is not None:
+                crash_window = _get_window()
+                if crash_window:
+                    _, offending_packet, rule_id = crash_window[-1]
+
+        # Tertiary: backward-compat private field access
+        if not offending_packet and self.mutator is not None:
             offending_packet = self.mutator._last_injected_packet
             rule_id = self.mutator._last_injected_rule_id
-
-        # Also check our own register
-        if not offending_packet and self._last_offending_packet:
-            offending_packet = self._last_offending_packet
-            rule_id = rule_id or self._last_mutation_rule_id
 
         # 3. Create CrashRecord
         record = CrashRecord(
@@ -215,6 +243,26 @@ class CrashMonitor:
         # 5. Save crash artifact to disk
         crash_path = self.save_crash_record(record)
         logger.error(f"Crash PoC saved to: {crash_path}")
+
+        # 5b. Record through CrashManager for deduplication
+        if self.crash_manager is not None:
+            try:
+                result = await self.crash_manager.record(
+                    payload=record.offending_packet,
+                    crash_type=f"exit_{exit_code}",
+                    rule_set_id=record.mutation_rule_id,
+                )
+                if result.is_new:
+                    logger.info(
+                        f"NEW unique crash recorded: sig={result.signature}"
+                    )
+                else:
+                    logger.debug(
+                        f"Duplicate crash #{result.duplicate_count} "
+                        f"of sig={result.signature}"
+                    )
+            except Exception as e:
+                logger.error(f"CrashManager.record() failed: {e}")
 
         # 6. Invoke external callback if registered
         if self._on_crash_callback:
@@ -314,6 +362,8 @@ class CrashMonitor:
             await self.sandbox.reset_state()
         except Exception as e:
             logger.error(f"sandbox.reset_state() failed: {e}")
+            # Still resume — otherwise the pipeline stays paused forever.
+            await self.resume_interceptor()
             return
 
         # Verify target is alive again
@@ -333,8 +383,27 @@ class CrashMonitor:
 
         logger.error(
             f"Target server did NOT come back alive after {max_wait}s. "
-            f"Fuzzing is paused — manual intervention may be required."
+            f"Attempting one more reset..."
         )
+        # Second attempt: reset + resume even if target isn't confirmed alive,
+        # so the pipeline doesn't get stuck permanently.
+        try:
+            await self.sandbox.reset_state()
+        except Exception:
+            pass
+        await asyncio.sleep(3.0)
+        if await self.sandbox.is_target_alive():
+            logger.info("Second reset succeeded — resuming operations")
+        else:
+            logger.error(
+                "Second reset also failed — resuming pipeline anyway "
+                "to avoid permanent stuck state. Crash monitor will "
+                "re-detect if target is still down."
+            )
+        # Always resume after second attempt.  The crash monitor's watch()
+        # loop will re-detect if the target is still dead and trigger a
+        # fresh on_crash() cycle.
+        await self.resume_interceptor()
 
     async def pause_interceptor(self) -> None:
         """Signal the Interceptor and MutationEngine to pause.

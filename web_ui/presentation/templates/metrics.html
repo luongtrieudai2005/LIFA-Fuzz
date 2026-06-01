@@ -1,0 +1,35 @@
+<!-- SECTION: eps -->
+<div class='metric-card card-cyan'>
+<h2 style='color: var(--cyan);'>{eps:.1f}</h2>
+<p>Executions / sec</p>
+</div>
+
+<!-- SECTION: packets -->
+<div class='metric-card card-green'>
+<h2 style='color: var(--green);'>{total_packets:,}</h2>
+<p>Total Packets (C2S + S2C)</p>
+</div>
+
+<!-- SECTION: mutations -->
+<div class='metric-card card-amber'>
+<h2 style='color: var(--amber);'>{total_injected:,}</h2>
+<p>Mutations Injected</p>
+</div>
+
+<!-- SECTION: rules -->
+<div class='metric-card card-violet'>
+<h2 style='color: var(--violet);'>{rules_count}</h2>
+<p>Active Rules</p>
+</div>
+
+<!-- SECTION: crashes_zero -->
+<div class='metric-card card-green'>
+<h2 style='color: var(--green);'>0</h2>
+<p>Crashes Detected</p>
+</div>
+
+<!-- SECTION: crashes_alert -->
+<div class='crash-alert'>
+<h2>💥 {crash_count}</h2>
+<p>Crashes Detected</p>
+</div>

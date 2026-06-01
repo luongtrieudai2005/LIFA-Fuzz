@@ -1,0 +1,23 @@
+<!-- SECTION: panel_open -->
+<div class="pipeline-panel">
+  <div class="pipeline-cards">
+
+<!-- SECTION: card -->
+<div class="pipeline-card {status_class}">
+  <span class="status-dot {dot_class}"></span>
+  <div class="card-title">{title}</div>
+  <div class="card-detail">{detail}</div>
+  <div class="card-secondary">{secondary}</div>
+</div>
+
+<!-- SECTION: panel_close -->
+  </div>
+  <div class="pipeline-summary">{summary_line}</div>
+</div>
+
+<!-- SECTION: not_running -->
+<div class="pipeline-panel">
+  <div style="text-align:center; padding:24px; opacity:0.5;">
+    Pipeline is not running. Start with: <code style="background:var(--bg-elevated);padding:2px 8px;border-radius:3px;border:1px solid var(--border);">python main.py</code>
+  </div>
+</div>

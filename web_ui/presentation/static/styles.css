@@ -1,0 +1,522 @@
+/* =============================================================================
+   LIFA-Fuzz Dashboard — Redesigned Styles
+   Aesthetic: Industrial / Engineering Tool
+   Inspired by: Grafana, Datadog, professional terminal UIs
+   ============================================================================= */
+
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+
+/* ── Base Reset ────────────────────────────────────────────────────────────── */
+
+:root {
+    --bg-base:       #0d0f11;
+    --bg-surface:    #141618;
+    --bg-elevated:   #1a1d21;
+    --bg-hover:      #1f2226;
+
+    --border:        #272b30;
+    --border-focus:  #3a3f46;
+
+    --text-primary:  #d4d8dc;
+    --text-secondary:#7a8390;
+    --text-muted:    #454c55;
+
+    --cyan:          #4fc3d4;
+    --cyan-dim:      #1e4d56;
+    --green:         #5fb86e;
+    --green-dim:     #1a3d22;
+    --amber:         #d4963a;
+    --amber-dim:     #3d2b10;
+    --red:           #d45555;
+    --red-dim:       #3d1414;
+    --violet:        #9b77d4;
+    --violet-dim:    #2a1d44;
+
+    --font-ui:   'IBM Plex Sans', sans-serif;
+    --font-mono: 'IBM Plex Mono', monospace;
+
+    --radius-sm: 4px;
+    --radius-md: 6px;
+    --radius-lg: 8px;
+}
+
+/* ── Streamlit global overrides ─────────────────────────────────────────────── */
+
+html, body, [class*="css"] {
+    font-family: var(--font-ui) !important;
+    background-color: var(--bg-base) !important;
+    color: var(--text-primary) !important;
+}
+
+.stApp {
+    background-color: var(--bg-base) !important;
+}
+
+/* Hide sidebar completely */
+div[data-testid="stSidebar"] { display: none !important; }
+section[data-testid="stSidebar"] { display: none !important; }
+
+/* Main content area */
+.main .block-container {
+    padding: 1.5rem 2rem 3rem !important;
+    max-width: 100% !important;
+}
+
+/* Streamlit top header bar */
+header[data-testid="stHeader"] {
+    background-color: var(--bg-base) !important;
+    border-bottom: 1px solid var(--border) !important;
+}
+
+/* Dividers */
+hr {
+    border: none !important;
+    border-top: 1px solid var(--border) !important;
+    margin: 1.25rem 0 !important;
+}
+
+/* Subheaders */
+h2, h3 {
+    font-family: var(--font-ui) !important;
+    font-weight: 500 !important;
+    font-size: 0.8rem !important;
+    letter-spacing: 0.08em !important;
+    text-transform: uppercase !important;
+    color: var(--text-secondary) !important;
+    margin-bottom: 0.75rem !important;
+}
+
+/* ── Metric Cards ────────────────────────────────────────────────────────────── */
+
+.metric-card {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 16px 18px;
+    text-align: left;
+    position: relative;
+    overflow: hidden;
+    transition: border-color 0.15s ease;
+}
+
+.metric-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0;
+    width: 3px; height: 100%;
+    background: currentColor;
+    opacity: 0.6;
+}
+
+.metric-card:hover {
+    border-color: var(--border-focus);
+}
+
+.metric-card h2 {
+    margin: 0 0 4px 0 !important;
+    font-family: var(--font-mono) !important;
+    font-size: 1.9rem !important;
+    font-weight: 600 !important;
+    letter-spacing: -0.02em !important;
+    text-transform: none !important;
+    line-height: 1.1 !important;
+}
+
+.metric-card p {
+    margin: 0 !important;
+    font-size: 0.72rem !important;
+    font-family: var(--font-ui) !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.06em !important;
+    color: var(--text-secondary) !important;
+}
+
+/* Color variants via CSS color inheritance */
+.metric-card.card-cyan  { color: var(--cyan);   border-left-color: var(--cyan); }
+.metric-card.card-green { color: var(--green);  border-left-color: var(--green); }
+.metric-card.card-amber { color: var(--amber);  border-left-color: var(--amber); }
+.metric-card.card-violet{ color: var(--violet); border-left-color: var(--violet); }
+
+/* ── Pipeline Status Panel ─────────────────────────────────────────────────── */
+
+.pipeline-panel {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 14px 16px 12px;
+    margin-bottom: 2px;
+}
+
+.pipeline-cards {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+
+.pipeline-card {
+    flex: 1;
+    background: var(--bg-base);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--text-muted);
+    border-radius: var(--radius-md);
+    padding: 10px 12px;
+    transition: border-color 0.15s ease;
+}
+
+.pipeline-card:hover {
+    border-color: var(--border-focus);
+}
+
+.pipeline-card .status-dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    margin-right: 6px;
+    vertical-align: middle;
+    animation: pulse-dot 2.5s ease-in-out infinite;
+}
+
+.pipeline-card .status-dot.dot-healthy { background: var(--green); }
+.pipeline-card .status-dot.dot-down     { background: var(--red); }
+.pipeline-card .status-dot.dot-degraded { background: var(--amber); }
+.pipeline-card .status-dot.dot-unknown  { background: var(--text-muted); animation: none; }
+
+.pipeline-card.status-healthy  { border-left-color: var(--green); }
+.pipeline-card.status-down     { border-left-color: var(--red); }
+.pipeline-card.status-degraded { border-left-color: var(--amber); }
+.pipeline-card.status-unknown  { border-left-color: var(--text-muted); }
+
+.pipeline-card .card-title {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin: 0 0 4px 0;
+    line-height: 1;
+}
+
+.pipeline-card .card-detail {
+    font-family: var(--font-mono);
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0 0 2px 0;
+    line-height: 1.2;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.pipeline-card .card-secondary {
+    font-family: var(--font-mono);
+    font-size: 0.62rem;
+    color: var(--text-muted);
+    margin: 0;
+    line-height: 1;
+}
+
+.pipeline-summary {
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    letter-spacing: 0.02em;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+}
+
+@keyframes pulse-dot {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+}
+
+/* ── Crash Alert Card ────────────────────────────────────────────────────────── */
+
+.crash-alert {
+    background: var(--bg-surface);
+    border: 1px solid var(--red);
+    border-left: 3px solid var(--red);
+    border-radius: var(--radius-md);
+    padding: 16px 18px;
+    text-align: left;
+    position: relative;
+    overflow: hidden;
+}
+
+.crash-alert::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(ellipse at top left, rgba(212,85,85,0.06) 0%, transparent 60%);
+    pointer-events: none;
+}
+
+.crash-alert h2 {
+    margin: 0 0 4px 0 !important;
+    font-family: var(--font-mono) !important;
+    font-size: 1.9rem !important;
+    font-weight: 600 !important;
+    letter-spacing: -0.02em !important;
+    text-transform: none !important;
+    color: var(--red) !important;
+    line-height: 1.1 !important;
+}
+
+.crash-alert p {
+    margin: 0 !important;
+    font-size: 0.72rem !important;
+    font-family: var(--font-ui) !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.06em !important;
+    color: var(--red) !important;
+    opacity: 0.7;
+}
+
+/* ── Status Badge ────────────────────────────────────────────────────────────── */
+
+.status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    border-radius: 3px;
+    font-size: 0.7rem;
+    font-family: var(--font-mono);
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    border: 1px solid transparent;
+}
+
+.status-running {
+    background: var(--green-dim);
+    color: var(--green);
+    border-color: rgba(95,184,110,0.25);
+}
+
+.status-idle {
+    background: var(--amber-dim);
+    color: var(--amber);
+    border-color: rgba(212,150,58,0.25);
+}
+
+.status-stopped {
+    background: var(--red-dim);
+    color: var(--red);
+    border-color: rgba(212,85,85,0.25);
+}
+
+/* ── Dashboard Header ────────────────────────────────────────────────────────── */
+
+.dash-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 0 14px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 1.25rem;
+}
+
+.dash-header-left {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}
+
+.dash-header-right {
+    display: flex;
+    align-items: center;
+}
+
+.dash-title {
+    font-family: var(--font-mono) !important;
+    font-size: 1.05rem !important;
+    font-weight: 600 !important;
+    color: var(--text-primary) !important;
+    letter-spacing: 0.02em !important;
+    margin: 0 !important;
+    text-transform: none !important;
+}
+
+.dash-subtitle {
+    font-family: var(--font-ui) !important;
+    font-size: 0.72rem !important;
+    color: var(--text-muted) !important;
+    letter-spacing: 0.03em !important;
+    margin: 0 !important;
+    text-transform: none !important;
+}
+
+.dash-logo {
+    width: 28px;
+    height: 28px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    flex-shrink: 0;
+}
+
+/* ── Section Labels ──────────────────────────────────────────────────────────── */
+
+.section-label {
+    font-family: var(--font-ui);
+    font-size: 0.7rem;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin: 0 0 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.section-label::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+}
+
+/* ── Footer ──────────────────────────────────────────────────────────────────── */
+
+.dash-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 0 0;
+    border-top: 1px solid var(--border);
+    margin-top: 1.5rem;
+}
+
+.dash-footer span {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    color: var(--text-muted);
+    letter-spacing: 0.04em;
+}
+
+.footer-dot {
+    display: inline-block;
+    width: 5px; height: 5px;
+    border-radius: 50%;
+    background: var(--green);
+    margin-right: 6px;
+    vertical-align: middle;
+    animation: blink 2s ease-in-out infinite;
+}
+
+@keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.2; }
+}
+
+/* ── Streamlit component overrides ──────────────────────────────────────────── */
+
+/* Expanders (crash items) */
+div[data-testid="stExpander"] {
+    background: var(--bg-surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius-md) !important;
+    margin-bottom: 6px !important;
+}
+
+div[data-testid="stExpander"]:hover {
+    border-color: var(--border-focus) !important;
+}
+
+div[data-testid="stExpander"] summary {
+    font-family: var(--font-mono) !important;
+    font-size: 0.78rem !important;
+    color: var(--text-primary) !important;
+    padding: 10px 14px !important;
+}
+
+div[data-testid="stExpander"] summary:hover {
+    background: var(--bg-hover) !important;
+}
+
+/* Dataframe / table */
+div[data-testid="stDataFrame"] {
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius-md) !important;
+    overflow: hidden !important;
+}
+
+div[data-testid="stDataFrame"] iframe {
+    background: var(--bg-surface) !important;
+}
+
+/* Text areas (LLM insights) */
+textarea {
+    background: var(--bg-surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius-sm) !important;
+    color: var(--text-primary) !important;
+    font-family: var(--font-mono) !important;
+    font-size: 0.75rem !important;
+    resize: vertical !important;
+}
+
+textarea:focus {
+    border-color: var(--border-focus) !important;
+    outline: none !important;
+    box-shadow: none !important;
+}
+
+/* Code blocks */
+.stCodeBlock, pre, code {
+    background: var(--bg-elevated) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius-sm) !important;
+    font-family: var(--font-mono) !important;
+    font-size: 0.75rem !important;
+    color: var(--text-primary) !important;
+}
+
+/* Info / alert boxes */
+div[data-testid="stAlert"] {
+    background: var(--bg-surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius-md) !important;
+    font-size: 0.82rem !important;
+    color: var(--text-secondary) !important;
+}
+
+/* Markdown text */
+.stMarkdown p {
+    font-size: 0.82rem !important;
+    color: var(--text-secondary) !important;
+    line-height: 1.6 !important;
+}
+
+.stMarkdown strong {
+    color: var(--text-primary) !important;
+    font-weight: 500 !important;
+}
+
+/* Inline code in markdown */
+.stMarkdown code {
+    background: var(--bg-elevated) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 3px !important;
+    padding: 1px 5px !important;
+    font-size: 0.78em !important;
+    color: var(--cyan) !important;
+}
+
+/* Plotly chart background */
+.js-plotly-plot .plotly, .js-plotly-plot .plotly .modebar {
+    background: transparent !important;
+}
+
+/* Column gaps */
+div[data-testid="stHorizontalBlock"] {
+    gap: 12px !important;
+}

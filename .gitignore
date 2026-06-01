@@ -32,6 +32,11 @@ core.*
 crashes/
 shared/raw_traffic.jsonl
 shared/llm_last_inference.json
+shared/last_known_grammar.json
+shared/runtime_state.json
+shared/slow_loop_state.json
+shared/adaptive_k.json
+shared/active_rules.json
 logs/
 
 # Evaluation generated outputs (keep source, ignore results)
@@ -44,13 +49,16 @@ evaluation/plots/
 # Firecracker — ignore large binaries and kernel source, keep build scripts
 sandbox/firecracker_env/linux-*/
 sandbox/firecracker_env/vmlinux
-sandbox/firecracker_env/rootfs.ext4
+sandbox/firecracker_env/rootfs*.ext4
 sandbox/firecracker_env/firecracker
 sandbox/firecracker_env/jailer
 sandbox/firecracker_env/busybox
 sandbox/firecracker_env/vulnerable_server
 sandbox/firecracker_env/snapshots/
 sandbox/firecracker_env/release-*/
+sandbox/firecracker_env/lighttpd-1.4.55/
+sandbox/firecracker_env/lighttpd_install/
+sandbox/firecracker_env/*.tar.gz
 
 # Claude Code config (local, not project)
 .claude/
@@ -61,3 +69,13 @@ sandbox/firecracker_env/release-*/
 # Misc
 *.log
 *.pcap
+
+# Compiled test binaries
+tests/dummy_targets/vulnerable_server
+tests/dummy_targets/vulnerable_server_cov
+tests/dummy_targets/*.gcda
+tests/dummy_targets/*.gcno
+tests/dummy_targets/*.gcov
+
+# Evaluation archive
+evaluation/archive/

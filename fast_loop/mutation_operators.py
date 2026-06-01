@@ -98,13 +98,25 @@ _FMT_MAP: dict[FieldType, tuple[str, int]] = {
 
 
 def _encode(value: int, field_type: FieldType, field_len: int) -> bytes:
-    """Encode an integer according to *field_type* and *field_len*."""
+    """Encode an integer according to *field_type* and *field_len*.
+
+    H7 fix: when ``field_len > size`` (e.g. UINT16 annotated on a 4-byte
+    region), the upper bytes are padded with zeros so the entire field is
+    written.  Previously only ``size`` bytes were encoded, leaving the
+    upper bytes untouched (incomplete mutation).
+    """
     if field_type in _FMT_MAP:
         fmt, size = _FMT_MAP[field_type]
         # Clamp to struct range to avoid struct.error on overflow
-        return struct.pack(fmt, value & ((1 << (size * 8)) - 1))
+        encoded = struct.pack(fmt, value & ((1 << (size * 8)) - 1))
+        if field_len > size:
+            # Pad upper bytes with zeros to match the declared field length
+            encoded = encoded + b"\x00" * (field_len - size)
+        return encoded[:field_len]
+    # Fallback for non-numeric types (BYTES, STRING, etc.): big-endian,
+    # consistent with _endian_for_type() in mutator.py.
     return (value & ((1 << (field_len * 8)) - 1)).to_bytes(
-        field_len, byteorder="little"
+        field_len, byteorder="big"
     )
 
 
@@ -114,8 +126,9 @@ def _decode(buf: bytearray, offset: int, field_type: FieldType,
     if field_type in _FMT_MAP:
         fmt, size = _FMT_MAP[field_type]
         return struct.unpack(fmt, bytes(buf[offset : offset + size]))[0]
+    # Fallback for non-numeric types: big-endian, consistent with _encode.
     return int.from_bytes(
-        bytes(buf[offset : offset + field_len]), byteorder="little"
+        bytes(buf[offset : offset + field_len]), byteorder="big"
     )
 
 
@@ -253,13 +266,8 @@ def op_boundary_violation(
     if flen <= 0:
         return buf
 
-    # Decode current value (numeric types only)
-    if field_type in _FMT_MAP:
-        current = _decode(buf, offset_start, field_type, flen)
-    else:
-        current = int.from_bytes(
-            bytes(buf[offset_start:offset_end]), byteorder="little"
-        )
+    # Decode current value — always use _decode for consistent endianness
+    current = _decode(buf, offset_start, field_type, flen)
 
     # Apply mutation
     mask = (1 << (flen * 8)) - 1

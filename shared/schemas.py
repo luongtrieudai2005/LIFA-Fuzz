@@ -131,6 +131,8 @@ class MutationStrategy(str, Enum):
     INCREMENT       → Monotonically increment as a big-endian integer
     CALCULATED      → Derived from another field (e.g. length = len(payload))
     DICTIONARY      → Pick from a list of known-interesting hex values
+    FORMAT_STRING   → Inject C-style format-string payloads (%s%s%s%n etc.)
+    TRUNCATE        → Truncate the packet at or near the field offset
     SKIP            → Leave field unchanged for this mutation round
     """
 
@@ -141,6 +143,8 @@ class MutationStrategy(str, Enum):
     INCREMENT       = "increment"
     CALCULATED      = "calculated"
     DICTIONARY      = "dictionary"
+    FORMAT_STRING   = "format_string"
+    TRUNCATE        = "truncate"
     SKIP            = "skip"
 
 
@@ -177,6 +181,14 @@ class FieldRule(BaseModel):
     calculation_source: Optional[str] = None
     notes: str = ""
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    dictionary_values: Optional[list[str]] = Field(
+        default=None,
+        description="Known-interesting hex values for DICTIONARY strategy",
+    )
+    data_type: Optional[FieldType] = Field(
+        default=None,
+        description="Type-aware dispatch: endian-safe encoding for binary fields",
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -305,6 +317,105 @@ class TrafficRecord(BaseModel):
             self.raw_hex = self.raw_data.hex()
         if self.raw_data and self.packet_length == 0:
             self.packet_length = len(self.raw_data)
+
+    # -- Property aliases for new MutationEngine compatibility --
+    @property
+    def raw_bytes(self) -> bytes:
+        """Alias for raw_data — used by new MutationEngine."""
+        return self.raw_data
+
+    @property
+    def packet_id(self) -> str:
+        """Alias for record_id — used by new MutationEngine."""
+        return self.record_id
+
+    @property
+    def hex_payload(self) -> str:
+        """Alias for raw_hex — used by new MutationEngine."""
+        return self.raw_hex
+
+    @property
+    def byte_length(self) -> int:
+        """Alias for packet_length — used by new MutationEngine."""
+        return self.packet_length
+
+
+# =============================================================================
+# Sequence-Aware Fuzzing: SeedSequence + FuzzTarget
+# =============================================================================
+
+
+class SeedSequence(BaseModel):
+    """Ordered sequence of packets representing one complete protocol session.
+
+    The fundamental unit for sequence-aware fuzzing (M = ⟨Prefix, Target, Suffix⟩).
+    Packets arrive from the Interceptor grouped by ``session_id``, forming a
+    replayable multi-step session (e.g. FTP USER → PASS → LIST).
+
+    A 1-packet sequence is backward-compatible with the legacy single-packet path.
+    """
+
+    sequence_id: str = Field(
+        default_factory=lambda: uuid.uuid4().hex[:12],
+        description="Unique ID for this sequence (used by IFPS tracking)",
+    )
+    session_id: str = Field(
+        default="",
+        description="TCP session ID from the Interceptor",
+    )
+    packets: list[TrafficRecord] = Field(
+        default_factory=list,
+        description="Ordered packets captured during one TCP session",
+    )
+    protocol_hint: str = Field(
+        default="",
+        description="Optional protocol name hint (e.g. 'FTP', 'HTTP')",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "sequence_id": "a1b2c3d4e5f6",
+                    "session_id": "sess_001",
+                    "packets": [
+                        {"direction": "client_to_server", "raw_hex": "555345522061646d696e"},
+                        {"direction": "client_to_server", "raw_hex": "5041535320736563726574"},
+                        {"direction": "client_to_server", "raw_hex": "4c495354"},
+                    ],
+                    "protocol_hint": "FTP",
+                }
+            ]
+        }
+    }
+
+    @property
+    def length(self) -> int:
+        """Number of packets in this sequence."""
+        return len(self.packets)
+
+    def is_single(self) -> bool:
+        """True if this sequence contains at most one packet (legacy path)."""
+        return len(self.packets) <= 1
+
+
+class FuzzTarget(BaseModel):
+    """Result of splitting a SeedSequence for fuzzing.
+
+    Implements the M = ⟨Prefix, Mutated_Target, Suffix⟩ paradigm:
+      - prefix:  verbatim packets sent before the target to drive server state
+      - target_seed:  the single packet selected for mutation
+      - suffix:  verbatim packets sent after the mutated target
+
+    Only target_seed is passed through the Mutation Engine; all other
+    packets are sent as-is to maintain protocol state correctness.
+    """
+
+    prefix: list[bytes]
+    target_seed: TrafficRecord
+    target_index: int
+    suffix: list[bytes]
+    sequence_id: str
 
 
 # =============================================================================
@@ -467,6 +578,10 @@ class ActiveRuleSet(BaseModel):
 
     The Mutation Engine reads from this. The Rule Watcher updates it
     when the Slow Loop pushes new rules.
+
+    Also serves as ``SemanticRuleSet`` for the new MutationEngine's
+    scheduling system — provides ``get_mutable_fields()`` and
+    ``get_static_fields()`` that convert ``SemanticRule`` → ``FieldRule``.
     """
 
     rules: list[SemanticRule] = Field(default_factory=list)
@@ -477,6 +592,26 @@ class ActiveRuleSet(BaseModel):
     version: int = Field(default=0, ge=0)
     last_updated: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+
+    # -- Fields for new MutationEngine scheduling --
+    rule_set_id: str = Field(
+        default_factory=lambda: uuid.uuid4().hex[:12],
+        description="Unique ID for this rule set version",
+    )
+    protocol_name: str = Field(default="unknown")
+    overall_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    # -- Stateful protocol support (setup sequence before fuzzing) --
+    setup_packets: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Hex-encoded setup packets to send before the mutated payload. "
+            "Used for stateful protocols that require a handshake "
+            "(e.g., FTP USER→PASS, SMTP HELO→MAIL). The Fast Loop sends "
+            "these sequentially on the same TCP connection before the "
+            "fuzzing payload."
+        ),
     )
 
     def add_rules(self, new_rules: list[SemanticRule]) -> None:
@@ -507,10 +642,76 @@ class ActiveRuleSet(BaseModel):
         self.last_updated = datetime.now(timezone.utc).isoformat()
         return pruned
 
+    # -- Methods for new MutationEngine scheduling --
 
-# =============================================================================
-# Crash Record
-# =============================================================================
+    def get_mutable_fields(self) -> list[FieldRule]:
+        """Return FieldRules for all non-STATIC fields from the active rules.
+
+        Converts SemanticRule → FieldRule for the scheduler system.
+        STATIC fields are excluded (they are applied separately via
+        ``get_static_fields()`` before mutation).
+        """
+        result: list[FieldRule] = []
+        for r in self.rules:
+            strategy = _rule_type_to_strategy(r.rule_type)
+            if strategy != MutationStrategy.STATIC:
+                result.append(FieldRule(
+                    field_name=r.target_field_name,
+                    offset=r.offset_start,
+                    length=r.field_length,
+                    mutation_strategy=strategy,
+                    static_value=r.preserve_bytes.hex() if r.preserve_bytes else None,
+                    confidence=r.priority,
+                    data_type=r.field_type,
+                ))
+        return result
+
+    def get_static_fields(self) -> list[FieldRule]:
+        """Return FieldRules for STATIC fields (magic bytes, headers to preserve).
+
+        Returns ALL unique non-overlapping static regions from rules'
+        ``preserve_bytes``.  Overlapping regions (same start offset) are
+        merged into the longest one.  This preserves static bytes at
+        non-zero offsets (e.g. version fields, reserved fields in headers)
+        that were previously silently dropped.
+        """
+        # Collect (offset, bytes) pairs; merge overlapping at same offset
+        by_offset: dict[int, bytes] = {}
+        for r in self.rules:
+            if not r.preserve_bytes:
+                continue
+            # SemanticRule preserve_bytes always starts at offset 0
+            off = 0
+            existing = by_offset.get(off)
+            if existing is None or len(r.preserve_bytes) > len(existing):
+                by_offset[off] = r.preserve_bytes
+
+        if not by_offset:
+            return []
+
+        result: list[FieldRule] = []
+        for off, raw in sorted(by_offset.items()):
+            magic_hex = raw.hex()
+            result.append(FieldRule(
+                field_name=f"_preserve_static_{off:03d}_{magic_hex[:8]}",
+                offset=off,
+                length=len(raw),
+                mutation_strategy=MutationStrategy.STATIC,
+                static_value=magic_hex,
+                confidence=1.0,
+            ))
+        return result
+
+
+def _rule_type_to_strategy(rule_type: RuleType) -> MutationStrategy:
+    """Map a SemanticRule's RuleType to a MutationStrategy for scheduling."""
+    mapping = {
+        RuleType.BIT_FLIP: MutationStrategy.BIT_FLIP,
+        RuleType.BOUNDARY: MutationStrategy.BOUNDARY_VALUES,
+        RuleType.STRUCTURAL: MutationStrategy.RANDOM_BYTES,
+        RuleType.STATE: MutationStrategy.RANDOM_BYTES,
+    }
+    return mapping.get(rule_type, MutationStrategy.RANDOM_BYTES)
 
 
 class CrashRecord(BaseModel):
@@ -523,7 +724,11 @@ class CrashRecord(BaseModel):
     timestamp: float = Field(
         default_factory=lambda: datetime.now(timezone.utc).timestamp()
     )
-    exit_code: int = Field(ge=0)
+    exit_code: int = Field(ge=-128)
+    # NOTE: Allows negative exit codes because Python's subprocess.poll()
+    # returns negative values when a process is killed by signal
+    # (e.g., -11 for SIGSEGV).  Sandboxes should normalise to 128+signum
+    # where possible, but the schema tolerates raw negatives as a safety net.
     signal: Optional[Signal] = None
     offending_packet: bytes = b""
     offending_packet_hex: str = ""
@@ -582,6 +787,14 @@ class InferredField(BaseModel):
     is_constant: bool = False  # True if this field is always the same value
     mutation_strategy: MutationStrategy = MutationStrategy.RANDOM_BYTES
 
+    @field_validator("possible_values", mode="before")
+    @classmethod
+    def coerce_possible_values(cls, v: Any) -> list[str]:
+        """LLMs often return null/None instead of [] — coerce to empty list."""
+        if v is None:
+            return []
+        return v
+
 
 class ProtocolGrammar(BaseModel):
     """Full protocol grammar as inferred by the LLM.
@@ -603,6 +816,22 @@ class ProtocolGrammar(BaseModel):
         default=None,
         description="LLM's analysis reasoning — explains inference decisions and strategy choices",
     )
+
+    @field_validator("fields", mode="before")
+    @classmethod
+    def coerce_fields(cls, v: Any) -> list:
+        """LLMs may return null/None for fields — coerce to empty list."""
+        if v is None:
+            return []
+        return v
+
+    @field_validator("state_machine", mode="before")
+    @classmethod
+    def coerce_state_machine(cls, v: Any) -> Optional[dict]:
+        """LLMs may return empty string or [] for state_machine — coerce to None."""
+        if v is None or v == "" or isinstance(v, list):
+            return None
+        return v
 
 
 # =============================================================================
@@ -633,3 +862,11 @@ class TrafficLog(BaseModel):
     @property
     def packet_count(self) -> int:
         return len(self.packets)
+
+
+# =============================================================================
+# Aliases for new MutationEngine compatibility
+# =============================================================================
+
+SemanticRuleSet = ActiveRuleSet
+PacketRecord = TrafficRecord

@@ -62,10 +62,12 @@ class TelemetryCollector:
         output_path: str,
         baseline_label: str = "X",
         snapshot_interval_s: float = 10.0,
+        coverage_info_path: Optional[str] = None,
     ) -> None:
         self.output_path = Path(output_path)
         self.baseline_label = baseline_label
         self.snapshot_interval_s = snapshot_interval_s
+        self._coverage_info_path = Path(coverage_info_path) if coverage_info_path else None
 
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -126,6 +128,104 @@ class TelemetryCollector:
         if self._interceptor is not None:
             await self._write_snapshot(final=True)
 
+    # -----------------------------------------------------------------
+    # Coverage Parsing (gcov/lcov)
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def parse_lcov(lcov_path: str) -> dict[str, Any]:
+        """Parse an lcov ``.info`` file and extract line/branch coverage.
+
+        Args:
+            lcov_path: Path to the ``.info`` file (output of ``lcov --capture``).
+
+        Returns:
+            Dict with ``lines_hit``, ``lines_total``, ``line_coverage_pct``,
+            ``branches_hit``, ``branches_total``, ``branch_coverage_pct``.
+            Returns a dict with all zeros if the file is missing or empty.
+        """
+        zeros: dict[str, Any] = {
+            "lines_hit": 0,
+            "lines_total": 0,
+            "line_coverage_pct": 0.0,
+            "branches_hit": 0,
+            "branches_total": 0,
+            "branch_coverage_pct": 0.0,
+        }
+
+        path = Path(lcov_path)
+        if not path.exists():
+            return zeros
+
+        lines_seen: set[int] = set()
+        lines_hit_set: set[int] = set()
+        branches_total: int = 0
+        branches_hit: int = 0
+
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("DA:"):
+                        # DA:<line_number>,<hit_count>[,<checksum>]
+                        parts = line[3:].split(",")
+                        if len(parts) >= 2:
+                            try:
+                                line_num = int(parts[0])
+                                hit_count = int(parts[1])
+                                lines_seen.add(line_num)
+                                if hit_count > 0:
+                                    lines_hit_set.add(line_num)
+                            except (ValueError, IndexError):
+                                pass
+                    elif line.startswith("BRDA:"):
+                        # BRDA:<line>,<block>,<branch>,<taken>
+                        parts = line[5:].split(",")
+                        if len(parts) >= 4:
+                            try:
+                                taken = parts[3]
+                                branches_total += 1
+                                if taken != "0" and taken != "-":
+                                    branches_hit += 1
+                            except (ValueError, IndexError):
+                                pass
+        except OSError:
+            return zeros
+
+        lines_total = len(lines_seen)
+        lines_hit = len(lines_hit_set)
+        line_pct = (lines_hit / lines_total * 100) if lines_total > 0 else 0.0
+        branch_pct = (branches_hit / branches_total * 100) if branches_total > 0 else 0.0
+
+        return {
+            "lines_hit": lines_hit,
+            "lines_total": lines_total,
+            "line_coverage_pct": round(line_pct, 2),
+            "branches_hit": branches_hit,
+            "branches_total": branches_total,
+            "branch_coverage_pct": round(branch_pct, 2),
+        }
+
+    @staticmethod
+    def find_latest_lcov(coverage_dir: str) -> Optional[str]:
+        """Find the newest ``.info`` file in a coverage directory.
+
+        Args:
+            coverage_dir: Directory to search for ``*.info`` files.
+
+        Returns:
+            Path to the newest file, or None if no files found.
+        """
+        cov_path = Path(coverage_dir)
+        if not cov_path.exists():
+            return None
+
+        info_files = list(cov_path.glob("*.info"))
+        if not info_files:
+            return None
+
+        return str(max(info_files, key=lambda p: p.stat().st_mtime))
+
     async def _collection_loop(self) -> None:
         """Background loop: snapshot metrics every N seconds."""
         try:
@@ -141,20 +241,22 @@ class TelemetryCollector:
         now = time.monotonic()
         elapsed = now - self._start_time
 
-        # Calculate EPS (injected since last snapshot)
-        current_injected = self._interceptor.total_injected if self._interceptor else 0
-        dt = now - self._last_snapshot_time
-        eps = (current_injected - self._last_injected) / dt if dt > 0 else 0.0
-        self._last_injected = current_injected
-        self._last_snapshot_time = now
-
-        # Mutation engine stats
+        # Mutation engine stats — read first so we can use mutator's EPS
         mut_stats = {}
         if self._mutator:
             try:
                 mut_stats = self._mutator.coverage_summary
             except Exception:
                 pass
+
+        # Calculate EPS — use mutator's total_sent (authoritative).
+        # MutationEngine sends directly to target (bypasses Interceptor),
+        # so interceptor.total_injected is always 0.
+        current_total = mut_stats.get("total_mutations", 0) if mut_stats else 0
+        dt = now - self._last_snapshot_time
+        eps = (current_total - self._last_injected) / dt if dt > 0 else 0.0
+        self._last_injected = current_total
+        self._last_snapshot_time = now
 
         # Crash stats
         crash_data = {
@@ -173,7 +275,8 @@ class TelemetryCollector:
             except Exception:
                 pass
 
-        # Agent stats (token usage)
+        # Agent stats (token usage) — prefer in-process agent, but also
+        # check slow_loop_state.json written by the subprocess (Baseline C)
         agent_data = {
             "token_usage": 0,
             "token_budget": 0,
@@ -190,11 +293,24 @@ class TelemetryCollector:
             except Exception:
                 pass
 
+        # If slow loop runs as a subprocess, its inferences are not reflected
+        # in the in-process agent. Read shared/slow_loop_state.json instead.
+        if agent_data["total_inferences"] == 0:
+            try:
+                sl_state_path = Path("shared/slow_loop_state.json")
+                if sl_state_path.exists():
+                    with open(sl_state_path) as _f:
+                        sl_data = json.load(_f)
+                    if sl_data.get("total_inferences", 0) > 0:
+                        agent_data["total_inferences"] = sl_data["total_inferences"]
+            except Exception:
+                pass
+
         # Precision mode
         precision_mode = False
         try:
-            if self._mutator and hasattr(self._mutator, "_orchestrator_precision"):
-                precision_mode = bool(self._mutator._orchestrator_precision)
+            if self._mutator and hasattr(self._mutator, "_stats"):
+                precision_mode = bool(self._mutator._stats.investigation_mode)
         except Exception:
             pass
 
@@ -206,7 +322,7 @@ class TelemetryCollector:
             "total_mutations": mut_stats.get("total_mutations", 0),
             "total_packets_captured": self._interceptor.total_captured
                                      if self._interceptor else 0,
-            "total_packets_injected": current_injected,
+            "total_packets_injected": current_total,
             "total_crashes": crash_data["total_crashes"],
             "unique_crashes": crash_data["unique_crashes"],
             "dedup_ratio": crash_data["dedup_ratio"],
@@ -218,6 +334,15 @@ class TelemetryCollector:
             "coverage_offsets": mut_stats.get("unique_offsets_fuzzed", 0),
             "final": final,
         }
+
+        # Code coverage from lcov .info file (populated post-run)
+        if (
+            self._coverage_info_path
+            and self._coverage_info_path.exists()
+        ):
+            snapshot["code_coverage"] = self.parse_lcov(
+                str(self._coverage_info_path)
+            )
 
         # Append to JSONL file
         with open(self.output_path, "a", encoding="utf-8") as f:
@@ -247,7 +372,15 @@ class TelemetryCollector:
             "baseline": self.baseline_label,
             "duration_s": snapshots[-1].get("elapsed_s", 0),
             "total_snapshots": len(snapshots),
-            "avg_eps": sum(s.get("eps", 0) for s in snapshots) / len(snapshots),
+            # avg_eps fix: use total_mutations / elapsed_s from the final
+            # snapshot instead of averaging instantaneous EPS readings.
+            # This gives the true average over the entire experiment.
+            "avg_eps": (
+                snapshots[-1].get("total_mutations", 0)
+                / snapshots[-1].get("elapsed_s", 1)
+                if snapshots[-1].get("elapsed_s", 0) > 0
+                else 0.0
+            ),
             "max_eps": max(s.get("eps", 0) for s in snapshots),
             "total_mutations": snapshots[-1].get("total_mutations", 0),
             "total_crashes": snapshots[-1].get("total_crashes", 0),
@@ -259,10 +392,39 @@ class TelemetryCollector:
         }
 
         # Find time to first crash
-        for s in snapshots:
-            if s.get("unique_crashes", 0) > 0:
-                summary["first_crash_elapsed_s"] = s.get("elapsed_s")
-                break
+        # FIX: use precise timestamp from CrashManager instead of coarse
+        # telemetry snapshot granularity (which has up to +10s error).
+        if self._crash_manager:
+            try:
+                cs = await self._crash_manager.get_statistics()
+                if cs.first_crash_time:
+                    # Parse ISO-8601 and compute elapsed from experiment start
+                    from datetime import datetime, timezone
+                    start_t = snapshots[0].get("timestamp", "") if snapshots else ""
+                    if start_t:
+                        try:
+                            start_dt = datetime.fromisoformat(
+                                start_t.replace("Z", "+00:00")
+                            )
+                            crash_dt = datetime.fromisoformat(
+                                cs.first_crash_time.replace("Z", "+00:00")
+                                if "T" in cs.first_crash_time
+                                else cs.first_crash_time
+                            )
+                            elapsed = (crash_dt - start_dt).total_seconds()
+                            if elapsed >= 0:
+                                summary["first_crash_elapsed_s"] = round(elapsed, 2)
+                        except (ValueError, TypeError):
+                            pass
+            except Exception:
+                pass
+
+        # Fallback: use snapshot-based detection if CrashManager didn't work
+        if summary["first_crash_elapsed_s"] is None:
+            for s in snapshots:
+                if s.get("unique_crashes", 0) > 0:
+                    summary["first_crash_elapsed_s"] = s.get("elapsed_s")
+                    break
 
         # Write summary file
         summary_path = self.output_path.parent / "summary.json"
@@ -313,6 +475,12 @@ def generate_synthetic_telemetry(
     total_mutations = 0
     unique_crashes = 0
     token_usage = 0
+    coverage_offsets = 0  # cumulative — monotonically increasing
+
+    # Baseline-dependent coverage growth rates (offsets discovered per snapshot)
+    # A: slow random walk;  B: moderate;  C: fastest (rules guide exploration)
+    _coverage_growth = {"A": (2, 6), "B": (4, 10), "C": (6, 15)}
+    _cov_lo, _cov_hi = _coverage_growth.get(baseline, (2, 8))
 
     with open(output_path, "w") as f:
         for t in range(interval_s, duration_s + 1, interval_s):
@@ -326,6 +494,9 @@ def generate_synthetic_telemetry(
 
             token_usage += int(token_rate)
 
+            # Coverage offsets: monotonic growth (new offsets discovered each interval)
+            coverage_offsets += random.randint(_cov_lo, _cov_hi)
+
             snapshot = {
                 "timestamp": f"2026-01-01T00:{t // 60:02d}:{t % 60:02d}Z",
                 "elapsed_s": t,
@@ -334,15 +505,22 @@ def generate_synthetic_telemetry(
                 "total_mutations": total_mutations,
                 "total_packets_captured": total_mutations // 5,
                 "total_packets_injected": total_mutations,
-                "total_crashes": unique_crashes + random.randint(0, 2),
+                "total_crashes": (total_crashes := unique_crashes + random.randint(0, 2)),
                 "unique_crashes": unique_crashes,
-                "dedup_ratio": round(random.uniform(0.3, 0.7), 4),
+                # M7 fix: compute dedup_ratio from actual crash counts
+                # instead of random noise — ensures internal consistency.
+                "dedup_ratio": round(
+                    (total_crashes - unique_crashes) / total_crashes
+                    if total_crashes > 0
+                    else 0.0,
+                    4
+                ),
                 "token_usage": token_usage,
                 "token_budget": 100000,
                 "total_inferences": token_usage // 500 if token_rate > 0 else 0,
                 "active_rules": random.randint(0, 15),
                 "precision_mode": unique_crashes > 0 and random.random() < 0.3,
-                "coverage_offsets": random.randint(10, 60),
+                "coverage_offsets": coverage_offsets,
                 "final": t == duration_s,
             }
             f.write(json.dumps(snapshot) + "\n")

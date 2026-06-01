@@ -40,21 +40,31 @@ class TestPacketSignature:
 
     def test_basic_signature(self):
         sig = packet_signature("deadbeef0005", prefix_bytes=4)
-        assert sig == "deadbeef:6"
+        assert sig.startswith("deadbeef:6:")  # New format includes content hash
 
     def test_short_packet(self):
         """Packets shorter than prefix_bytes use whatever is available."""
         sig = packet_signature("dead", prefix_bytes=4)
-        assert sig == "dead:2"
+        assert sig.startswith("dead:2:")
 
     def test_empty_packet(self):
         sig = packet_signature("", prefix_bytes=4)
-        assert sig == ":0"
+        assert sig.startswith(":0:")
 
     def test_same_prefix_same_length_is_duplicate(self):
         sig1 = packet_signature("deadbeef0005aa", prefix_bytes=4)
         sig2 = packet_signature("deadbeef0005bb", prefix_bytes=4)
         assert sig1 == sig2  # Same prefix + same length → duplicate
+
+    def test_different_content_different_sig(self):
+        """Packets with same prefix+length but different body content
+        should produce DIFFERENT signatures (critical for HTTP protocols)."""
+        # Two GET requests with same length but different paths
+        get_root = "474554202f20485454502f312e310d0a486f73743a206c6f63616c686f7374"
+        get_path = "474554202f62696e20485454502f312e310d0a486f73743a206c6f63616c686f7374"
+        sig1 = packet_signature(get_root, prefix_bytes=4)
+        sig2 = packet_signature(get_path, prefix_bytes=4)
+        assert sig1 != sig2  # Different content → different signature
 
     def test_different_prefix_not_duplicate(self):
         sig1 = packet_signature("deadbeef0005", prefix_bytes=4)
@@ -669,7 +679,9 @@ class TestDifferentialAnalysis:
 
     @pytest.mark.asyncio
     async def test_bootstrap_fallback_on_llm_failure(self, tmp_path):
-        """When LLM fails and heatmap exists, bootstrap rules are pushed."""
+        """When LLM fails and heatmap exists, bootstrap rules are pushed
+        ONLY when no prior LLM rules are active (C3 fix: don't overwrite
+        good LLM rules with stale heatmap bootstrap)."""
         orch, log_path = self._make_orchestrator(tmp_path, min_packets=1)
 
         # Write enough packets to trigger both analysis and LLM
@@ -679,28 +691,15 @@ class TestDifferentialAnalysis:
             packets.append({"payload": payload_hex})
         self._write_traffic(log_path, packets)
 
-        # First cycle: let it succeed in MOCK mode to generate heatmap
-        os.environ["LLM_MODE"] = "MOCK"
-        await orch.run_cycle()
-        assert orch.last_heatmap is not None
-        os.environ.pop("LLM_MODE", None)
-
-        # Second cycle: force LLM to fail
+        # C3 fix: To test bootstrap fallback, do NOT run a successful
+        # LLM cycle first. Instead, make the first cycle fail so
+        # _llm_rules_active stays False and bootstrap fallback triggers.
         orch.agent.infer_protocol = AsyncMock(
             side_effect=RuntimeError("API budget exhausted")
         )
-        # Write more traffic so cycle isn't skipped
-        with open(log_path, "a") as f:
-            for i in range(5):
-                entry = {
-                    "timestamp": 2000.0 + i * 0.1,
-                    "direction": "client_to_server",
-                    "payload": f"cafe{i:04x}" + "cc" * (i + 1),
-                    "length": 4 + i + 1,
-                    "is_mutated": False,
-                }
-                f.write(json.dumps(entry) + "\n")
 
+        # First cycle: run analysis (creates heatmap), then LLM fails
+        # → bootstrap rules should be pushed since no LLM rules exist.
         result = await orch.run_cycle()
         assert result is not None
         assert result["status"] == "bootstrap"

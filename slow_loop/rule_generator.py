@@ -30,17 +30,19 @@ Priority Scoring:
 from __future__ import annotations
 
 import json
+from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from shared.logger import get_logger
 from shared.schemas import (
     FieldType,
     InferredField,
+    MutationConstraints,
+    MutationStrategy,
     ProtocolGrammar,
     RuleType,
     SemanticRule,
-    MutationConstraints,
 )
 
 logger = get_logger("slow_loop.rule_generator")
@@ -113,15 +115,24 @@ class RuleGenerator:
     # Core Conversion
     # -----------------------------------------------------------------
 
-    def grammar_to_rules(self, grammar: ProtocolGrammar) -> list[SemanticRule]:
+    def grammar_to_rules(
+        self,
+        grammar: ProtocolGrammar,
+        heatmap: Any = None,
+    ) -> list[SemanticRule]:
         """Convert an inferred grammar into a list of SemanticRules.
 
         Iterates over each field in the grammar and generates appropriate
         mutation rules based on the field type. Skips constant fields
         (magic bytes, fixed headers).
 
+        Optionally cross-validates LLM-inferred field types against the
+        mathematical heatmap from DifferentialAnalyzer.
+
         Args:
             grammar: The ProtocolGrammar inferred by the LLM.
+            heatmap: Optional HeatmapResult from DifferentialAnalyzer for
+                     field-type cross-validation.
 
         Returns:
             A list of SemanticRule objects, sorted by priority (descending).
@@ -137,6 +148,9 @@ class RuleGenerator:
             )
             return []
 
+        # ── Cross-validate LLM fields against mathematical heatmap ────
+        validated_fields = self._validate_field_types(grammar, heatmap)
+
         rules: list[SemanticRule] = []
 
         # Build a preserve-bytes mask from detected magic bytes
@@ -147,10 +161,26 @@ class RuleGenerator:
             except ValueError:
                 logger.warning(f"Invalid magic_bytes hex: {grammar.magic_bytes!r}")
 
-        for field in grammar.fields:
+        for field in validated_fields:
             if field.is_constant:
                 logger.debug(f"Skipping constant field '{field.name}'")
                 continue
+
+            # Resolve variable-length fields (offset_end=-1) to a concrete
+            # size so they are NOT silently dropped by _generate_rules_for_field().
+            # The mutator's _apply_field() clamps to the actual packet size at
+            # runtime, so using a generous upper bound here is safe.
+            if field.offset_end == -1:
+                resolved_end = min(
+                    field.offset_start + 1024,
+                    grammar.max_packet_size,
+                )
+                field = field.model_copy(update={"offset_end": resolved_end})
+                logger.info(
+                    f"Variable-length field '{field.name}' resolved "
+                    f"offset_end=-1 → {resolved_end} "
+                    f"(max_packet_size={grammar.max_packet_size})"
+                )
 
             field_rules = self._generate_rules_for_field(
                 field, grammar.confidence, magic_bytes
@@ -181,6 +211,151 @@ class RuleGenerator:
             f"'{grammar.protocol_name}' (confidence={grammar.confidence:.2f})"
         )
         return unique
+
+    # -----------------------------------------------------------------
+    # Field Cross-Validation
+    # -----------------------------------------------------------------
+
+    # Numeric field types that the LLM might hallucinate over entropy regions
+    _NUMERIC_TYPES: set[FieldType] = {
+        FieldType.UINT8, FieldType.UINT16_LE, FieldType.UINT16_BE,
+        FieldType.UINT32_LE, FieldType.UINT32_BE,
+        FieldType.INT8, FieldType.INT16_LE, FieldType.INT16_BE,
+        FieldType.INT32_LE, FieldType.INT32_BE,
+    }
+
+    def _validate_field_types(
+        self,
+        grammar: ProtocolGrammar,
+        heatmap: Any = None,
+    ) -> list[InferredField]:
+        """Cross-validate LLM-inferred fields against mathematical heatmap.
+
+        Applies correction rules that produce warnings (not errors).
+        Returns a (potentially modified) copy of grammar.fields.
+
+        Rules:
+        1. STATIC override: heatmap says STATIC (conf >= 0.9) but LLM says
+           non-static → override to static + is_constant.
+        2. HIGH_ENTROPY override: heatmap says HIGH_ENTROPY but LLM says
+           numeric type with low grammar confidence → override to bytes.
+        3. Overlap detection: overlapping fields → shorter one gets skip.
+        4. OOB clamping: offset_end > max_packet_size → clamp.
+        """
+        fields = list(grammar.fields)  # shallow copy
+
+        # Build offset → FieldGroup lookup from heatmap (if available)
+        heatmap_map: dict[int, Any] = {}
+        if heatmap is not None and hasattr(heatmap, "field_groups"):
+            for fg in heatmap.field_groups:
+                for off in range(fg.start, fg.end):
+                    heatmap_map[off] = fg
+
+        # ── Per-field heatmap validation ──────────────────────────────
+        for i, field in enumerate(fields):
+            # Rule 4: OOB clamping (always applies, no heatmap needed)
+            if (
+                field.offset_end != -1
+                and field.offset_end > grammar.max_packet_size > 0
+            ):
+                old_end = field.offset_end
+                fields[i] = field.model_copy(update={
+                    "offset_end": grammar.max_packet_size,
+                })
+                logger.warning(
+                    f"Field '{field.name}' offset_end={old_end} exceeds "
+                    f"max_packet_size={grammar.max_packet_size} — clamped"
+                )
+                field = fields[i]
+
+            if not heatmap_map:
+                continue
+
+            # Collect ALL heatmap groups covering this field's byte range,
+            # not just the first byte.  A multi-byte field should only be
+            # overridden to STATIC if ALL its bytes are STATIC in the heatmap.
+            field_end = field.offset_end if field.offset_end != -1 else field.offset_start + 1
+            covering_groups: list[Any] = []
+            for off in range(field.offset_start, field_end):
+                g = heatmap_map.get(off)
+                if g is not None:
+                    covering_groups.append(g)
+
+            if not covering_groups:
+                continue
+
+            # Use the MAJORITY label across the field's bytes for cross-validation
+            label_counts = Counter(g.label.value for g in covering_groups)
+            dominant_label = label_counts.most_common(1)[0][0]
+            # Use the minimum confidence across covering groups (conservative)
+            min_confidence = min(g.confidence for g in covering_groups)
+
+            # Rule 1: STATIC override — only if ALL bytes are STATIC
+            all_static = all(g.label.value == "STATIC" for g in covering_groups)
+            if (
+                all_static
+                and min_confidence >= 0.9
+                and field.mutation_strategy != MutationStrategy.STATIC
+            ):
+                logger.warning(
+                    f"Field '{field.name}': LLM says strategy="
+                    f"{field.mutation_strategy.value}, but heatmap says "
+                    f"STATIC for ALL {len(covering_groups)} bytes "
+                    f"(min_conf={min_confidence:.2f}) → overriding to static"
+                )
+                fields[i] = field.model_copy(update={
+                    "mutation_strategy": MutationStrategy.STATIC,
+                    "is_constant": True,
+                })
+                continue
+
+            # Rule 2: HIGH_ENTROPY override — if majority of bytes are HIGH_ENTROPY
+            if (
+                dominant_label == "HIGH_ENTROPY"
+                and field.field_type in self._NUMERIC_TYPES
+                and grammar.confidence < 0.6
+            ):
+                logger.warning(
+                    f"Field '{field.name}': LLM says type="
+                    f"{field.field_type.value}, but heatmap says HIGH_ENTROPY "
+                    f"and grammar confidence is low ({grammar.confidence:.2f}) "
+                    f"→ overriding to bytes/random_bytes"
+                )
+                fields[i] = field.model_copy(update={
+                    "field_type": FieldType.BYTES,
+                    "mutation_strategy": MutationStrategy.RANDOM_BYTES,
+                })
+
+        # ── Rule 3: Overlap detection ─────────────────────────────────
+        for i in range(len(fields)):
+            for j in range(i + 1, len(fields)):
+                fi, fj = fields[i], fields[j]
+                if fi.mutation_strategy == MutationStrategy.SKIP:
+                    continue
+                if fj.mutation_strategy == MutationStrategy.SKIP:
+                    continue
+                # -1 means "rest of packet" — skip overlap check for it
+                if fi.offset_end == -1 or fj.offset_end == -1:
+                    continue
+                # Check [offset_start, offset_end) overlap
+                if fi.offset_start < fj.offset_end and fj.offset_start < fi.offset_end:
+                    # Override the shorter field
+                    len_i = fi.offset_end - fi.offset_start
+                    len_j = fj.offset_end - fj.offset_start
+                    if len_i <= len_j:
+                        victim_idx, victim_name = i, fi.name
+                    else:
+                        victim_idx, victim_name = j, fj.name
+                    logger.warning(
+                        f"Overlap detected: '{fi.name}' [{fi.offset_start},{fi.offset_end}) "
+                        f"∩ '{fj.name}' [{fj.offset_start},{fj.offset_end}) "
+                        f"→ setting shorter '{victim_name}' to skip"
+                    )
+                    fields[victim_idx] = fields[victim_idx].model_copy(update={
+                        "mutation_strategy": MutationStrategy.SKIP,
+                    })
+
+        return fields
 
     # -----------------------------------------------------------------
     # Per-Field Dispatch
@@ -527,21 +702,34 @@ class RuleGenerator:
     # Push to Fast Loop
     # -----------------------------------------------------------------
 
-    async def push_rules(self, rules: list[SemanticRule]) -> None:
+    async def push_rules(
+        self,
+        rules: list[SemanticRule],
+        grammar: Optional[ProtocolGrammar] = None,
+        overall_confidence: Optional[float] = None,
+        protocol_name: Optional[str] = None,
+    ) -> None:
         """Push generated rules to the shared file for Fast Loop pickup.
 
-        Writes rules as a JSON array of serialized SemanticRule objects.
-        Uses atomic write (temp file + rename) to prevent partial reads
-        by the Fast Loop's Rule Watcher.
+        Writes rules as a JSON object containing the rule list and optional
+        setup_packets (for stateful protocols).  Uses atomic write (temp
+        file + rename) to prevent partial reads by the Fast Loop's Rule
+        Watcher.
 
         Atomicity guarantee:
             On Linux, ``os.rename()`` within a single filesystem is atomic.
             The Fast Loop will either see the old file or the complete new
-            file — never a partial write. The Mutator's ``reload_rules()` also
+            file — never a partial write. The Mutator's ``reload_rules()`` also
             retries reads on JSONDecodeError for extra safety (e.g., on NFS).
 
         Args:
             rules: List of validated SemanticRules to push.
+            grammar: Optional ProtocolGrammar — if it has a state_machine
+                with a ``setup_sequence``, the hex-encoded packets are
+                included in the output for stateful protocol support.
+            overall_confidence: C4 fix — overall confidence score to pass
+                through to the Fast Loop so it doesn't show 0%.
+            protocol_name: C4 fix — protocol name to pass through.
         """
         if not rules:
             logger.debug("No rules to push")
@@ -562,6 +750,26 @@ class RuleGenerator:
         # Serialize to JSON
         rules_json = [r.model_dump(mode="json") for r in valid_rules]
 
+        # Extract setup_packets from grammar's state_machine (stateful protocols)
+        setup_packets: list[str] = []
+        if grammar and grammar.state_machine:
+            raw = grammar.state_machine.get("setup_sequence", [])
+            if isinstance(raw, list):
+                # Accept hex strings directly, or convert bytes-like entries
+                for pkt in raw:
+                    if isinstance(pkt, str) and pkt:
+                        setup_packets.append(pkt)
+
+        payload = {
+            "rules": rules_json,
+            "setup_packets": setup_packets,
+            # C4 fix: include confidence metadata so the Fast Loop's
+            # _poll_rules_file() can restore overall_confidence instead
+            # of defaulting to 0.0.
+            "overall_confidence": overall_confidence or 0.0,
+            "protocol_name": protocol_name or "unknown",
+        }
+
         # Ensure output directory exists
         self.rule_output_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -569,7 +777,7 @@ class RuleGenerator:
         temp_path = self.rule_output_file.with_suffix(".tmp")
         try:
             with open(temp_path, "w", encoding="utf-8") as f:
-                json.dump(rules_json, f, indent=2, default=str)
+                json.dump(payload, f, indent=2, default=str)
 
             temp_path.rename(self.rule_output_file)
 

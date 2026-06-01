@@ -141,23 +141,28 @@ class TestBuildPrompt:
     """Tests for prompt construction."""
 
     def test_build_prompt_with_records(self, sample_traffic_records):
-        """build_prompt() formats traffic records into a readable prompt."""
+        """build_prompt() formats traffic records into a readable prompt.
+
+        Mutated packets are filtered out to prevent corpus contamination.
+        Of the 3 sample records, only 2 are non-mutated.
+        """
         agent = LLMAgent()
         prompt = agent.build_prompt(sample_traffic_records)
 
-        # Should include header
-        assert "Analyze 3 network traffic packets" in prompt
+        # Should include header with clean (non-mutated) count
+        assert "Analyze 2 clean network traffic packets" in prompt
 
-        # Should include direction and hex
+        # Should include direction and hex in xxd format
         assert "client_to_server" in prompt
         assert "server_to_client" in prompt
-        assert "deadbeef" in prompt
+        # xxd format: "de ad be ef" (spaces between bytes)
+        assert "de ad be ef" in prompt
 
-        # Should include ASCII representation
+        # Should include ASCII representation inside xxd pipes
         assert "HELLO" in prompt
 
-        # Should mark mutated packets
-        assert "True" in prompt
+        # Mutated packet should be filtered out — "BYE" must NOT appear
+        assert "BYE" not in prompt
 
     def test_build_prompt_empty(self):
         """build_prompt() returns a message when no samples provided."""
@@ -294,6 +299,8 @@ class TestCallLLM:
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = '{"protocol_name": "test"}'
+        mock_response.usage.prompt_tokens = 80
+        mock_response.usage.completion_tokens = 20
         mock_response.usage.total_tokens = 100
 
         mock_litellm.acompletion = AsyncMock(return_value=mock_response)
@@ -356,6 +363,8 @@ class TestInferProtocol:
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = json.dumps(sample_grammar_json)
+        mock_response.usage.prompt_tokens = 150
+        mock_response.usage.completion_tokens = 50
         mock_response.usage.total_tokens = 200
 
         mock_litellm.acompletion = AsyncMock(return_value=mock_response)
@@ -377,6 +386,8 @@ class TestInferProtocol:
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = json.dumps(sample_grammar_json)
+        mock_response.usage.prompt_tokens = 120
+        mock_response.usage.completion_tokens = 30
         mock_response.usage.total_tokens = 150
 
         mock_litellm.acompletion = AsyncMock(return_value=mock_response)
@@ -418,13 +429,16 @@ class TestMathHint:
         assert "MATHEMATICAL" not in prompt
 
     def test_build_prompt_from_records_with_hint(self, sample_traffic_records):
-        """build_prompt() injects math_hint into TrafficRecord prompts."""
+        """build_prompt() injects math_hint BEFORE traffic samples."""
         agent = LLMAgent()
         hint = "HEATMAP: byte 0 = STATIC (H=0.0)"
         prompt = agent.build_prompt(sample_traffic_records, math_hint=hint)
 
         assert hint in prompt
-        assert "deadbeef" in prompt
+        # xxd format has spaces: "de ad be ef"
+        assert "de ad be ef" in prompt
+        # Heatmap should come BEFORE packet data
+        assert prompt.index(hint) < prompt.index("de ad be ef")
 
     @pytest.mark.asyncio
     @patch("slow_loop.llm_agent.HAS_LITELM", True)
@@ -436,6 +450,8 @@ class TestMathHint:
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = json.dumps(sample_grammar_json)
+        mock_response.usage.prompt_tokens = 80
+        mock_response.usage.completion_tokens = 20
         mock_response.usage.total_tokens = 100
 
         mock_litellm.acompletion = AsyncMock(return_value=mock_response)
@@ -502,3 +518,235 @@ class TestHexToAscii:
 
     def test_empty(self):
         assert _hex_to_ascii("") == ""
+
+
+# =============================================================================
+# API Base & Multi-Provider Handling
+# =============================================================================
+
+
+class TestApiBaseHandling:
+    """Tests for api_base parameter and multi-provider support."""
+
+    def test_api_base_default_empty(self):
+        """api_base defaults to empty string."""
+        agent = LLMAgent()
+        assert agent.api_base == ""
+
+    def test_api_base_stored(self):
+        """api_base is stored when provided."""
+        agent = LLMAgent(api_base="https://api.z.ai/api/coding/paas/v4")
+        assert agent.api_base == "https://api.z.ai/api/coding/paas/v4"
+
+    def test_stats_includes_api_base(self):
+        """Stats dict includes the configured api_base."""
+        agent = LLMAgent(api_base="https://custom.endpoint/v1")
+        assert agent.stats["api_base"] == "https://custom.endpoint/v1"
+
+    @pytest.mark.asyncio
+    @patch("slow_loop.llm_agent.HAS_LITELM", True)
+    @patch("slow_loop.llm_agent.litellm", create=True)
+    async def test_call_llm_passes_api_base(self, mock_litellm):
+        """call_llm() passes api_base to litellm.acompletion when set."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = '{"protocol_name": "test"}'
+        mock_response.usage.prompt_tokens = 40
+        mock_response.usage.completion_tokens = 10
+        mock_response.usage.total_tokens = 50
+        mock_litellm.acompletion = AsyncMock(return_value=mock_response)
+
+        agent = LLMAgent(
+            provider="openai",
+            model="glm-5-turbo",
+            api_key="test-key",
+            api_base="https://api.z.ai/api/coding/paas/v4",
+        )
+        await agent.call_llm("test prompt")
+
+        call_kwargs = mock_litellm.acompletion.call_args.kwargs
+        assert call_kwargs["api_base"] == "https://api.z.ai/api/coding/paas/v4"
+        assert call_kwargs["model"] == "openai/glm-5-turbo"
+
+    @pytest.mark.asyncio
+    @patch("slow_loop.llm_agent.HAS_LITELM", True)
+    @patch("slow_loop.llm_agent.litellm", create=True)
+    async def test_call_llm_omits_api_base_when_empty(self, mock_litellm):
+        """call_llm() does NOT pass api_base to litellm when empty."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = '{"protocol_name": "test"}'
+        mock_response.usage.prompt_tokens = 40
+        mock_response.usage.completion_tokens = 10
+        mock_response.usage.total_tokens = 50
+        mock_litellm.acompletion = AsyncMock(return_value=mock_response)
+
+        agent = LLMAgent(api_key="test-key", api_base="")
+        await agent.call_llm("test prompt")
+
+        call_kwargs = mock_litellm.acompletion.call_args.kwargs
+        assert "api_base" not in call_kwargs
+
+    @pytest.mark.asyncio
+    @patch("slow_loop.llm_agent.HAS_LITELM", True)
+    @patch("slow_loop.llm_agent.litellm", create=True)
+    async def test_ollama_model_string(self, mock_litellm):
+        """Ollama provider constructs correct model string."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = '{"protocol_name": "test"}'
+        mock_response.usage.prompt_tokens = 40
+        mock_response.usage.completion_tokens = 10
+        mock_response.usage.total_tokens = 50
+        mock_litellm.acompletion = AsyncMock(return_value=mock_response)
+
+        agent = LLMAgent(provider="ollama", model="llama3.2", api_key="")
+        await agent.call_llm("test prompt")
+
+        call_kwargs = mock_litellm.acompletion.call_args.kwargs
+        assert call_kwargs["model"] == "ollama/llama3.2"
+
+    @pytest.mark.asyncio
+    @patch("slow_loop.llm_agent.HAS_LITELM", True)
+    @patch("slow_loop.llm_agent.litellm", create=True)
+    async def test_ollama_no_api_key_required(self, mock_litellm):
+        """Ollama provider works without an API key (local model)."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = '{"protocol_name": "test"}'
+        mock_response.usage.prompt_tokens = 40
+        mock_response.usage.completion_tokens = 10
+        mock_response.usage.total_tokens = 50
+        mock_litellm.acompletion = AsyncMock(return_value=mock_response)
+
+        agent = LLMAgent(provider="ollama", model="llama3.2", api_key="")
+        result = await agent.call_llm("test prompt")
+        assert result == '{"protocol_name": "test"}'
+
+    @pytest.mark.asyncio
+    @patch("slow_loop.llm_agent.HAS_LITELM", True)
+    async def test_non_ollama_empty_api_key_raises(self):
+        """Non-Ollama providers raise RuntimeError when API key is empty."""
+        agent = LLMAgent(provider="openai", model="gpt-4o", api_key="")
+        with pytest.raises(RuntimeError, match="No API key"):
+            await agent.call_llm("test prompt")
+
+
+# ---------------------------------------------------------------------------
+# Fallback Logic Tests
+# ---------------------------------------------------------------------------
+
+class TestLLMFallback:
+    """Tests for the LLM Agent's fallback mechanism.
+
+    When the LLM API fails 3+ times consecutively, infer_protocol()
+    should return the last known good grammar instead of raising.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fallback_returns_cached_grammar(self):
+        """After 3 consecutive failures, infer_protocol returns cached grammar."""
+        agent = LLMAgent(
+            provider="openai", model="gpt-4o", api_key="test-key",
+            cache_file="/tmp/_lifa_test_no_exist.json",
+        )
+
+        # Simulate a previously successful inference
+        cached_grammar = ProtocolGrammar(
+            protocol_name="cached_proto",
+            description="From a previous successful call",
+            confidence=0.9,
+        )
+        agent._last_known_good_grammar = cached_grammar
+        agent._consecutive_failures = 3  # At the failure threshold
+
+        # Call infer_protocol — should return cached grammar WITHOUT calling LLM
+        traffic = [TrafficRecord(
+            direction=Direction.CLIENT_TO_SERVER,
+            raw_data=b"\x01\x02\x03",
+        )]
+        result = await agent.infer_protocol(traffic)
+
+        assert result.protocol_name == "cached_proto"
+        assert result.confidence == 0.9
+
+    @pytest.mark.asyncio
+    async def test_no_fallback_when_under_threshold(self):
+        """With < 3 consecutive failures, infer_protocol should still call LLM."""
+        agent = LLMAgent(
+            provider="openai", model="gpt-4o", api_key="test-key",
+            cache_file="/tmp/_lifa_test_no_exist.json",
+        )
+
+        cached_grammar = ProtocolGrammar(
+            protocol_name="cached_proto",
+            confidence=0.9,
+        )
+        agent._last_known_good_grammar = cached_grammar
+        agent._consecutive_failures = 2  # Below threshold
+
+        # This should attempt to call the LLM (in REAL mode it will fail
+        # because there's no real API). But with MOCK mode it should work.
+        os.environ["LLM_MODE"] = "MOCK"
+        try:
+            traffic = [TrafficRecord(
+                direction=Direction.CLIENT_TO_SERVER,
+                raw_data=b"\x01\x02\x03",
+            )]
+            result = await agent.infer_protocol(traffic)
+            # In MOCK mode, it returns a mock grammar, NOT the cached one
+            assert result.protocol_name != "cached_proto"
+        finally:
+            os.environ.pop("LLM_MODE", None)
+
+    @pytest.mark.asyncio
+    async def test_consecutive_failures_incremented(self):
+        """call_llm() increments _consecutive_failures on final failure."""
+        agent = LLMAgent(
+            provider="openai", model="gpt-4o", api_key="test-key",
+            max_retries=1,
+        )
+
+        assert agent._consecutive_failures == 0
+
+        with patch("slow_loop.llm_agent.HAS_LITELM", True):
+            with patch("slow_loop.llm_agent.litellm", create=True) as mock_litellm:
+                mock_litellm.acompletion = AsyncMock(
+                    side_effect=RuntimeError("API down")
+                )
+                with pytest.raises(RuntimeError):
+                    await agent.call_llm("test prompt")
+
+        assert agent._consecutive_failures == 1
+
+    @pytest.mark.asyncio
+    async def test_cache_cleared_on_success(self):
+        """After a successful inference, _consecutive_failures resets to 0."""
+        agent = LLMAgent(
+            provider="openai", model="gpt-4o", api_key="test-key",
+            cache_file="/tmp/_lifa_test_no_exist.json",
+        )
+        agent._consecutive_failures = 2  # Below 3-failure gate threshold
+
+        os.environ["LLM_MODE"] = "MOCK"
+        try:
+            traffic = [TrafficRecord(
+                direction=Direction.CLIENT_TO_SERVER,
+                raw_data=b"\x01\x02\x03",
+            )]
+            await agent.infer_protocol(traffic)
+            assert agent._consecutive_failures == 0
+            assert agent._last_known_good_grammar is not None
+        finally:
+            os.environ.pop("LLM_MODE", None)
+
+    def test_reset_clears_cache(self):
+        """reset() clears both the cached grammar and failure counter."""
+        agent = LLMAgent(provider="openai", model="gpt-4o", api_key="test-key")
+        agent._last_known_good_grammar = ProtocolGrammar(protocol_name="test")
+        agent._consecutive_failures = 10
+
+        agent.reset()
+
+        assert agent._last_known_good_grammar is None
+        assert agent._consecutive_failures == 0

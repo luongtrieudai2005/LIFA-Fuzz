@@ -54,9 +54,11 @@ from typing import Any
 
 import yaml
 
+from dotenv import load_dotenv
 from shared.logger import get_logger, setup_root_logger
 from shared.schemas import ProtocolGrammar, SemanticRule
 from shared.crash_manager import CrashManager
+from shared.runtime_state import write_slow_loop_state, SLOW_LOOP_STATE_FILE
 from slow_loop.parser import TrafficParser
 from slow_loop.llm_agent import LLMAgent
 from slow_loop.rule_generator import RuleGenerator
@@ -93,6 +95,39 @@ def resolve_traffic_log(config: dict[str, Any]) -> str:
 
 
 # =============================================================================
+# Slow Loop State Persistence
+# =============================================================================
+
+
+def _write_slow_loop_state(
+    orchestrator: RulesOrchestrator,
+    agent: LLMAgent,
+    alive: bool = True,
+) -> None:
+    """Write current slow loop status to shared/slow_loop_state.json.
+
+    Called after each cycle so the main pipeline (and dashboard) can
+    see slow loop health without shared object references.
+    """
+    orch_stats = orchestrator.stats
+    data = {
+        "timestamp": time.time(),
+        "pid": os.getpid(),
+        "alive": alive,
+        "last_cycle_time": (
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            if orch_stats.get("total_cycles", 0) > 0
+            else ""
+        ),
+        "total_cycles": orch_stats.get("total_cycles", 0),
+        "total_inferences": orch_stats.get("total_inferences", 0),
+        "total_rules_pushed": orch_stats.get("total_rules_pushed", 0),
+        "last_error": orch_stats.get("last_error", ""),
+    }
+    write_slow_loop_state(data, SLOW_LOOP_STATE_FILE)
+
+
+# =============================================================================
 # Main Daemon Loop
 # =============================================================================
 
@@ -122,6 +157,7 @@ async def run_slow_loop(
     llm_cfg = config.get("slow_loop", {}).get("llm_agent", {})
     parser_cfg = config.get("slow_loop", {}).get("parser", {})
     rule_cfg = config.get("slow_loop", {}).get("rule_generator", {})
+    slow_loop_cfg = config.get("slow_loop", {})
 
     min_packets = parser_cfg.get("min_samples_before_infer", min_packets)
     rules_output = rule_cfg.get("rule_output_file", rules_output_path)
@@ -137,6 +173,7 @@ async def run_slow_loop(
     logger.info(f"  LLM mode:      {llm_cfg.get('mode', os.environ.get('LLM_MODE', 'REAL'))}")
     logger.info(f"  LLM provider:  {llm_cfg.get('provider', 'openai')}")
     logger.info(f"  LLM model:     {llm_cfg.get('model', 'gpt-4o')}")
+    logger.info(f"  LLM api_base:  {llm_cfg.get('api_base', '') or '(default)'}")
     logger.info("=" * 60)
 
     # ── Config-driven LLM mode ────────────────────────────────────────
@@ -158,12 +195,27 @@ async def run_slow_loop(
         provider=llm_cfg.get("provider", "openai"),
         model=llm_cfg.get("model", "gpt-4o"),
         api_key=api_key,
+        api_base=llm_cfg.get("api_base", ""),
         max_tokens=llm_cfg.get("max_tokens", 4096),
         temperature=llm_cfg.get("temperature", 0.2),
         timeout_seconds=llm_cfg.get("timeout_seconds", 60),
         max_retries=llm_cfg.get("max_retries", 3),
         session_budget_tokens=llm_cfg.get("session_budget_tokens", 0),
+        session_budget_usd=llm_cfg.get("session_budget_usd", 0),
+        cache_file=llm_cfg.get("cache_file", "shared/last_known_grammar.json"),
+        circuit_retry_after_s=llm_cfg.get("circuit_retry_after_s", 300),
+        context_window=llm_cfg.get("context_window", 128_000),
+        prompt_truncation_strategy=llm_cfg.get("prompt_truncation_strategy", "truncate"),
     )
+    agent.enable_thinking = llm_cfg.get("enable_thinking", True)
+
+    # Cross-validate enable_thinking for cost-sensitive models
+    if agent.enable_thinking and "glm" in agent.model.lower():
+        logger.warning(
+            "enable_thinking=True with GLM model — this may cause "
+            "all tokens to be consumed by reasoning_content. "
+            "Set enable_thinking: false in config.yaml"
+        )
 
     rule_gen = RuleGenerator(
         min_confidence=rule_cfg.get("min_confidence", 0.5),
@@ -179,6 +231,31 @@ async def run_slow_loop(
     if loaded_crashes > 0:
         logger.info(f"  Loaded {loaded_crashes} existing crash records")
 
+    # ── EWMA Adaptive Controller (coordinates Fast Loop recv() sampling) ──
+    ewma_cfg = config.get("slow_loop", {}).get("ewma_controller", {})
+    ewma_enabled = ewma_cfg.get("enabled", True)
+    ewma_controller = None
+    if ewma_enabled:
+        from slow_loop.ewma_controller import EWMAController
+        ewma_controller = EWMAController(
+            output_path=ewma_cfg.get("output_path", "shared/adaptive_k.json"),
+            delta=ewma_cfg.get("delta", 0.1),
+            theta=ewma_cfg.get("theta", 2.0),
+            K_max=ewma_cfg.get("K_max", 200),
+            k_min=ewma_cfg.get("k_min", 5),
+            weight_A=ewma_cfg.get("weight_A", 0.3),
+            weight_B=ewma_cfg.get("weight_B", 0.7),
+            response_buf_path=ewma_cfg.get(
+                "response_buf_path", "shared/response_buffer.jsonl"
+            ),
+        )
+        logger.info(
+            f"  EWMA Controller: enabled (theta={ewma_controller.theta}, "
+            f"K_max={ewma_controller.K_max}, k_min={ewma_controller.k_min})"
+        )
+    else:
+        logger.info("  EWMA Controller: disabled")
+
     # ── Orchestrator (wraps Parser → dedup → Math → LLM → RuleGen) ──
     orchestrator = RulesOrchestrator(
         parser=parser,
@@ -189,6 +266,9 @@ async def run_slow_loop(
         max_prompt_tokens=llm_cfg.get("max_prompt_tokens", 0),
         min_packets_before_infer=min_packets,
         crash_manager=crash_manager,
+        ab_mode=slow_loop_cfg.get("ab_mode", "llm"),
+        ewma_controller=ewma_controller,
+        re_infer_interval_s=slow_loop_cfg.get("re_infer_interval_s", 300.0),
     )
 
     # ── Shutdown signal ──────────────────────────────────────────────
@@ -241,6 +321,8 @@ async def run_slow_loop(
                         logger.error(
                             f"Cycle error: {result['reason']}"
                         )
+                        # Persist state BEFORE backoff so dashboard sees the error
+                        _write_slow_loop_state(orchestrator, agent, alive=True)
                         # Back off longer on API errors
                         await asyncio.sleep(min(poll_interval_s * 3, 120))
                         continue
@@ -264,17 +346,6 @@ async def run_slow_loop(
                             "  ⚠ PRECISION MODE ACTIVE (k=1) — "
                             "single-field mutations for crash isolation"
                         )
-                    elif result["status"] == "skipped":
-                        logger.debug(
-                            f"Cycle skipped: {result['reason']}"
-                        )
-                    elif result["status"] == "error":
-                        logger.error(
-                            f"Cycle error: {result['reason']}"
-                        )
-                        # Back off longer on API errors
-                        await asyncio.sleep(min(poll_interval_s * 3, 120))
-                        continue
                 else:
                     consecutive_empty_reads += 1
                     if consecutive_empty_reads % 6 == 0:
@@ -282,15 +353,25 @@ async def run_slow_loop(
                         logger.debug("No new traffic data — still watching...")
 
                 # Wait before next cycle
+                # Persist state so main pipeline & dashboard can see us
+                _write_slow_loop_state(orchestrator, agent, alive=True)
                 await asyncio.sleep(poll_interval_s)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Unexpected error in slow loop: {e}", exc_info=True)
+                # Persist state so dashboard doesn't show stale data
+                try:
+                    _write_slow_loop_state(orchestrator, agent, alive=True)
+                except Exception:
+                    pass
                 await asyncio.sleep(5.0)
 
     finally:
+        # ── Shutdown: mark slow loop as dead ────────────────────────
+        _write_slow_loop_state(orchestrator, agent, alive=False)
+
         # ── Shutdown summary ──────────────────────────────────────────
         orch_stats = orchestrator.stats
         logger.info("")
@@ -315,6 +396,9 @@ async def run_slow_loop(
 
 def main() -> None:
     """Parse CLI arguments and launch the daemon."""
+    # Load .env file first (manual env vars take precedence)
+    load_dotenv(override=False)
+
     parser = argparse.ArgumentParser(
         description="LIFA-Fuzz Slow Loop Daemon — "
         "Parser → LLM → Rule Generator pipeline",
