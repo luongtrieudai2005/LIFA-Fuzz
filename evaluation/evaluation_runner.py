@@ -55,6 +55,29 @@ from dotenv import load_dotenv
 
 RESULTS_DIR = Path(__file__).parent / "results"
 
+
+def _load_llm_agent_config(config_path: str = "config.yaml") -> dict[str, Any]:
+    """Load the ``slow_loop.llm_agent`` block from ``config.yaml``.
+
+    Baseline C builds its LLMAgent IN-PROCESS (via ``_run_fusion_loop``),
+    not through ``run_slow_loop.py``, so it must read the same canonical
+    config the daemon uses. Previously the agent was built from ad-hoc
+    ``LLM_*`` env vars whose names did not match ``.env`` (it read
+    ``LLM_API_BASE`` while ``.env`` defines ``OPENAI_API_BASE``), leaving
+    ``api_base`` empty and routing every call to the default OpenAI
+    endpoint with a GLM model name → all calls failed → silent bootstrap
+    fallback. ``config.yaml`` is the single source of truth here.
+    """
+    try:
+        import yaml
+
+        path = _project_root / config_path
+        with open(path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        return cfg.get("slow_loop", {}).get("llm_agent", {}) or {}
+    except Exception:
+        return {}
+
 BASELINE_CONFIGS = {
     "A": {
         "label": "baseline_A_random",
@@ -124,9 +147,15 @@ async def run_single_baseline(
     # Clean shared state
     _reset_shared_state()
 
-    # Set LLM mode based on config
+    # Set LLM mode based on config.
+    # Baseline C (llm_enabled) MUST run in REAL mode. The previous code did
+    # ``os.environ.get("LLM_MODE", "MOCK")`` which only kept an ambient value
+    # and otherwise defaulted to MOCK — so unless the operator had manually
+    # exported LLM_MODE=REAL, baseline C silently ran MOCK, produced a fixed
+    # dummy grammar unrelated to the real traffic, and effectively degraded
+    # to bootstrap (math) rules. Force REAL here deterministically.
     if config["llm_enabled"]:
-        os.environ["LLM_MODE"] = os.environ.get("LLM_MODE", "MOCK")
+        os.environ["LLM_MODE"] = "REAL"
     else:
         os.environ["LLM_MODE"] = "MOCK"  # Always MOCK when LLM disabled
 
@@ -145,6 +174,13 @@ async def run_single_baseline(
             "port": 8080,
             "container": "lifa-lighttpd-server",
             "client_script": "sandbox/client/http_client.py",
+        },
+        "lightftp": {
+            "image": "lifa-fuzz-server:latest",  # not used with firecracker
+            "build_context": "sandbox/firecracker_env",
+            "port": 21,
+            "container": "lifa-lightftp-server",
+            "client_script": "sandbox/client/ftp_client.py",
         },
     }
     tcfg = TARGET_CONFIGS.get(target)
@@ -173,6 +209,16 @@ async def run_single_baseline(
             ),
             "target_port": 9000,  # lighttpd listens on 9000 inside the VM (matches lighttpd.conf)
         },
+        "lightftp": {
+            "rootfs_path": "sandbox/firecracker_env/rootfs_lightftp.ext4",
+            "kernel_args": (
+                "console=ttyS0 reboot=k panic=1 pci=off"
+                " root=/dev/vda rw"
+                " init=/init"
+                " ip=172.16.0.2::172.16.0.1:255.255.255.0::eth0:off"
+            ),
+            "target_port": 21,  # FTP standard port
+        },
     }
 
     image_display = tcfg["image"] if sandbox_driver == "docker" else "MicroVM (rootfs)"
@@ -189,6 +235,10 @@ async def run_single_baseline(
     sandbox = None
     client_proc = None
     interceptor = None
+
+    # Track whether Slow Loop is running in-process (Baseline B/C fusion)
+    # so the state writer can report correct SlowLoopState to the dashboard.
+    _slow_loop_in_process = False
 
     # ── Signal handler for graceful cleanup on kill ───────────
     import signal as _signal
@@ -223,6 +273,7 @@ async def run_single_baseline(
                 rootfs_path=fc_cfg["rootfs_path"],
                 kernel_args=fc_cfg["kernel_args"],
                 target_port=fc_cfg["target_port"],
+                target_name=target,  # Pass target name for driver-level defaults
             )
 
         await sandbox.start()
@@ -292,16 +343,68 @@ async def run_single_baseline(
                     direction=Direction.CLIENT_TO_SERVER,
                     raw_data=seed_data,
                 ))
+        elif target == "lifa":
+            from shared.schemas import Direction, TrafficRecord
+            # Inject diverse LIFA protocol seeds — MUST include PROCESS_DATA
+            # with various payload sizes so mutations can trigger the overflow.
+            # LIFA header: MAGIC(4) + opcode(1) + length(1) + payload(N)
+            MAGIC = b"LIFA"
+            lifa_seeds = [
+                # PING packets (opcode 0x01)
+                MAGIC + bytes([0x01, 0x04]) + b"PONG",
+                MAGIC + bytes([0x01, 0x08]) + b"SEQ00001",
+                # PROCESS_DATA packets (opcode 0x02) — the vulnerable path
+                MAGIC + bytes([0x02, 0x08]) + bytes(range(8)),          # 8-byte payload (safe)
+                MAGIC + bytes([0x02, 0x0F]) + bytes(range(15)),         # 15-byte payload (safe)
+                MAGIC + bytes([0x02, 0x20]) + bytes(range(32)),         # 32-byte payload (edge)
+                MAGIC + bytes([0x02, 0x40]) + bytes(range(64)),         # 64-byte payload (OVERFLOW!)
+                MAGIC + bytes([0x02, 0x80]) + bytes(range(128)),        # 128-byte payload (OVERFLOW!)
+            ]
+            for seed_data in lifa_seeds:
+                await seed_queue.put(TrafficRecord(
+                    direction=Direction.CLIENT_TO_SERVER,
+                    raw_data=seed_data,
+                ))
+        elif target == "lightftp":
+            from shared.schemas import Direction, TrafficRecord
+            # Inject FTP protocol seeds — cover authentication + data commands
+            ftp_seeds = [
+                b"USER admin\r\n",
+                b"PASS admin\r\n",
+                b"USER anonymous\r\n",
+                b"PASS guest@\r\n",
+                b"SYST\r\n",
+                b"PWD\r\n",
+                b"TYPE I\r\n",
+                b"MKD testdir\r\n",
+                b"CWD testdir\r\n",
+                b"LIST\r\n",
+                b"NOOP\r\n",
+                b"QUIT\r\n",
+                b"DELE testfile.txt\r\n",
+                b"SIZE testfile.txt\r\n",
+                b"FEAT\r\n",
+                b"REST 0\r\n",
+            ]
+            for seed_data in ftp_seeds:
+                await seed_queue.put(TrafficRecord(
+                    direction=Direction.CLIENT_TO_SERVER,
+                    raw_data=seed_data,
+                ))
 
+        # Target-specific mutator tuning
+        # Firecracker + FTP: need generous timeouts (FTP banner + command
+        # response arrive asynchronously over the TAP bridge).
+        _is_fc_ftp = (sandbox_driver == "firecracker" and target == "lightftp")
         mutator = MutationEngine(
             target_host=target_host,
             target_port=target_port,
             seed_queue=seed_queue,
             k=2,
-            max_eps=5000,              # Lift throttle for evaluation
-            connection_timeout=0.2,    # Fast localhost
-            recv_timeout=0.01,         # 10ms fallback
-            no_recv=True,              # Skip response — crash monitored separately
+            max_eps=5000,
+            connection_timeout=1.0 if _is_fc_ftp else 0.2,
+            recv_timeout=0.5 if _is_fc_ftp else 0.01,
+            no_recv=False,
         )
 
         # ── 5. Crash Monitor ──────────────────────────────────────
@@ -365,7 +468,10 @@ async def run_single_baseline(
                             and not rec.get("is_mutated")
                         ):
                             raw_hex = rec.get("payload", rec.get("raw_hex", ""))
-                            if raw_hex and len(raw_hex) >= 8:
+                            # FIX: accept all non-empty payloads (>= 2 hex chars
+                            # = 1 byte). Short packets like ACKs and status bytes
+                            # are legitimate protocol messages. Matches main.py.
+                            if raw_hex and len(raw_hex) >= 2:
                                 tr = TrafficRecord(
                                     direction=Direction.CLIENT_TO_SERVER,
                                     raw_data=bytes.fromhex(raw_hex),
@@ -381,34 +487,75 @@ async def run_single_baseline(
         )
         background_tasks.append(seed_feeder_task)
 
-        # ── 7. Slow Loop (only for Baseline C with LLM) ────────────
+        # ── 7. Slow Loop (only for Baseline B/C) ────────────
         agent = None
-        if config["llm_enabled"] or config["math_enabled"]:
-            # Start slow loop subprocess for rule generation
-            # For Baseline B (math-only), the orchestrator still runs
-            # to produce bootstrap rules from the analyzer
+        if config["llm_enabled"]:
+            # Baseline C: create LLM agent for full Neural-Mathematical Fusion.
+            # Build from config.yaml's slow_loop.llm_agent block — the same
+            # canonical config run_slow_loop.py uses — so provider/model/
+            # api_base/enable_thinking match the daemon exactly. Only the API
+            # key value comes from the environment (looked up via api_key_env).
+            llm_cfg = _load_llm_agent_config()
+            api_key_env = llm_cfg.get("api_key_env", "OPENAI_API_KEY")
+            api_key = os.environ.get(
+                api_key_env, os.environ.get("OPENAI_API_KEY", "")
+            )
             from slow_loop.llm_agent import LLMAgent
             agent = LLMAgent(
-                provider=os.environ.get("LLM_PROVIDER", "openai"),
-                model=os.environ.get("LLM_MODEL", "gpt-4o"),
-                api_key=os.environ.get(
-                    os.environ.get("LLM_API_KEY_ENV", "OPENAI_API_KEY"), "test"
+                provider=llm_cfg.get("provider", "openai"),
+                model=llm_cfg.get("model", "gpt-4o"),
+                api_key=api_key,
+                api_base=llm_cfg.get("api_base", ""),
+                max_tokens=llm_cfg.get("max_tokens", 4096),
+                temperature=llm_cfg.get("temperature", 0.2),
+                timeout_seconds=llm_cfg.get("timeout_seconds", 60),
+                max_retries=llm_cfg.get("max_retries", 3),
+                cache_file=llm_cfg.get(
+                    "cache_file", "shared/last_known_grammar.json"
                 ),
-                api_base=os.environ.get("LLM_API_BASE", ""),
+                context_window=llm_cfg.get("context_window", 128_000),
+            )
+            # CRITICAL: GLM-5-Turbo via Z.ai consumes all tokens for
+            # reasoning_content and returns empty .content unless thinking
+            # is disabled. Authoritative value lives in config.yaml.
+            agent.enable_thinking = llm_cfg.get("enable_thinking", False)
+
+            if not api_key and agent.provider != "ollama":
+                print(
+                    "  ⚠ WARNING: LLM enabled (baseline C) but no API key found "
+                    f"(env var '{api_key_env}'). Calls will fail and the loop "
+                    "will fall back to bootstrap rules."
+                )
+            print(
+                f"  LLM agent: provider={agent.provider} model={agent.model} "
+                f"api_base={agent.api_base or '(default)'} "
+                f"enable_thinking={agent.enable_thinking}"
             )
 
-            if config["llm_enabled"]:
-                # Full slow loop subprocess
-                slow_loop_proc = await _start_slow_loop_subprocess()
-            else:
-                # Math-only: run orchestrator in-process for bootstrap rules
-                math_task = asyncio.create_task(
-                    _run_math_only_loop(
-                        traffic_log, agent, mutator, crash_manager
-                    ),
-                    name="math_bootstrap_loop",
-                )
-                background_tasks.append(math_task)
+        if config["llm_enabled"]:
+            # Full fusion: run slow loop IN-PROCESS (not subprocess!)
+            # This ensures rules are pushed directly to the mutator
+            # via await mutator.update_rule_set() instead of relying
+            # on fragile file-based IPC.
+            _slow_loop_in_process = True
+            fusion_task = asyncio.create_task(
+                _run_fusion_loop(
+                    traffic_log, agent, mutator, crash_manager
+                ),
+                name="fusion_loop",
+            )
+            background_tasks.append(fusion_task)
+        elif config["math_enabled"]:
+            # Baseline B: math-only — no LLM agent needed.
+            # The DifferentialAnalyzer produces rules directly.
+            _slow_loop_in_process = True
+            math_task = asyncio.create_task(
+                _run_math_only_loop(
+                    traffic_log, mutator, crash_manager
+                ),
+                name="math_bootstrap_loop",
+            )
+            background_tasks.append(math_task)
 
         # ── 8. Telemetry Collector ─────────────────────────────────
         collector = TelemetryCollector(
@@ -417,6 +564,15 @@ async def run_single_baseline(
             snapshot_interval_s=10.0,
         )
         await collector.start(interceptor, mutator, crash_manager, agent)
+
+        # ── 8a. Step 3: State Coverage CSV Logger ──────────────────
+        # Per-baseline CSV file for coverage comparison plots.
+        from evaluation.state_coverage_logger import StateCoverageLogger
+        csv_logger = StateCoverageLogger(
+            output_path=f"logs/state_coverage_stats_{baseline_id}.csv",
+            interval_s=10.0,
+        )
+        csv_logger.init_file()
 
         # ── 8b. Runtime State Writer (feeds the Dashboard) ────────
         # Writes shared/runtime_state.json every 2s so the Streamlit
@@ -461,15 +617,26 @@ async def run_single_baseline(
                             total_accepted=ms.total_accepted,
                             total_rejected=ms.total_rejected,
                             total_crashes=ms.total_crashes,
+                            total_timeout=ms.total_timeout,
                             investigation_mode=ms.investigation_mode,
                             rule_set_version=ms.rule_set_version,
+                            active_rule_count=ms.active_rule_count,
+                        ),
+                        rule_set=RuleSetState(
+                            version=ms.rule_set_version,
+                            protocol_name="fuzzing",
+                            confidence=0.0,
+                            total_rules=ms.active_rule_count,
                         ),
                         slow_loop=SlowLoopState(
-                            alive=(slow_loop_proc is not None and slow_loop_proc.poll() is None),
+                            alive=(
+                                _slow_loop_in_process
+                                or (slow_loop_proc is not None and slow_loop_proc.poll() is None)
+                            ),
                             pid=slow_loop_proc.pid if slow_loop_proc else None,
                             total_cycles=0,
                             total_inferences=0,
-                            total_rules_pushed=0,
+                            total_rules_pushed=ms.active_rule_count,
                             last_error="",
                         ),
                         evaluation=EvaluationState(
@@ -523,6 +690,20 @@ async def run_single_baseline(
                     f"  [{elapsed:.0f}s/{duration_s}s] "
                     f"EPS={eps:.0f}  injected={injected}  crashes={crashes}"
                 )
+
+            # Step 3: Write state coverage CSV snapshot every ~10s
+            if int(elapsed) > 0 and int(elapsed) % 10 == 0:
+                try:
+                    cs = mutator.coverage_summary
+                    csv_logger.write_snapshot(
+                        executions=cs["total_mutations"],
+                        unique_code_branches=cs["unique_offsets_fuzzed"],
+                        unique_states=cs.get("unique_states", 0),
+                        unique_state_edges=cs.get("unique_state_edges", 0),
+                    )
+                except Exception:
+                    pass
+
             await asyncio.sleep(1.0)
 
         # ── 10. Stop and collect results ───────────────────────────
@@ -869,10 +1050,9 @@ async def _start_slow_loop_subprocess():
 
 async def _run_math_only_loop(
     traffic_log: str,
-    agent: Any,
     mutator: Any,
     crash_manager: Any,
-    poll_interval: float = 15.0,
+    poll_interval: float = 5.0,
 ) -> None:
     """Background loop that runs DifferentialAnalyzer and pushes bootstrap rules.
 
@@ -921,37 +1101,28 @@ async def _run_math_only_loop(
             heatmap = analyzer.analyze(raw_bytes)
             field_rules = heatmap.to_field_rules()
 
+            print(
+                f"  [math-only] Analyzed {len(raw_bytes)} packets → "
+                f"{len(heatmap.field_groups)} groups, "
+                f"{len(field_rules)} field_rules"
+            )
+
             if field_rules:
+                # Use RulesOrchestrator._convert_field_rules() which correctly
+                # handles: STATIC → preserve_bytes, SKIP filtering,
+                # dictionary_values transfer, and field_type inference.
+                # NOTE: _convert_field_rules is an instance method that calls
+                # @staticmethod helpers via self — we must pass a real instance.
+                _orch = RulesOrchestrator.__new__(RulesOrchestrator)
+                rules = _orch._convert_field_rules(field_rules)
+
+                # Assign deterministic rule_ids so the same field always gets
+                # the same ID → dedup works across math-only cycles.
                 import hashlib
-                from shared.schemas import SemanticRule, RuleType, MutationStrategy
-                rules = []
-                for fr in field_rules:
-                    end = fr.offset + fr.length if fr.length > 0 else 65535
-                    # Map strategy to rule type
-                    strategy_map = {
-                        MutationStrategy.STATIC: RuleType.STRUCTURAL,
-                        MutationStrategy.BOUNDARY_VALUES: RuleType.BOUNDARY,
-                        MutationStrategy.BIT_FLIP: RuleType.BIT_FLIP,
-                        MutationStrategy.RANDOM_BYTES: RuleType.STRUCTURAL,
-                        MutationStrategy.CALCULATED: RuleType.BOUNDARY,
-                    }
-                    rt = strategy_map.get(fr.mutation_strategy, RuleType.BIT_FLIP)
-                    # C2 fix: deterministic rule_id based on field content
-                    # so the same field always gets the same ID → dedup works.
-                    rule_id = hashlib.sha256(
-                        f"{fr.offset}:{end}:{fr.mutation_strategy.value}".encode()
+                for rule in rules:
+                    rule.rule_id = hashlib.sha256(
+                        f"{rule.offset_start}:{rule.offset_end}:{rule.rule_type.value}".encode()
                     ).hexdigest()[:12]
-                    rule = SemanticRule(
-                        rule_id=rule_id,
-                        rule_type=rt,
-                        target_field_name=fr.field_name,
-                        mutation_type=rt,
-                        offset_start=fr.offset,
-                        offset_end=end,
-                        priority=fr.confidence,
-                        description=fr.notes or "Bootstrap rule from DifferentialAnalyzer",
-                    )
-                    rules.append(rule)
 
                 # Direct push to mutator (primary delivery mechanism)
                 from shared.schemas import ActiveRuleSet as _ARS
@@ -960,6 +1131,10 @@ async def _run_math_only_loop(
                     rules=rules,
                 )
                 await mutator.update_rule_set(rule_set_payload)
+                print(
+                    f"  [math-only] Pushed {len(rules)} rules to mutator "
+                    f"(first 3: {[r.target_field_name for r in rules[:3]]})"
+                )
 
                 # Write rules to file for mutator file poller (backup path)
                 # MUST match the path read by MutationEngine._load_rules_path_from_config()
@@ -972,6 +1147,96 @@ async def _run_math_only_loop(
                         f, indent=2, default=str,
                     )
                 tmp.rename(rules_path)
+
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            continue
+
+
+async def _run_fusion_loop(
+    traffic_log: str,
+    agent: Any,
+    mutator: Any,
+    crash_manager: Any,
+    poll_interval: float = 5.0,
+) -> None:
+    """Background loop for Baseline C: math bootstrap + LLM inference.
+
+    Runs the full RulesOrchestrator pipeline in-process, pushing rules
+    directly to the mutator via await mutator.update_rule_set().
+    This avoids the broken subprocess IPC that caused 0 rules in C.
+    """
+    from slow_loop.parser import TrafficParser
+    from slow_loop.differential_analyzer import DifferentialAnalyzer
+    from slow_loop.rules_orchestrator import RulesOrchestrator
+    from slow_loop.rule_generator import RuleGenerator
+
+    rule_gen = RuleGenerator(min_confidence=0.5, max_rules=200)
+    parser = TrafficParser(log_path=traffic_log, read_interval_ms=2000)
+
+    orchestrator = RulesOrchestrator(
+        parser=parser,
+        agent=agent,
+        rule_gen=rule_gen,
+        max_packets_per_inference=20,
+        window_size=200,
+        min_packets_before_infer=2,
+        crash_manager=crash_manager,
+        re_infer_interval_s=30.0,
+    )
+
+    while True:
+        await asyncio.sleep(poll_interval)
+        try:
+            result = await orchestrator.run_cycle()
+
+            if result is not None and result.get("status") == "success":
+                rules = result.get("rules", [])
+                grammar = result.get("grammar")
+                if rules and grammar:
+                    from shared.schemas import ActiveRuleSet as _ARS
+                    rule_set = _ARS(
+                        protocol_name=grammar.protocol_name,
+                        rules=rules,
+                    )
+                    await mutator.update_rule_set(rule_set)
+
+                    # Also write to file for mutator file poller (backup)
+                    rules_path = Path(mutator._rules_file)
+                    rules_path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = rules_path.with_suffix(".tmp")
+                    with open(tmp, "w") as f:
+                        json.dump(
+                            [r.model_dump(mode="json") for r in rules],
+                            f, indent=2, default=str,
+                        )
+                    tmp.rename(rules_path)
+
+            elif result is not None and result.get("status") == "bootstrap":
+                rules = result.get("rules", [])
+                if rules:
+                    from shared.schemas import ActiveRuleSet as _ARS
+                    rule_set = _ARS(
+                        protocol_name="bootstrap_fusion",
+                        rules=rules,
+                    )
+                    await mutator.update_rule_set(rule_set)
+
+                    # Write bootstrap rules to file (backup path for
+                    # mutator file poller — same as success path above).
+                    try:
+                        rules_path = Path(mutator._rules_file)
+                        rules_path.parent.mkdir(parents=True, exist_ok=True)
+                        tmp = rules_path.with_suffix(".tmp")
+                        with open(tmp, "w") as f:
+                            json.dump(
+                                [r.model_dump(mode="json") for r in rules],
+                                f, indent=2, default=str,
+                            )
+                        tmp.rename(rules_path)
+                    except Exception:
+                        pass  # File write is backup-only, not critical
 
         except asyncio.CancelledError:
             break
@@ -1012,6 +1277,77 @@ def write_comparison(baselines: list[str] = None) -> dict:
 
 
 # =============================================================================
+# Dashboard subprocess management
+# =============================================================================
+
+
+def _start_dashboard(port: int = 8501) -> Optional[object]:
+    """Launch the Streamlit dashboard as a background subprocess.
+
+    Returns the subprocess handle, or None if launch failed.
+    """
+    import subprocess as sp
+    from pathlib import Path
+
+    dashboard_script = _project_root / "web_ui" / "app.py"
+    if not dashboard_script.exists():
+        print("  ⚠ web_ui/app.py not found — dashboard skipped")
+        return None
+
+    # Find streamlit binary
+    python_bin = Path(sys.executable).parent
+    streamlit_bin = python_bin / "streamlit"
+
+    if streamlit_bin.exists():
+        cmd = [
+            str(streamlit_bin), "run", str(dashboard_script),
+            "--server.port", str(port),
+            "--server.headless", "true",
+            "--browser.gatherUsageStats", "false",
+        ]
+    else:
+        cmd = [
+            sys.executable, "-m", "streamlit", "run", str(dashboard_script),
+            "--server.port", str(port),
+            "--server.headless", "true",
+            "--browser.gatherUsageStats", "false",
+        ]
+
+    try:
+        proc = sp.Popen(
+            cmd,
+            stdout=sp.DEVNULL,
+            stderr=sp.DEVNULL,
+            cwd=str(_project_root),
+        )
+        print(f"  ✓ Dashboard started (PID={proc.pid}) → http://localhost:{port}")
+        return proc
+    except FileNotFoundError:
+        print("  ⚠ streamlit not found — install with: pip install streamlit")
+        return None
+    except OSError as e:
+        print(f"  ⚠ Failed to start dashboard: {e}")
+        return None
+
+
+def _stop_dashboard(proc) -> None:
+    """Stop the dashboard subprocess gracefully."""
+    if proc is None:
+        return
+    import subprocess as sp
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except sp.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=3)
+        print("  ✓ Dashboard stopped")
+    except Exception:
+        pass
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
@@ -1039,8 +1375,19 @@ Examples:
         help="Sandbox driver (default: docker)",
     )
     parser.add_argument(
-        "--target", default="lifa", choices=["lifa", "lighttpd"],
-        help="Target server: lifa (vulnerable_server) or lighttpd (real-world HTTP)",
+        "--target", default="lifa", choices=["lifa", "lighttpd", "lightftp"],
+        help="Target server: lifa, lightttpd, or lightftp",
+    )
+    parser.add_argument(
+        "--no-dashboard",
+        action="store_true",
+        help="Do not auto-start the Streamlit dashboard",
+    )
+    parser.add_argument(
+        "--dashboard-port",
+        type=int,
+        default=8501,
+        help="Dashboard port (default: 8501)",
     )
 
     args = parser.parse_args()
@@ -1054,6 +1401,11 @@ Examples:
     )
     cleanup_orphaned_resources()
     archive_previous_results(target=args.target, driver=args.driver)
+
+    # ── Start dashboard subprocess ────────────────────────────────
+    dashboard_proc = None
+    if not args.no_dashboard:
+        dashboard_proc = _start_dashboard(port=args.dashboard_port)
 
     print("╔══════════════════════════════════════════════════════════╗")
     print("║  LIFA-Fuzz Academic Benchmarking Suite                  ║")
@@ -1107,7 +1459,14 @@ Examples:
     print(f"\n  Results saved to: {RESULTS_DIR}")
     print(f"  Generate plots:   python -m evaluation.plot_generator")
 
+    # ── Stop dashboard ────────────────────────────────────────────
+    if dashboard_proc:
+        _stop_dashboard(dashboard_proc)
+
 
 if __name__ == "__main__":
     load_dotenv(override=False)
+    # Ensure CWD is project root — all relative paths (sandbox/,
+    # shared/, etc.) depend on this. Running from evaluation/ breaks them.
+    os.chdir(str(_project_root))
     asyncio.run(main())

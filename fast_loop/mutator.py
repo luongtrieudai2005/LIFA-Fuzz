@@ -68,6 +68,18 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from shared.logger import get_logger
+
+# BinaryMutator: 14-strategy AFL-class mutation engine for DUMB mode (Baseline A).
+# When no SemanticRules are available, MutationEngine delegates to this instead
+# of the old single-bit-flip _dumb_mutate(), ensuring Baseline A is a fair
+# comparison against B (math-only) and C (full fusion).
+from fast_loop.binary_mutator import BinaryMutator
+
+# StateTransitionGraph: Step 3 — State-Coverage Expansion.
+# Tracks unique (prev_code, command, new_code) edges to reward the fuzzer
+# for discovering new protocol state paths (STATE_NOVELTY seeds).
+from fast_loop.state_transition_graph import StateTransitionGraph
+
 from shared.schemas import (
     ActiveRuleSet,
     Direction,
@@ -435,6 +447,8 @@ class MutatorStats:
     current_k:                 int                        = 200
     recv_sample_rate:          float                      = 0.0
     ewma_lambda_c:             float                      = 0.0
+    # Rule count for dashboard / telemetry
+    active_rule_count:         int                        = 0
     ewma_regime:               str                        = "sparse"
 
 
@@ -550,6 +564,21 @@ class MutationEngine:
         self._running: bool = False
         self._paused:  bool = False
 
+        # BinaryMutator for DUMB mode (Baseline A — AFL-class random fuzzing).
+        # Uses 14+4 strategies (bit_flip, interesting values, arithmetic, block
+        # operations, plus FTP-aware token injection) instead of the old
+        # single-bit-flip _dumb_mutate().
+        # No seed → non-deterministic, matching standard fuzzing practice.
+        self._binary_mutator: BinaryMutator = BinaryMutator()
+
+        # Step 3: State Transition Graph — tracks unique protocol state edges.
+        # Lock-free: only accessed from the single asyncio hot loop.
+        self._stg: StateTransitionGraph = StateTransitionGraph()
+
+        # FTP protocol detection: auto-detect from target port (21 = FTP).
+        # When active: enforce CRLF packet delimiter, use FTP token mutations.
+        self._is_ftp_target: bool = (target_port == 21)
+
         # P1-A: revert pending flag — deterministic mode revert
         self._revert_pending: bool = False
 
@@ -566,6 +595,7 @@ class MutationEngine:
 
         # Stats (initialized above with correct mode)
         self._mutation_signatures: set[str] = set()
+        self._current_rule_type: Optional[str] = None  # for _track_rule_response
 
         # Rule file poller — bridges Slow Loop / Math-Only → Fast Loop
         rule_cfg = self._load_rules_path_from_config()
@@ -576,6 +606,9 @@ class MutationEngine:
         self._current_k: int = 200          # Sampling interval (K_max default)
         self._packet_counter: int = 0       # Monotonic — never reset
         self._recv_count: int = 0           # Number of recv() calls (for telemetry)
+        self._consecutive_failures: int = 0 # Back-pressure: consecutive CRASH/TIMEOUT
+        self._MAX_CONSECUTIVE_FAILURES = 5  # Back off after this many failures
+        self._rule_response_stats: dict[str, dict[str, int]] = {}  # Per rule-type stats
         self._ipc_read_interval: int = 50   # Read adaptive_k.json every N packets
         self._adaptive_k_path: str = "shared/adaptive_k.json"
         self._response_buf_path: str = "shared/response_buffer.jsonl"
@@ -613,8 +646,12 @@ class MutationEngine:
 
     @property
     def coverage_summary(self) -> dict:
-        """Backward-compatible property for telemetry and callers."""
+        """Backward-compatible property for telemetry and callers.
+
+        Step 3: Extended with STG metrics for CSV telemetry and dashboard.
+        """
         s = self._stats
+        stg = self._stg.stats
         return {
             "total_mutations": s.total_sent,
             "total_packets": s.total_sent,
@@ -626,6 +663,11 @@ class MutationEngine:
             "investigation_mode": s.investigation_mode,
             "current_k": self._current_k,
             "recv_sample_rate": self._recv_count / max(1, s.total_sent),
+            # Step 3: State Transition Graph metrics
+            "unique_states": stg["unique_states"],
+            "unique_state_edges": stg["unique_edges"],
+            "unique_state_paths": stg["unique_paths"],
+            "novel_seed_count": stg["novel_seed_count"],
         }
 
     # -------------------------------------------------------------------
@@ -709,6 +751,24 @@ class MutationEngine:
                 status = await self._send(payload, seed.sequence_id)
 
             self._update_stats(status, payload)
+
+            # Back-pressure: if too many consecutive failures, back off
+            # to let the server recover instead of flooding a dead socket.
+            if status in (PacketStatus.CRASH, PacketStatus.TIMEOUT):
+                self._consecutive_failures += 1
+            else:
+                self._consecutive_failures = 0
+
+            if self._consecutive_failures >= self._MAX_CONSECUTIVE_FAILURES:
+                log.warning(
+                    f"{self._consecutive_failures} consecutive failures — "
+                    f"backing off 2s for server recovery"
+                )
+                await asyncio.sleep(2.0)
+                self._consecutive_failures = 0
+
+            # Track per-rule-type response stats for LLM feedback
+            self._track_rule_response(status)
 
             # IFPS: periodic cap to prevent unbounded growth.
             # Cap rather than delete — deleting would cause .get(_, 0) to
@@ -913,6 +973,7 @@ class MutationEngine:
             last_investigation_summary = dict(self._stats.last_investigation_summary),
             current_k                  = self._current_k,
             recv_sample_rate           = self._recv_count / total,
+            active_rule_count          = len(self._rule_set.rules) if self._rule_set is not None else 0,
         )
 
     def get_crash_window(self) -> list[tuple]:
@@ -998,6 +1059,11 @@ class MutationEngine:
 
         Fast path: skip if file already large (>80KB ≈ 1000 lines).
         Non-blocking: write failure is silently ignored (never crash the hot loop).
+
+        FTP-aware: when the response looks like an FTP status code (3 ASCII
+        digits followed by space/hyphen), extracts and logs the status code
+        alongside the hex_prefix so the EWMA controller can reward deep
+        authentication states with higher recv() intensity.
         """
         try:
             path = self._response_buf_path
@@ -1008,15 +1074,123 @@ class MutationEngine:
             except FileNotFoundError:
                 pass
             hex_prefix = response[:8].hex() if len(response) >= 8 else response.hex()
-            line = json.dumps({
+
+            entry: dict = {
                 "hex_prefix": hex_prefix,
                 "length": len(response),
                 "ts": round(time.time(), 3),
-            }) + "\n"
+            }
+
+            # FTP status code extraction: 3 ASCII digits followed by space/hyphen
+            # Validate range 100-599 per RFC 959 to avoid false positives from
+            # binary data that happens to start with 3 ASCII digits.
+            if len(response) >= 4 and response[:3].isdigit():
+                try:
+                    code_val = int(response[:3])
+                    if 100 <= code_val <= 599 and response[3:4] in (b" ", b"-"):
+                        entry["ftp_status_code"] = f"{code_val:03d}"
+                except ValueError:
+                    pass
+
+            line = json.dumps(entry) + "\n"
             with open(path, "a") as f:
                 f.write(line)
         except Exception:
             pass  # Never crash hot loop for IPC write failure
+
+    @staticmethod
+    def _extract_ftp_code(response: bytes) -> str:
+        """Extract 3-digit FTP status code from server response bytes.
+
+        Reuses the validation pattern from _record_response_sample():
+        3 ASCII digits in range 100-599 followed by space or hyphen.
+
+        Args:
+            response: Raw bytes from the FTP server.
+
+        Returns:
+            Zero-padded 3-digit code string (e.g. ``"220"``),
+            or ``"000"`` if the response is not a valid FTP status line.
+        """
+        if len(response) >= 4 and response[:3].isdigit():
+            try:
+                code_val = int(response[:3])
+                if 100 <= code_val <= 599 and response[3:4] in (b" ", b"-"):
+                    return f"{code_val:03d}"
+            except ValueError:
+                pass
+        return "000"
+
+    def _classify_response(self, resp: bytes, payload: bytes) -> PacketStatus:
+        """Classify server response by protocol-specific status codes.
+
+        For FTP: uses 3-digit status codes (RFC 959):
+          - 2xx/3xx = ACCEPTED (server processed the command)
+          - 4xx/5xx = REJECTED (server refused/errored)
+
+        For non-FTP or unrecognized responses: defaults to ACCEPTED
+        (got bytes back = server is alive and responded).
+
+        Args:
+            resp:    Raw response bytes from the server.
+            payload: The original payload sent (for context).
+
+        Returns:
+            Appropriate PacketStatus enum value.
+        """
+        if not resp:
+            return PacketStatus.REJECTED
+        if self._is_ftp_target and len(resp) >= 3:
+            try:
+                code = int(resp[:3])
+                if 200 <= code < 400:
+                    return PacketStatus.ACCEPTED
+                elif 400 <= code < 600:
+                    return PacketStatus.REJECTED
+            except ValueError:
+                pass
+        # Default: got bytes back = accepted
+        return PacketStatus.ACCEPTED
+
+    def _track_rule_response(self, status: PacketStatus) -> None:
+        """Track per-rule-type response stats for LLM feedback.
+
+        Records accepted/rejected/timeout/crash counts grouped by the
+        mutation strategy that produced the current packet. Exposed via
+        the ``rule_response_stats`` property for the RulesOrchestrator
+        to build LLM response feedback.
+        """
+        rule_type = self._current_rule_type or "unknown"
+        if rule_type not in self._rule_response_stats:
+            self._rule_response_stats[rule_type] = {
+                "accepted": 0, "rejected": 0, "timeout": 0, "crash": 0,
+            }
+        key = status.value  # "accepted", "rejected", "timeout", "crash"
+        if key in self._rule_response_stats[rule_type]:
+            self._rule_response_stats[rule_type][key] += 1
+
+    @property
+    def rule_response_stats(self) -> dict[str, dict[str, int]]:
+        """Snapshot of per-rule-type response stats (for LLM feedback)."""
+        return dict(self._rule_response_stats)
+
+    def _write_rule_response_stats(self) -> None:
+        """Write per-rule-type response stats to shared JSON file.
+
+        Called every heartbeat (~5s) so the RulesOrchestrator can read
+        it and build LLM response feedback. Uses atomic write.
+        """
+        if not self._rule_response_stats:
+            return
+        try:
+            path = Path("shared/rule_response_stats.json")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._rule_response_stats, f)
+            tmp.rename(path)
+        except Exception:
+            pass  # Must not crash the hot loop
 
     def _poll_adaptive_k(self) -> None:
         """Poll shared/adaptive_k.json for EWMA controller updates.
@@ -1128,6 +1302,11 @@ class MutationEngine:
         Operates at sequence level: each SeedSequence is one unit.
         Rarely-used sequences get higher energy and are chosen more often.
 
+        Step 3 — STATE_NOVELTY boost: seeds that discovered new protocol
+        state edges receive a 5× energy multiplier, making them far more
+        likely to be selected. This drives deep-state exploration, similar
+        to AFL rewarding new code-branch discoveries.
+
         Uses acceptance-rejection sampling — O(1) expected time per
         selection regardless of corpus size.
         """
@@ -1140,10 +1319,14 @@ class MutationEngine:
         # Max energy is 1.0 (freq=0).  Acceptance-rejection:
         for _ in range(n + 10):  # bounded retries, fallback to uniform
             idx = random.randint(0, n - 1)
-            freq = self._seed_freq.get(self._corpus[idx].sequence_id, 0)
+            seq = self._corpus[idx]
+            freq = self._seed_freq.get(seq.sequence_id, 0)
             energy = 1.0 / (freq + 1)
-            if random.random() < energy:
-                return self._corpus[idx]
+            # STATE_NOVELTY boost: 5× acceptance for seeds that found new edges
+            if self._stg.is_novel_seed(seq.sequence_id):
+                energy *= StateTransitionGraph.NOVELTY_ENERGY_MULTIPLIER
+            if random.random() < min(energy, 1.0):
+                return seq
 
         # Fallback: uniform random (extremely unlikely to reach here)
         return self._corpus[random.randint(0, n - 1)]
@@ -1234,7 +1417,32 @@ class MutationEngine:
     # -------------------------------------------------------------------
 
     async def _build_mutant(self, seed: PacketRecord) -> bytes:
-        """Build one mutated packet using the active scheduler and rule set."""
+        """Build one mutated packet using the active scheduler and rule set.
+
+        Implements ε-greedy exploration (Task 3):
+            ε = 0.2 — with 20% probability, bypass LLM rules and apply
+            purely random havoc mutation via BinaryMutator to maintain
+            wide state-space coverage and prevent mode collapse.
+        """
+        # ── ε-greedy: exploration vs exploitation ──────────────────────
+        _EPSILON = 0.2
+        if random.random() < _EPSILON:
+            # EXPLORATION: bypass LLM rules, pure random/havoc mutation
+            buf = bytearray(seed.raw_bytes)
+            self._binary_mutator.mutate(buf)
+            result = bytes(buf)
+            self._last_injected_rule_id = "epsilon_explore"
+            self._current_rule_type = "epsilon_explore"
+            # Track mutation signatures for coverage proxy
+            if buf and len(buf) == len(seed.raw_bytes):
+                for i in range(len(buf)):
+                    if buf[i] != seed.raw_bytes[i]:
+                        self._mutation_signatures.add(f"explore:{i}:{buf[i]:02x}")
+            elif buf:
+                self._mutation_signatures.add(f"explore:len:{len(buf)}")
+            return result
+
+        # ── EXPLOITATION: structured LLM-guided mutation ───────────────
         # Snapshot rule set — avoid holding lock during mutation
         async with self._rule_lock:
             rule_set = self._rule_set
@@ -1245,17 +1453,28 @@ class MutationEngine:
                 self._mode = MutationMode.DUMB
                 self._stats.mode = "dumb"
                 self._stats.investigation_field = None
-                log.info("No rule set — entering DUMB mode")
+                log.info("No rule set — entering DUMB mode (BinaryMutator)")
 
             buf = bytearray(seed.raw_bytes)
-            result = self._dumb_mutate(buf)
+            # BinaryMutator: 14 strategies (bit_flip, interesting values,
+            # arithmetic, block operations) — AFL-class random fuzzing.
+            # Replaces the old single-bit-flip _dumb_mutate() so that
+            # Baseline A is a fair comparison against B and C.
+            self._binary_mutator.mutate(buf)  # in-place, no alloc
+            result = bytes(buf)
             # Clear rule attribution — no rule produced this mutation
             self._last_injected_rule_id = None
-            # Track mutation signature
+            self._current_rule_type = "dumb"
+            # Track mutation signatures for coverage proxy.
+            # BinaryMutator may change length (block_dup/del/truncate),
+            # so only track same-length mutations for offset coverage.
             if buf and len(buf) == len(seed.raw_bytes):
                 for i in range(len(buf)):
                     if buf[i] != seed.raw_bytes[i]:
                         self._mutation_signatures.add(f"dumb:{i}:{buf[i]:02x}")
+            elif buf:
+                # Length-changing mutation — track by total length as proxy
+                self._mutation_signatures.add(f"dumb:len:{len(buf)}")
             return result
 
         # Choose base payload
@@ -1307,10 +1526,47 @@ class MutationEngine:
         # Track which rules were applied for crash attribution
         if chosen:
             self._last_injected_rule_id = ",".join(f.field_name for f in chosen)
+            self._current_rule_type = chosen[0].mutation_strategy.value
         else:
             self._last_injected_rule_id = None
+            self._current_rule_type = None
 
         return bytes(base)
+
+    # -------------------------------------------------------------------
+    # FTP Protocol Enforcement
+    # -------------------------------------------------------------------
+
+    def _ensure_ftp_crlf(self, payload: bytes) -> bytes:
+        """Enforce CRLF (\\r\\n) packet termination for FTP targets.
+
+        FTP protocol requires every command to be terminated with CRLF (RFC 959).
+        If the target is an FTP server (port 21) and the payload doesn't end
+        with CRLF, append it. If it ends with bare LF, upgrade to CRLF.
+
+        Handles edge cases:
+            - Already ends with CRLF → pass through unchanged
+            - Ends with bare LF → upgrade to CRLF
+            - Ends with bare CR → append LF
+            - No terminator → append CRLF
+        """
+        if not self._is_ftp_target or not payload:
+            return payload
+
+        # Check if already properly terminated with CRLF
+        if payload.endswith(b"\r\n"):
+            return payload
+
+        # Bare LF → upgrade to CRLF
+        if payload.endswith(b"\n"):
+            return payload[:-1] + b"\r\n"
+
+        # Bare CR → append LF
+        if payload.endswith(b"\r"):
+            return payload + b"\n"
+
+        # No terminator → append CRLF
+        return payload + b"\r\n"
 
     # -------------------------------------------------------------------
     # Network Send
@@ -1318,6 +1574,9 @@ class MutationEngine:
 
     async def _send(self, payload: bytes, seed_id: str) -> PacketStatus:
         """Open a fresh TCP connection and send one mutated payload."""
+        # FTP CRLF enforcement: ensure packet ends with \r\n
+        payload = self._ensure_ftp_crlf(payload)
+
         status = PacketStatus.TIMEOUT
         writer = None
 
@@ -1330,21 +1589,24 @@ class MutationEngine:
             writer.write(payload)
             await writer.drain()
 
-            # EWMA Adaptive Controller: sample recv() every current_k-th packet
-            if self._should_recv():
-                self._recv_count += 1
-                try:
-                    resp = await asyncio.wait_for(
-                        reader.read(4096), timeout=self.recv_timeout
-                    )
-                    status = PacketStatus.ACCEPTED if resp else PacketStatus.REJECTED
-                    if resp:
-                        self._record_response_sample(resp)
-                except asyncio.TimeoutError:
-                    status = PacketStatus.TIMEOUT
-            else:
-                # Fire-and-forget: assume accepted, crash detected separately
-                status = PacketStatus.ACCEPTED
+            # Always read response — classify as accepted/rejected/timeout
+            self._recv_count += 1
+            try:
+                resp = await asyncio.wait_for(
+                    reader.read(4096), timeout=self.recv_timeout
+                )
+                if resp:
+                    status = self._classify_response(resp, payload)
+                    self._record_response_sample(resp)
+                    # Step 3: STG tracking for single-packet send (piggyback).
+                    if self._is_ftp_target:
+                        new_code = self._extract_ftp_code(resp)
+                        cmd = StateTransitionGraph.extract_ftp_command(payload)
+                        self._stg.record_edge("220", cmd, new_code, seed_id)
+                else:
+                    status = PacketStatus.REJECTED
+            except asyncio.TimeoutError:
+                status = PacketStatus.TIMEOUT
 
         except (ConnectionRefusedError, ConnectionResetError, BrokenPipeError):
             status = PacketStatus.CRASH
@@ -1370,7 +1632,7 @@ class MutationEngine:
             if writer is not None:
                 writer.close()
                 try:
-                    await writer.wait_closed()
+                    await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
                 except Exception:
                     pass
 
@@ -1393,6 +1655,9 @@ class MutationEngine:
         self, payload: bytes, seed_id: str
     ) -> PacketStatus:
         """Send setup packets + mutated payload on ONE TCP connection."""
+        # FTP CRLF enforcement
+        payload = self._ensure_ftp_crlf(payload)
+
         status = PacketStatus.TIMEOUT
         writer = None
 
@@ -1417,20 +1682,19 @@ class MutationEngine:
             writer.write(payload)
             await writer.drain()
 
-            # 3. Read final response — EWMA adaptive sampling
-            if self._should_recv():
-                self._recv_count += 1
-                try:
-                    resp = await asyncio.wait_for(
-                        reader.read(4096), timeout=self.recv_timeout
-                    )
-                    status = PacketStatus.ACCEPTED if resp else PacketStatus.REJECTED
-                    if resp:
-                        self._record_response_sample(resp)
-                except asyncio.TimeoutError:
-                    status = PacketStatus.TIMEOUT
-            else:
-                status = PacketStatus.ACCEPTED
+            # 3. Read final response — always read and classify
+            self._recv_count += 1
+            try:
+                resp = await asyncio.wait_for(
+                    reader.read(4096), timeout=self.recv_timeout
+                )
+                if resp:
+                    status = self._classify_response(resp, payload)
+                    self._record_response_sample(resp)
+                else:
+                    status = PacketStatus.REJECTED
+            except asyncio.TimeoutError:
+                status = PacketStatus.TIMEOUT
 
         except (ConnectionRefusedError, ConnectionResetError, BrokenPipeError):
             status = PacketStatus.CRASH
@@ -1455,7 +1719,7 @@ class MutationEngine:
             if writer is not None:
                 writer.close()
                 try:
-                    await writer.wait_closed()
+                    await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
                 except Exception:
                     pass
 
@@ -1489,9 +1753,21 @@ class MutationEngine:
 
         The returned PacketStatus reflects the server's response to the
         mutated target ONLY — prefix/suffix responses are drained but ignored.
+
+        Step 3 — STG Tracking:
+          Prefix responses are already read (then discarded). We capture them
+          for the StateTransitionGraph at zero extra cost. For the mutated
+          target, STG piggybacks on the existing _should_recv() gate.
         """
+        # FTP CRLF enforcement on the mutated target
+        mutated_payload = self._ensure_ftp_crlf(mutated_payload)
+
         status = PacketStatus.TIMEOUT
         writer = None
+
+        # Step 3: STG tracking — initial state for FTP is always 220 (banner).
+        # Track prev_code across the entire sequence to chain edges.
+        prev_code = "220"
 
         try:
             reader, writer = await asyncio.wait_for(
@@ -1504,29 +1780,52 @@ class MutationEngine:
                 writer.write(pkt_bytes)
                 await writer.drain()
                 try:
-                    await asyncio.wait_for(
-                        reader.read(4096), timeout=self.recv_timeout
-                    )
-                except (asyncio.TimeoutError, Exception):
-                    pass  # server may not respond to every prefix packet
-
-            # Step C: Send mutated target — EWMA adaptive sampling
-            writer.write(mutated_payload)
-            await writer.drain()
-
-            if self._should_recv():
-                self._recv_count += 1
-                try:
                     resp = await asyncio.wait_for(
                         reader.read(4096), timeout=self.recv_timeout
                     )
-                    status = PacketStatus.ACCEPTED if resp else PacketStatus.REJECTED
-                    if resp:
-                        self._record_response_sample(resp)
-                except asyncio.TimeoutError:
-                    status = PacketStatus.TIMEOUT
-            else:
-                status = PacketStatus.ACCEPTED
+                    # Step 3: capture prefix response for STG (already read,
+                    # previously discarded — zero extra cost).
+                    if resp and self._is_ftp_target:
+                        new_code = self._extract_ftp_code(resp)
+                        cmd = StateTransitionGraph.extract_ftp_command(pkt_bytes)
+                        self._stg.record_edge(
+                            prev_code, cmd, new_code, target.sequence_id
+                        )
+                        prev_code = new_code
+                except (asyncio.TimeoutError, Exception):
+                    pass  # server may not respond to every prefix packet
+
+            # Step C: Send mutated target — always read and classify response
+            writer.write(mutated_payload)
+            await writer.drain()
+
+            self._recv_count += 1
+            try:
+                resp = await asyncio.wait_for(
+                    reader.read(4096), timeout=self.recv_timeout
+                )
+                if resp:
+                    status = self._classify_response(resp, mutated_payload)
+                    self._record_response_sample(resp)
+                    # Step 3: STG tracking for mutated target (piggyback).
+                    if self._is_ftp_target:
+                        new_code = self._extract_ftp_code(resp)
+                        cmd = StateTransitionGraph.extract_ftp_command(
+                            mutated_payload
+                        )
+                        is_novel = self._stg.record_edge(
+                            prev_code, cmd, new_code, target.sequence_id
+                        )
+                        if is_novel:
+                            log.info(
+                                f"STATE_NOVELTY: new edge "
+                                f"({prev_code},{cmd},{new_code}) "
+                                f"seed={target.sequence_id[:8]}",
+                            )
+                else:
+                    status = PacketStatus.REJECTED
+            except asyncio.TimeoutError:
+                status = PacketStatus.TIMEOUT
 
             # Step D: Send suffix packets verbatim
             for pkt_bytes in target.suffix:
@@ -1648,6 +1947,9 @@ class MutationEngine:
                     "recv_rate": f"{self._recv_count / max(1, self._stats.total_sent):.1%}",
                 }},
             )
+
+            # Write rule response stats to shared file for LLM feedback
+            self._write_rule_response_stats()
 
 
 # ===========================================================================

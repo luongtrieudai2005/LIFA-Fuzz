@@ -29,6 +29,14 @@ from shared.logger import get_logger
 
 log = get_logger("slow_loop.ewma_controller")
 
+# FTP Response Analyzer — rewards deep auth states with higher recv intensity
+from slow_loop.ftp_response_analyzer import (
+    FTPResponseAnalyzer,
+    FTPAuthDepth,
+    _FTP_STATUS_MAP,
+    extract_ftp_status_codes,
+)
+
 
 class EWMAController:
     """EWMA Adaptive Controller for Fast Loop recv() sampling.
@@ -144,14 +152,18 @@ class EWMAController:
     # ------------------------------------------------------------------
 
     def _read_and_truncate_response_buffer(self) -> int:
-        """Read response_buffer.jsonl, count unique hex_prefix, then truncate.
+        """Read response_buffer.jsonl, count unique hex_prefix + FTP auth depth, then truncate.
 
         Uses atomic rename-swap to prevent data loss: first renames the live
         file to a staging name, then reads from staging. Any new Fast Loop
         writes during processing go to a fresh file (open("a") creates it).
 
+        For FTP targets: additionally parses response bytes for 3-digit FTP
+        status codes and boosts proxy_B proportionally to auth depth reached.
+        Deep authentication (code 230) yields 3× reward vs pre-auth (code 220).
+
         Returns:
-            Number of unique response hex prefixes (proxy for response diversity).
+            Effective response diversity score (unique prefixes × auth bonus).
         """
         buf_path = self.response_buf_path
         if not buf_path.exists():
@@ -177,8 +189,10 @@ class EWMAController:
                 pass
             return 0
 
-        # Step 3: Count unique hex_prefix values
+        # Step 3: Count unique hex_prefix values + FTP auth depth
         unique_prefixes: set[str] = set()
+        ftp_codes_seen: set[str] = set()
+
         for line in lines:
             line = line.strip()
             if not line:
@@ -188,16 +202,55 @@ class EWMAController:
                 hp = entry.get("hex_prefix", "")
                 if hp:
                     unique_prefixes.add(hp)
+
+                # FTP status code extraction — boost reward for deep auth states
+                ftp_code = entry.get("ftp_status_code", "")
+                if ftp_code:
+                    ftp_codes_seen.add(ftp_code)
             except (json.JSONDecodeError, AttributeError):
                 continue
 
-        # Step 4: Delete staging file (data has been consumed)
+        # Step 4: Compute effective diversity with FTP auth depth bonus
+        diversity = len(unique_prefixes)
+
+        if ftp_codes_seen:
+            # Parse each FTP status code and find the maximum auth depth
+            # (modules already imported at file top)
+            max_depth = FTPAuthDepth.PRE_AUTH
+            for code in ftp_codes_seen:
+                if code in _FTP_STATUS_MAP:
+                    depth = _FTP_STATUS_MAP[code][0]
+                else:
+                    # Unknown code — infer from class (first digit)
+                    depth = FTPResponseAnalyzer._infer_depth_from_class(code)
+                if depth > max_depth:
+                    max_depth = depth
+
+            # Auth depth multiplier:
+            #   PRE_AUTH (0) → 1.0× (no bonus)
+            #   USER_ACCEPTED (1) → 2.0× (doubled — USER handler exercised)
+            #   AUTHENTICATED (2) → 3.0× (tripled — deep code paths exercised)
+            auth_multiplier = {
+                FTPAuthDepth.PRE_AUTH: 1.0,
+                FTPAuthDepth.USER_ACCEPTED: 2.0,
+                FTPAuthDepth.AUTHENTICATED: 3.0,
+            }.get(max_depth, 1.0)
+
+            diversity = round(diversity * auth_multiplier)
+
+            log.debug(
+                f"FTP auth depth bonus: max_depth={max_depth.name}, "
+                f"codes={ftp_codes_seen}, multiplier={auth_multiplier:.1f}×, "
+                f"effective_diversity={diversity}"
+            )
+
+        # Step 5: Delete staging file (data has been consumed)
         try:
             staging.unlink(missing_ok=True)
         except OSError:
             pass
 
-        return len(unique_prefixes)
+        return diversity
 
     # ------------------------------------------------------------------
     # IPC: Write adaptive_k.json (atomic)

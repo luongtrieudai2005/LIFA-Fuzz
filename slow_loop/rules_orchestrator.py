@@ -103,7 +103,10 @@ def packet_signature(
             fingerprint ^= int(chunk, 16) if len(chunk) == 8 else int(chunk, 16)
         content_hash = f"{fingerprint:08x}"[-6:]  # last 6 hex digits
     else:
-        content_hash = body  # short body — use as-is
+        # Short body — use full packet hex as content_hash to avoid
+        # empty-string collisions that over-deduplicate short packets
+        # (e.g., ACKs, status bytes, single-byte protocol messages).
+        content_hash = packet_hex if not body else body
 
     return f"{prefix}:{length}:{content_hash}"
 
@@ -132,6 +135,10 @@ class SlidingWindow:
         self.prefix_bytes = prefix_bytes
         # OrderedDict preserves insertion order; we use it as LRU
         self._buffer: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        # Incremental inference: tracks which packet signatures have been
+        # sent to the LLM.  Prevents re-sending the same packets across
+        # cycles, reducing token consumption from O(N) to O(ΔN).
+        self._inferred_sigs: set[str] = set()
 
     def add(self, packet: dict[str, Any]) -> bool:
         """Add a packet to the buffer. Returns True if it was new.
@@ -152,9 +159,10 @@ class SlidingWindow:
             self._buffer.move_to_end(sig)
         self._buffer[sig] = packet
 
-        # Evict oldest if over capacity
+        # Evict oldest if over capacity; also prune their inferred status
         while len(self._buffer) > self.max_entries:
-            self._buffer.popitem(last=False)
+            evicted_sig, _ = self._buffer.popitem(last=False)
+            self._inferred_sigs.discard(evicted_sig)
 
         return is_new
 
@@ -220,6 +228,91 @@ class SlidingWindow:
 
         return result[:n]
 
+    # -----------------------------------------------------------------
+    # Incremental Inference: Unseen Packet Tracking
+    # -----------------------------------------------------------------
+
+    def mark_inferred(self, sigs: set[str]) -> None:
+        """Mark packet signatures as having been sent to the LLM.
+
+        Called by RulesOrchestrator after a successful LLM inference.
+        Future ``get_unseen_samples()`` calls will skip these signatures,
+        ensuring the LLM only receives genuinely new traffic data.
+
+        Args:
+            sigs: Set of packet signatures that were included in the
+                  LLM prompt for this cycle.
+        """
+        self._inferred_sigs.update(sigs)
+
+    def get_unseen_samples(self, n: int) -> list[dict[str, Any]]:
+        """Select up to N diverse packets NOT yet sent to the LLM.
+
+        Uses the same round-robin diversity strategy as
+        ``get_diverse_sample()``, but restricted to the subset of the
+        buffer whose signatures are not in ``_inferred_sigs``.
+
+        This is the core of the incremental inference optimisation:
+        instead of re-sending the full window every cycle, only truly
+        new packets are forwarded to the LLM.
+
+        Args:
+            n: Maximum number of unseen packets to return.
+
+        Returns:
+            List of up to N diverse unseen packet dicts.
+        """
+        # Filter buffer to only unseen entries
+        unseen: OrderedDict[str, dict[str, Any]] = OrderedDict(
+            (sig, pkt)
+            for sig, pkt in self._buffer.items()
+            if sig not in self._inferred_sigs
+        )
+
+        if len(unseen) <= n:
+            return list(unseen.values())
+
+        # Same round-robin diversity selection, restricted to unseen
+        groups: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
+        for sig, pkt in unseen.items():
+            prefix = sig.split(":")[0]
+            if prefix not in groups:
+                groups[prefix] = []
+            groups[prefix].append(pkt)
+
+        result: list[dict[str, Any]] = []
+        group_keys = list(groups.keys())
+
+        while len(result) < n and group_keys:
+            exhausted: list[str] = []
+            for key in group_keys:
+                if groups[key]:
+                    result.append(groups[key].pop(0))
+                if not groups[key]:
+                    exhausted.append(key)
+                if len(result) >= n:
+                    break
+            for key in exhausted:
+                if key in group_keys:
+                    group_keys.remove(key)
+            if not group_keys:
+                break
+
+        return result[:n]
+
+    @property
+    def unseen_count(self) -> int:
+        """Number of packets in the window that have NOT been sent to the LLM."""
+        return sum(1 for sig in self._buffer if sig not in self._inferred_sigs)
+
+    def reset_inferred(self) -> None:
+        """Clear all inferred markers — forces a full re-inference on next cycle.
+
+        Called when ``re_infer_interval_s`` triggers a scheduled full
+        re-analysis of the entire sliding window.
+        """
+        self._inferred_sigs.clear()
+
     @property
     def size(self) -> int:
         """Current number of unique packets in the buffer."""
@@ -260,11 +353,11 @@ class RulesOrchestrator:
         max_packets_per_inference: int = 20,
         window_size: int = 200,
         max_prompt_tokens: int = 0,
-        min_packets_before_infer: int = 5,
+        min_packets_before_infer: int = 2,
         crash_manager: Any = None,
         ab_mode: str = "llm",
         ewma_controller: Optional[EWMAController] = None,
-        re_infer_interval_s: float = 300.0,
+        re_infer_interval_s: float = 30.0,
     ) -> None:
         self.parser = parser
         self.agent = agent
@@ -315,6 +408,12 @@ class RulesOrchestrator:
         self._ab_cycle_counter: int = 0
         self._ab_results_log: list[dict] = []
 
+        # Incremental inference: stores a condensed summary of the last
+        # successful LLM grammar so the next cycle can UPDATE rather
+        # than re-derive from scratch.  Set to None on first cycle or
+        # after a forced full re-inference.
+        self._previous_grammar_summary: Optional[dict[str, Any]] = None
+
     # -----------------------------------------------------------------
     # Main Pipeline
     # -----------------------------------------------------------------
@@ -337,9 +436,13 @@ class RulesOrchestrator:
         t0 = time.monotonic()
         self._total_cycles += 1
 
-        # M3 fix: Reset EWMA epoch timer at the START of every cycle so that
-        # skipped cycles (insufficient data) don't inflate the next epoch.
-        self._ewma_epoch_start = time.monotonic()
+        # EWMA epoch timer: do NOT reset here.
+        # _ewma_epoch_start tracks the time of the LAST SUCCESSFUL EWMA update.
+        # Removing the reset fixes Baseline B (Math-Only) where fast cycles
+        # (<5s) never triggered EWMA, leaving adaptive sampling stuck at K_max.
+        # Skipped cycles naturally accumulate epoch time, which correctly
+        # reduces the coverage rate (delta_C / wall_time) when no new
+        # protocol structure is being discovered.
 
         try:
             # ── 1. Read traffic log ─────────────────────────────────
@@ -397,21 +500,38 @@ class RulesOrchestrator:
                     f"Forcing cycle with {self._window.size} buffered packets."
                 )
 
-            # ── 4. Select diverse samples ───────────────────────────
-            selected = self._window.get_diverse_sample(
+            # ── 4a. Select FULL diverse samples (for math analysis) ──
+            full_selected = self._window.get_diverse_sample(
                 self.max_packets_per_inference
             )
 
-            if not selected:
+            if not full_selected:
                 return {
                     "status": "skipped",
                     "reason": "No diverse samples available",
                     "packets_available": 0,
                 }
 
+            # ── 4b. Select UNSEEN diverse samples (for LLM) ─────────
+            # Incremental inference: only send new packets to the LLM,
+            # along with a summary of the previous grammar so the LLM
+            # can UPDATE rather than re-derive from scratch.
+            # On scheduled re-inference, reset inferred markers so ALL
+            # buffer packets become eligible again (periodic full sweep),
+            # then use the full diverse sample.
+            if re_infer_due:
+                self._window.reset_inferred()
+                llm_selected = full_selected
+            else:
+                llm_selected = self._window.get_unseen_samples(
+                    self.max_packets_per_inference
+                )
+
             # ── 5. Differential Analysis (Math Layer) ───────────────
+            # Math runs on the FULL diverse sample for accurate statistics,
+            # even if only a subset (the unseen packets) goes to the LLM.
             math_hint: Optional[str] = None
-            raw_packets = self._extract_raw_bytes(selected)
+            raw_packets = self._extract_raw_bytes(full_selected)
             if len(raw_packets) >= self._analyzer.min_packets:
                 try:
                     heatmap = self._analyzer.analyze(raw_packets)
@@ -431,9 +551,26 @@ class RulesOrchestrator:
                     f"(need {self._analyzer.min_packets}, have {len(raw_packets)})"
                 )
 
-            # ── 6. Build LLM payload ───────────────────────────────
+            # ── 5b. Skip LLM if no unseen packets ───────────────────
+            # Incremental optimisation: if all diverse samples have already
+            # been sent to the LLM, there is nothing new to learn.
+            # Still update EWMA with the latest math analysis.
+            if not llm_selected and not re_infer_due:
+                self._update_ewma()
+                return {
+                    "status": "skipped",
+                    "reason": (
+                        f"No unseen packets for incremental inference "
+                        f"(window={self._window.size}, "
+                        f"unseen={self._window.unseen_count})"
+                    ),
+                    "packets_available": self._window.size,
+                    "unseen": self._window.unseen_count,
+                }
+
+            # ── 6. Build LLM payload (from unseen samples) ──────────
             fake_session = InteractionSession(session_id=0)
-            for pkt in selected:
+            for pkt in llm_selected:
                 fake_session.add_packet(pkt)
 
             payload = self.parser.format_for_llm([fake_session])
@@ -441,6 +578,18 @@ class RulesOrchestrator:
             # ── 7. Token budget check ───────────────────────────────
             payload_str = json.dumps(payload, ensure_ascii=False)
             estimated_tokens = estimate_tokens(payload_str)
+            # Also count tokens from injected prompt components that the
+            # LLM agent will add (math_hint, previous_grammar, response_feedback).
+            if math_hint:
+                estimated_tokens += estimate_tokens(math_hint)
+            if self._previous_grammar_summary:
+                estimated_tokens += estimate_tokens(
+                    json.dumps(self._previous_grammar_summary, ensure_ascii=False)
+                )
+            # Build response feedback early so we can count its tokens.
+            response_feedback = self._build_response_feedback()
+            if response_feedback:
+                estimated_tokens += estimate_tokens(response_feedback)
 
             if self.max_prompt_tokens > 0 and estimated_tokens > self.max_prompt_tokens:
                 self._skipped_budget += 1
@@ -471,6 +620,10 @@ class RulesOrchestrator:
                         "  Budget exhausted but LLM rules already active — "
                         "skipping bootstrap overwrite"
                     )
+
+                # Update EWMA even on budget skip to prevent epoch accumulation
+                # that would cause a mode shock when budget is restored.
+                self._update_ewma()
 
                 return {
                     "status": "skipped",
@@ -529,10 +682,20 @@ class RulesOrchestrator:
                         "packets_available": self._window.size,
                     }
 
-            # ── 9. Call LLM with math hint ──────────────────────────
+            # ── 9. Crash isolation check (before LLM call) ──────────
+            # Must run regardless of LLM success/failure — crashes occur
+            # independently of grammar inference.
+            if self.crash_manager:
+                await self._check_crash_isolation()
+
+            # ── 10. Call LLM with math hint + response feedback ──────
+            # response_feedback was already built at step 7 for token budget.
             try:
                 grammar = await self.agent.infer_protocol(
-                    payload, math_hint=math_hint
+                    payload,
+                    math_hint=math_hint,
+                    previous_grammar_summary=self._previous_grammar_summary,
+                    response_feedback=response_feedback,
                 )
                 self._total_inferences += 1
                 self._last_inference_time = time.monotonic()  # Reset timer
@@ -540,6 +703,13 @@ class RulesOrchestrator:
                 # LLM failed → fall back to bootstrap rules from heatmap
                 self._errors += 1
                 self._last_error = str(llm_err)
+                # BUG 4 fix: reset inference timer so re_infer_due won't
+                # fire again immediately, causing an infinite full-buffer
+                # retransmit loop during LLM outages.
+                self._last_inference_time = time.monotonic()
+                # BUG 3 fix: allow bootstrap fallback to activate again
+                # on next cycle so the fuzzer can recover from stale rules.
+                self._llm_rules_active = False
                 logger.warning(
                     f"  LLM inference failed: {llm_err}"
                 )
@@ -593,9 +763,24 @@ class RulesOrchestrator:
                     # bootstrap fallback won't overwrite them.
                     self._llm_rules_active = True
 
-            # ── 10. Crash isolation check ───────────────────────────
-            if self.crash_manager:
-                await self._check_crash_isolation()
+            # ── 9b. Incremental: mark inferred + store grammar ───────
+            # Track which packets have been sent to the LLM so future
+            # cycles can skip them (incremental inference).
+            llm_sigs = {
+                packet_signature(
+                    pkt.get("payload", ""),
+                    self._window.prefix_bytes,
+                )
+                for pkt in llm_selected
+                if pkt.get("payload")
+            }
+            self._window.mark_inferred(llm_sigs)
+            self._previous_grammar_summary = self._condense_grammar(grammar)
+            logger.info(
+                f"  Incremental: {len(llm_sigs)} packets inferred "
+                f"(unseen_remaining={self._window.unseen_count}, "
+                f"window={self._window.size})"
+            )
 
             # ── 11. EWMA Adaptive Controller update ──────────────────
             self._update_ewma()
@@ -623,7 +808,7 @@ class RulesOrchestrator:
                 "status": "success",
                 "grammar": grammar,
                 "rules": rules,
-                "packets_sent": len(selected),
+                "packets_sent": len(llm_selected),
                 "packets_available": self._window.size,
                 "unique_types": self._window.unique_prefixes,
                 "heatmap_groups": (
@@ -637,6 +822,8 @@ class RulesOrchestrator:
             # LLM parse errors — non-fatal, try bootstrap fallback
             self._errors += 1
             self._last_error = str(e)
+            self._last_inference_time = time.monotonic()
+            self._llm_rules_active = False
             logger.error(f"LLM parse error in cycle #{self._total_cycles}: {e}")
 
             # EWMA: update even on error so k stays current
@@ -674,6 +861,8 @@ class RulesOrchestrator:
             # LLM API errors — non-fatal, try bootstrap fallback
             self._errors += 1
             self._last_error = str(e)
+            self._last_inference_time = time.monotonic()
+            self._llm_rules_active = False
             logger.error(f"LLM API error in cycle #{self._total_cycles}: {e}")
 
             # EWMA: update even on error so k stays current
@@ -711,6 +900,8 @@ class RulesOrchestrator:
             # Unexpected errors — log and continue
             self._errors += 1
             self._last_error = str(e)
+            self._last_inference_time = time.monotonic()
+            self._llm_rules_active = False
             logger.error(
                 f"Unexpected error in cycle #{self._total_cycles}: {e}",
                 exc_info=True,
@@ -742,6 +933,8 @@ class RulesOrchestrator:
             "skipped_insufficient_data": self._skipped_insufficient_data,
             "errors": self._errors,
             "bootstrap_count": self._bootstrap_count,
+            "unseen_packets": self._window.unseen_count,
+            "has_previous_grammar": self._previous_grammar_summary is not None,
             "ab_mode": self.ab_mode,
             "ab_cycle_counter": self._ab_cycle_counter,
             "precision_mode": self._precision_mode,
@@ -796,6 +989,111 @@ class RulesOrchestrator:
                     continue
         return raw
 
+    def _build_response_feedback(self) -> Optional[str]:
+        """Build response feedback text from mutator's rule response stats.
+
+        Collects per-rule-type accepted/rejected/timeout/crash counts and
+        formats them as a text block for the LLM.  This creates a
+        closed-loop feedback cycle: the LLM sees how its rules performed
+        and can adjust offsets, types, and strategies accordingly.
+
+        Returns:
+            Formatted feedback string, or None if no data available.
+        """
+        # Read response stats from shared file written by mutator
+        try:
+            from pathlib import Path as _Path
+            stats_path = _Path("shared/rule_response_stats.json")
+            if not stats_path.exists():
+                return None
+            import json as _json
+            data = _json.loads(stats_path.read_text(encoding="utf-8"))
+            if not data:
+                return None
+        except Exception:
+            return None
+
+        # Check if we have previous grammar to reference
+        has_previous = self._previous_grammar_summary is not None
+        total_rules = len(self._previous_grammar_summary.get("fields", [])) if has_previous else 0
+
+        lines = [
+            "## RESPONSE FEEDBACK FROM PREVIOUS RULES",
+            "",
+        ]
+        if has_previous:
+            lines.append(
+                f"Your previous grammar generated rules for {total_rules} fields. "
+                f"Here is how the server responded to mutations:",
+            )
+        else:
+            lines.append(
+                "The fuzzer has been running. Here are the server response "
+                "statistics by mutation strategy:",
+            )
+
+        lines.append("")
+        lines.append(
+            "  Strategy         | Accepted | Rejected | Timeout | Crash | Total"
+        )
+        lines.append(
+            "------------------+----------+----------+---------+-------+------"
+        )
+
+        grand_total = 0
+        grand_accepted = 0
+        for strategy, counts in data.items():
+            accepted = counts.get("accepted", 0)
+            rejected = counts.get("rejected", 0)
+            timeout = counts.get("timeout", 0)
+            crash = counts.get("crash", 0)
+            total = accepted + rejected + timeout + crash
+            if total == 0:
+                continue
+            grand_total += total
+            grand_accepted += accepted
+            lines.append(
+                f"  {strategy:<17s} | {accepted:>8,} | {rejected:>8,} | "
+                f"{timeout:>7,} | {crash:>5,} | {total:>5,}"
+            )
+
+        if grand_total == 0:
+            return None
+
+        lines.append("")
+        acceptance_rate = grand_accepted / grand_total * 100
+        lines.append(
+            f"Overall acceptance rate: {acceptance_rate:.1f}% "
+            f"({grand_accepted:,}/{grand_total:,})"
+        )
+
+        # Analysis guidance
+        lines.append("")
+        lines.append("ANALYSIS GUIDANCE:")
+        if acceptance_rate < 30:
+            lines.append(
+                "- VERY LOW acceptance rate — most field offsets are likely WRONG"
+            )
+            lines.append(
+                "  Re-examine byte boundaries carefully and try different offsets"
+            )
+        elif acceptance_rate < 60:
+            lines.append(
+                "- Moderate acceptance rate — some fields are correct, others wrong"
+            )
+            lines.append(
+                "  Focus on strategies with HIGH rejection to fix incorrect fields"
+            )
+        else:
+            lines.append(
+                "- Good acceptance rate — your grammar is mostly accurate"
+            )
+            lines.append(
+                "  Focus on deepening coverage of correctly identified fields"
+            )
+
+        return "\n".join(lines)
+
     def _convert_field_rules(
         self, field_rules: list[FieldRule]
     ) -> list[SemanticRule]:
@@ -817,6 +1115,20 @@ class RulesOrchestrator:
             if fr.mutation_strategy == MutationStrategy.SKIP:
                 continue
             end = fr.offset + fr.length if fr.length > 0 else 65535
+
+            # STATIC fields: set preserve_bytes + mutation_strategy_override
+            # so the mutator's get_static_fields() picks them up and
+            # get_mutable_fields() excludes them (magic bytes preserved).
+            preserve = b""
+            strategy_override = None
+            if fr.mutation_strategy == MutationStrategy.STATIC:
+                if fr.static_value:
+                    try:
+                        preserve = bytes.fromhex(fr.static_value)
+                    except ValueError:
+                        pass
+                strategy_override = MutationStrategy.STATIC
+
             rule = SemanticRule(
                 rule_type=self._strategy_to_rule_type(fr.mutation_strategy),
                 target_field_name=fr.field_name,
@@ -824,11 +1136,51 @@ class RulesOrchestrator:
                 offset_start=fr.offset,
                 offset_end=end,
                 field_type=self._infer_field_type(fr),
+                preserve_bytes=preserve,
                 priority=fr.confidence,
                 description=fr.notes or f"Bootstrap rule from DifferentialAnalyzer",
+                dictionary_values=fr.dictionary_values if fr.dictionary_values else [],
+                mutation_strategy_override=strategy_override,
             )
             rules.append(rule)
         return rules
+
+    @staticmethod
+    def _condense_grammar(grammar: ProtocolGrammar) -> dict[str, Any]:
+        """Create a token-efficient summary of a ProtocolGrammar.
+
+        The summary includes field names, offsets, types, and strategies —
+        enough context for the LLM to UPDATE its understanding without
+        re-deriving from scratch on the next cycle.
+
+        Args:
+            grammar: The ProtocolGrammar from a successful LLM inference.
+
+        Returns:
+            A dict suitable for ``_format_previous_grammar()`` in LLMAgent.
+        """
+        return {
+            "protocol_name": grammar.protocol_name,
+            "magic_bytes": grammar.magic_bytes,
+            "total_header_size": grammar.total_header_size,
+            "min_packet_size": grammar.min_packet_size,
+            "max_packet_size": grammar.max_packet_size,
+            "confidence": grammar.confidence,
+            "reasoning": grammar.reasoning,
+            "fields": [
+                {
+                    "name": f.name,
+                    "offset_start": f.offset_start,
+                    "offset_end": f.offset_end,
+                    "field_type": f.field_type.value,
+                    "mutation_strategy": f.mutation_strategy.value,
+                    "is_constant": f.is_constant,
+                    "possible_values": f.possible_values,
+                    "description": f.description,
+                }
+                for f in grammar.fields
+            ],
+        }
 
     @staticmethod
     def _strategy_to_rule_type(strategy: Any) -> RuleType:
@@ -843,6 +1195,8 @@ class RulesOrchestrator:
             MutationStrategy.INCREMENT: RuleType.STRUCTURAL,
             MutationStrategy.CALCULATED: RuleType.BOUNDARY,
             MutationStrategy.DICTIONARY: RuleType.STRUCTURAL,
+            MutationStrategy.FORMAT_STRING: RuleType.STRUCTURAL,
+            MutationStrategy.TRUNCATE: RuleType.STRUCTURAL,
             MutationStrategy.SKIP: RuleType.BIT_FLIP,
         }
         return mapping.get(strategy, RuleType.BIT_FLIP)

@@ -374,6 +374,12 @@ class FirecrackerSandbox(BaseSandbox):
         socket_path:      Path for the Firecracker UDS socket.
     """
 
+    # LightFTP is pre-baked into rootfs (all-in-one Docker build):
+    #   /usr/local/bin/fftp  (ASAN-compiled, static-linked)
+    #   /etc/fftp.conf       (bind 0.0.0.0:21)
+    #   /init                (boots directly to fftp, no SSH)
+    LIGHTFTP_BINARY = "/usr/local/bin/fftp"
+
     def __init__(
         self,
         binary_path: str = "sandbox/firecracker_env/firecracker",
@@ -393,19 +399,25 @@ class FirecrackerSandbox(BaseSandbox):
         # Target-aware defaults for rootfs and kernel args
         fc_env = "sandbox/firecracker_env"
         if not rootfs_path:
-            if target_name == "lighttpd":
+            if target_name == "lightftp":
+                rootfs_path = f"{fc_env}/rootfs_lightftp.ext4"
+            elif target_name == "lighttpd":
                 rootfs_path = f"{fc_env}/rootfs_lighttpd.ext4"
             else:
                 rootfs_path = f"{fc_env}/rootfs.ext4"
         if not kernel_args:
             base_args = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw"
-            if target_name == "lighttpd":
+            if target_name in ("lighttpd", "lightftp"):
                 kernel_args = f"{base_args} init=/init"
             else:
                 kernel_args = (
                     f"{base_args} init=/bin/vulnerable_server"
                     " ip=172.16.0.2::172.16.0.1:255.255.255.0::eth0:off"
                 )
+
+        # LightFTP listens on port 21 by default
+        if target_name == "lightftp" and target_port == 9000:
+            target_port = 21
 
         self.binary_path = Path(binary_path)
         self.vmlinux_path = Path(vmlinux_path)
@@ -429,6 +441,49 @@ class FirecrackerSandbox(BaseSandbox):
         self._last_exit_code: Optional[int] = None
         self._last_exit_time: float = 0.0
         self._serial_output: str = ""
+
+    def _apply_target_defaults(self) -> None:
+        """Re-apply target-aware defaults after config overrides.
+
+        Called by main.py after setting config attributes via setattr().
+        Recomputes rootfs_path, kernel_args, and target_port based on
+        the current target_name.
+        """
+        fc_env = "sandbox/firecracker_env"
+        # Coerce to Path in case config override set a raw string
+        self.rootfs_path = Path(self.rootfs_path)
+        self.binary_path = Path(self.binary_path)
+        self.vmlinux_path = Path(self.vmlinux_path)
+        self.snapshot_dir = Path(self.snapshot_dir)
+        self.socket_path = Path(self.socket_path)
+
+        # Only update rootfs if it still points to the default
+        default_rootfs = f"{fc_env}/rootfs.ext4"
+        if str(self.rootfs_path) == default_rootfs or not self.rootfs_path.name:
+            if self.target_name == "lightftp":
+                self.rootfs_path = Path(f"{fc_env}/rootfs_lightftp.ext4")
+            elif self.target_name == "lighttpd":
+                self.rootfs_path = Path(f"{fc_env}/rootfs_lighttpd.ext4")
+
+        # Update kernel args for init-based targets
+        if self.target_name in ("lighttpd", "lightftp"):
+            base_args = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw"
+            if "init=/init" not in self.kernel_args:
+                self.kernel_args = f"{base_args} init=/init"
+
+        # LightFTP listens on port 21
+        if self.target_name == "lightftp" and self.target_port == 9000:
+            self.target_port = 21
+
+        logger.info(
+            "Firecracker target defaults applied",
+            extra={"context": {
+                "target_name": self.target_name,
+                "rootfs_path": str(self.rootfs_path),
+                "target_port": self.target_port,
+                "kernel_args": self.kernel_args,
+            }},
+        )
 
     # -----------------------------------------------------------------
     # Prerequisites Check
@@ -606,11 +661,14 @@ class FirecrackerSandbox(BaseSandbox):
             ) from e
 
         # 8. Wait for target server to be ready
-        ready = await self._wait_for_target_tcp(timeout_s=15.0)
+        # LightFTP is pre-baked into rootfs (all-in-one Docker build),
+        # no SSH provisioning needed — boots directly to fftp on port 21.
+        boot_timeout = 15.0
+        ready = await self._wait_for_target_tcp(timeout_s=boot_timeout)
         if not ready:
             await self._kill_process()
             raise SandboxStartError(
-                f"Target server did not become ready within 15s",
+                f"Target server did not become ready within {boot_timeout}s",
                 driver="firecracker",
             )
         logger.info(

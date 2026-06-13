@@ -41,7 +41,7 @@ logger.addHandler(_handler)
 # ── Configuration (overridable via env vars) ─────────────────────
 TARGET_HOST = os.environ.get("TARGET_HOST", "127.0.0.1")
 TARGET_PORT = int(os.environ.get("TARGET_PORT", "8001"))
-SEND_INTERVAL_MS = int(os.environ.get("SEND_INTERVAL_MS", "1000"))
+SEND_INTERVAL_MS = int(os.environ.get("SEND_INTERVAL_MS", "100"))
 
 # ── Protocol Constants ────────────────────────────────────────────
 MAGIC = b"LIFA"                   # 0x4C 0x49 0x46 0x41

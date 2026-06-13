@@ -516,6 +516,27 @@ class SemanticRule(BaseModel):
     hit_count: int = Field(default=0, ge=0)
     crash_count: int = Field(default=0, ge=0)
     description: str = ""
+    # ── Semantic enrichment fields ────────────────────────────────────
+    # Preserve LLM-inferred enum values and strategy overrides so the
+    # Fast Loop mutator can use targeted mutations (DICTIONARY, FORMAT_STRING)
+    # instead of falling back to generic RANDOM_BYTES.
+    dictionary_values: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Known-interesting hex values for DICTIONARY mutation strategy. "
+            "Populated from LLM-inferred enum possible_values or math-layer "
+            "LOW_ENTROPY discrete values. When non-empty, the mutator picks "
+            "from these values instead of random bytes."
+        ),
+    )
+    mutation_strategy_override: Optional[MutationStrategy] = Field(
+        default=None,
+        description=(
+            "If set, overrides the _rule_type_to_strategy() mapping for this "
+            "rule. Enables strategies like FORMAT_STRING and TRUNCATE that "
+            "don't have a dedicated RuleType enum value."
+        ),
+    )
 
     @field_serializer("preserve_bytes")
     def serialize_preserve_bytes(self, data: bytes, _info: Any) -> str:
@@ -653,7 +674,11 @@ class ActiveRuleSet(BaseModel):
         """
         result: list[FieldRule] = []
         for r in self.rules:
-            strategy = _rule_type_to_strategy(r.rule_type)
+            strategy = _rule_type_to_strategy(
+                r.rule_type,
+                dictionary_values=r.dictionary_values,
+                mutation_strategy_override=r.mutation_strategy_override,
+            )
             if strategy != MutationStrategy.STATIC:
                 result.append(FieldRule(
                     field_name=r.target_field_name,
@@ -663,6 +688,7 @@ class ActiveRuleSet(BaseModel):
                     static_value=r.preserve_bytes.hex() if r.preserve_bytes else None,
                     confidence=r.priority,
                     data_type=r.field_type,
+                    dictionary_values=r.dictionary_values if r.dictionary_values else None,
                 ))
         return result
 
@@ -703,8 +729,25 @@ class ActiveRuleSet(BaseModel):
         return result
 
 
-def _rule_type_to_strategy(rule_type: RuleType) -> MutationStrategy:
-    """Map a SemanticRule's RuleType to a MutationStrategy for scheduling."""
+def _rule_type_to_strategy(
+    rule_type: RuleType,
+    dictionary_values: list[str] | None = None,
+    mutation_strategy_override: MutationStrategy | None = None,
+) -> MutationStrategy:
+    """Map a SemanticRule's RuleType to a MutationStrategy for scheduling.
+
+    Priority order:
+        1. mutation_strategy_override — explicit per-rule override (FORMAT_STRING, etc.)
+        2. dictionary_values — non-empty list triggers DICTIONARY strategy
+        3. RuleType → MutationStrategy mapping — default mapping
+    """
+    # Explicit override takes highest priority
+    if mutation_strategy_override is not None:
+        return mutation_strategy_override
+    # Non-empty dictionary_values → DICTIONARY strategy
+    if dictionary_values:
+        return MutationStrategy.DICTIONARY
+    # Default mapping
     mapping = {
         RuleType.BIT_FLIP: MutationStrategy.BIT_FLIP,
         RuleType.BOUNDARY: MutationStrategy.BOUNDARY_VALUES,

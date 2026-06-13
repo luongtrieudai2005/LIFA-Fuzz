@@ -140,11 +140,54 @@ class CrashMonitor:
                 alive = await self.sandbox.is_target_alive()
 
                 if was_alive and not alive:
-                    # State transition: running → crashed
-                    logger.error("CRASH DETECTED — target server is down!")
+                    # ── Verification step (Fix 1): confirm crash with retries ──
+                    # Transient TCP failures (e.g., fork-based server overload)
+                    # can cause a single is_target_alive() == False that resolves
+                    # within seconds. Before declaring a crash, verify with a
+                    # short retry loop to filter false positives.
+                    verified = await self._verify_crash()
+
+                    if not verified:
+                        # False positive: target recovered on its own.
+                        logger.info(
+                            "CRASH VERIFICATION: target recovered — "
+                            "false positive, skipping"
+                        )
+                        was_alive = True
+                        await asyncio.sleep(self.poll_interval_ms / 1000.0)
+                        continue
+
+                    # State transition: running → crashed (VERIFIED)
+
+                    # ── Collect crash diagnostics (Fix 2+3) ──
                     crash_info = await self.sandbox.get_last_crash_info()
                     exit_code = crash_info.exit_code if crash_info else 0
-                    await self.on_crash(exit_code)
+                    serial_output = ""
+                    if crash_info and crash_info.stack_trace:
+                        serial_output = crash_info.stack_trace
+
+                    # ── Classify crash type (Fix 3) ──
+                    crash_classification = self._classify_crash(
+                        exit_code, serial_output
+                    )
+
+                    is_actionable = crash_classification.get("is_actionable", True)
+                    if is_actionable:
+                        logger.error("CRASH DETECTED — target server is down!")
+                    else:
+                        logger.info(
+                            "Server exited normally (exit 0) — restarting..."
+                        )
+                    logger.warning(
+                        f"Crash classified as: {crash_classification['type']} "
+                        f"(confidence={crash_classification['confidence']})"
+                    )
+
+                    await self.on_crash(
+                        exit_code,
+                        classification=crash_classification,
+                        serial_output=serial_output,
+                    )
                     # After on_crash() → restart_target() → resume_interceptor(),
                     # the target may already be alive again.  Check and update
                     # was_alive so we don't miss a rapid re-crash:
@@ -173,7 +216,12 @@ class CrashMonitor:
     # Crash Handling
     # -----------------------------------------------------------------
 
-    async def on_crash(self, exit_code: int) -> CrashRecord:
+    async def on_crash(
+        self,
+        exit_code: int,
+        classification: Optional[dict] = None,
+        serial_output: str = "",
+    ) -> CrashRecord:
         """Handle a crash event.
 
         Full pipeline:
@@ -187,6 +235,10 @@ class CrashMonitor:
 
         Args:
             exit_code: Container exit code (e.g., 139 for SIGSEGV).
+            classification: Optional crash classification dict from
+                ``_classify_crash()`` with keys: type, confidence, detail.
+            serial_output: Optional serial console output from the VM
+                (contains kernel panic / ASAN messages).
 
         Returns:
             The created CrashRecord.
@@ -231,11 +283,33 @@ class CrashMonitor:
             signal=signal,
             offending_packet=offending_packet,
             mutation_rule_id=rule_id,
+            stack_trace=serial_output[-2000:] if serial_output else None,
         )
         logger.error(
             f"Crash artifact: packet={record.offending_packet_hex[:64]}, "
             f"rule_id={rule_id}"
         )
+
+        # 3b. Attach classification metadata for downstream consumers
+        is_actionable = True
+        if classification:
+            is_actionable = classification.get("is_actionable", True)
+            logger.warning(
+                f"Crash classification: {classification['type']} "
+                f"(confidence={classification['confidence']:.0%}, "
+                f"detail={classification.get('detail', '')})"
+            )
+
+        # 3c. Non-actionable exits (e.g., exit code 0): skip artifact
+        #     saving and CrashManager recording — just restart the target.
+        if not is_actionable:
+            logger.info(
+                "Normal server exit (not actionable) — "
+                "skipping CrashManager recording and artifact saving"
+            )
+            if self.auto_reset:
+                await self.restart_target()
+            return record
 
         # 4. Pause traffic IMMEDIATELY
         await self.pause_interceptor()
@@ -245,12 +319,17 @@ class CrashMonitor:
         logger.error(f"Crash PoC saved to: {crash_path}")
 
         # 5b. Record through CrashManager for deduplication
+        # Use classification type as crash_type for richer reporting
+        crash_type_str = (
+            classification["type"] if classification else f"exit_{exit_code}"
+        )
         if self.crash_manager is not None:
             try:
                 result = await self.crash_manager.record(
                     payload=record.offending_packet,
-                    crash_type=f"exit_{exit_code}",
+                    crash_type=crash_type_str,
                     rule_set_id=record.mutation_rule_id,
+                    notes=classification.get("detail", "") if classification else "",
                 )
                 if result.is_new:
                     logger.info(
@@ -285,6 +364,232 @@ class CrashMonitor:
     def _resolve_signal(self, exit_code: int) -> Optional[Signal]:
         """Map a container exit code to a POSIX signal name."""
         return EXIT_CODE_TO_SIGNAL.get(exit_code)
+
+    # -----------------------------------------------------------------
+    # Crash Verification (Fix 1)
+    # -----------------------------------------------------------------
+
+    async def _verify_crash(
+        self,
+        retries: int = 3,
+        delay_s: float = 0.5,
+    ) -> bool:
+        """Confirm that the target is truly crashed, not just a transient blip.
+
+        After ``is_target_alive()`` returns False, this method waits briefly
+        and retries to filter out false positives caused by:
+        - Fork-based servers briefly refusing connections between child deaths
+        - TCP backlog overflow causing momentary SYN drops
+        - Scheduler starvation under high load
+
+        However, if the sandbox process/container itself has exited (returncode
+        is not None for Docker, Firecracker process has died), the crash is
+        confirmed immediately without retries — there's no recovering from a
+        dead process.
+
+        Mock/test sandboxes that lack ``_process`` and ``target_container``
+        are trusted outright — they don't have transient failures.
+
+        Args:
+            retries: Number of verification attempts (default 3).
+            delay_s: Seconds between attempts (default 0.5s → total ~1.5s).
+
+        Returns:
+            True if the crash is confirmed (target still dead after all retries).
+            False if the target recovered (false positive).
+        """
+        # Fast path 1: Firecracker — process exited → confirmed immediately.
+        if hasattr(self.sandbox, "_process") and self.sandbox._process is not None:
+            if self.sandbox._process.returncode is not None:
+                return True  # Process exited → confirmed crash
+
+        # Fast path 2: Docker — container not running → confirmed immediately.
+        if hasattr(self.sandbox, "target_container"):
+            client = None
+            try:
+                import docker
+                client = docker.from_env()
+                container = client.containers.get(self.sandbox.target_container)
+                if container.status != "running":
+                    return True  # Container stopped → confirmed crash
+            except Exception:
+                pass  # Can't check → fall through to retry logic
+            finally:
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+
+        # Fast path 3: Mock/test sandbox — no real process to go transient.
+        # If the sandbox has neither _process nor target_container, it's a
+        # test mock — trust its is_target_alive() result immediately.
+        has_process = hasattr(self.sandbox, "_process") and self.sandbox._process is not None
+        has_container = hasattr(self.sandbox, "target_container")
+        if not has_process and not has_container:
+            return True  # Mock sandbox: trust the driver, no transient failures
+
+        # Slow path: retry to check for transient TCP/process failures
+        for attempt in range(retries):
+            await asyncio.sleep(delay_s)
+            try:
+                alive = await self.sandbox.is_target_alive()
+                if alive:
+                    return False  # Target recovered — false positive
+            except Exception:
+                pass  # Exception ≈ not alive, continue checking
+
+        return True  # Still dead after all retries → confirmed crash
+
+    # -----------------------------------------------------------------
+    # Crash Classification (Fix 3)
+    # -----------------------------------------------------------------
+
+    def _classify_crash(
+        self,
+        exit_code: int,
+        serial_output: str = "",
+    ) -> dict:
+        """Classify a crash by root cause using exit code + serial output.
+
+        Categories:
+            - ``asan_violation``  — AddressSanitizer detected a memory error.
+                                   High-value: real memory corruption bug.
+            - ``oom_kill``        — Linux OOM killer terminated the process.
+                                   Denial-of-service via resource exhaustion.
+            - ``signal_crash``    — Process killed by a fatal signal (SIGSEGV,
+                                   SIGABRT, etc.) without ASAN context.
+            - ``graceful_exit``   — Process called exit(0) or exit(1) cleanly.
+                                   May indicate a logic bug or maxcmds limit.
+            - ``kernel_panic``    — Guest kernel panicked (typically PID 1 death).
+            - ``unknown``         — Cannot determine root cause.
+
+        Returns:
+            Dict with keys: type, confidence (0.0-1.0), detail (human-readable).
+        """
+        serial_lower = serial_output.lower() if serial_output else ""
+
+        # ── Check for ASAN signature (highest priority) ────────────
+        asan_markers = [
+            "addresssanitizer",
+            "==error:",
+            "heap-buffer-overflow",
+            "heap-use-after-free",
+            "stack-buffer-overflow",
+            "stack-use-after-free",
+            "global-buffer-overflow",
+            "use-after-poison",
+            "container-overflow",
+            "stack-overflow",
+            "alloc-dealloc-mismatch",
+            "memcpy-param-overlap",
+            "new-delete-type-mismatch",
+            "heap-allocated-memory",
+            "freed here",
+        ]
+        for marker in asan_markers:
+            if marker in serial_lower:
+                # Try to extract the specific error type
+                for specific in [
+                    "heap-buffer-overflow",
+                    "heap-use-after-free",
+                    "stack-buffer-overflow",
+                    "stack-use-after-free",
+                    "global-buffer-overflow",
+                    "stack-overflow",
+                ]:
+                    if specific in serial_lower:
+                        return {
+                            "type": "asan_violation",
+                            "confidence": 0.95,
+                            "detail": f"ASAN {specific}",
+                            "is_actionable": True,
+                        }
+                return {
+                    "type": "asan_violation",
+                    "confidence": 0.90,
+                    "detail": "ASAN memory error detected",
+                    "is_actionable": True,
+                }
+
+        # ── Check for OOM killer ───────────────────────────────────
+        oom_markers = [
+            "out of memory",
+            "oom-kill",
+            "killed process",
+            "oom_kill",
+            "invoked oom-killer",
+            "out_of_memory",
+            "memory cgroup out of memory",
+        ]
+        for marker in oom_markers:
+            if marker in serial_lower:
+                return {
+                    "type": "oom_kill",
+                    "confidence": 0.85,
+                    "detail": "OOM killer terminated process",
+                    "is_actionable": True,
+                }
+
+        # ── Check for kernel panic ────────────────────────────────
+        panic_markers = [
+            "kernel panic",
+            "attempted to kill init",
+            "panic - not syncing",
+        ]
+        for marker in panic_markers:
+            if marker in serial_lower:
+                return {
+                    "type": "kernel_panic",
+                    "confidence": 0.80,
+                    "detail": "Guest kernel panic (likely PID 1 death)",
+                    "is_actionable": True,
+                }
+
+        # ── Check for known signal exit codes ──────────────────────
+        signal = self._resolve_signal(exit_code)
+        if signal is not None:
+            return {
+                "type": "signal_crash",
+                "confidence": 0.90,
+                "detail": f"Fatal signal: {signal.value}",
+                "is_actionable": True,
+            }
+
+        # ── Check for negative exit code (signal via Python) ───────
+        if exit_code < 0:
+            sig_num = -exit_code
+            return {
+                "type": "signal_crash",
+                "confidence": 0.90,
+                "detail": f"Killed by signal {sig_num}",
+                "is_actionable": True,
+            }
+
+        # ── Check for normal exit (exit code 0) ───────────────────
+        # exit(0) = server shut down voluntarily — NOT a vulnerability.
+        # For a long-running server this may indicate a DoS condition
+        # (e.g., max-cmds limit reached), but it is NOT a memory
+        # corruption bug.  We still restart the target but do NOT
+        # record this as an actionable crash.
+        if exit_code == 0:
+            return {
+                "type": "normal_exit",
+                "confidence": 0.90,
+                "detail": (
+                    "Server exited(0) — normal shutdown, not a crash.  "
+                    "Likely: connection limit, max-cmds, or clean close."
+                ),
+                "is_actionable": False,
+            }
+
+        # ── Non-zero exit without signal ───────────────────────────
+        return {
+            "type": "unknown",
+            "confidence": 0.30,
+            "detail": f"Process exited with code {exit_code}",
+            "is_actionable": True,
+        }
 
     # -----------------------------------------------------------------
     # Corpus Management

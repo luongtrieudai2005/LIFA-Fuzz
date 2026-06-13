@@ -166,6 +166,31 @@ class RuleGenerator:
                 logger.debug(f"Skipping constant field '{field.name}'")
                 continue
 
+            # Guard: drop fields with invalid byte ranges instead of letting
+            # them crash SemanticRule construction (offset_start has ge=0).
+            # LLMs often describe trailer/checksum/CRLF fields with negative
+            # offsets (e.g. "last 2 bytes" → offset_start=-2) or inverted
+            # ranges (end <= start). Without this guard, ONE such field raises
+            # a ValidationError out of grammar_to_rules(), which the
+            # orchestrator catches as ValueError and turns into a full
+            # bootstrap fallback — so even a successful LLM inference yields
+            # zero rules for baseline C.
+            if field.offset_start < 0:
+                logger.warning(
+                    f"Dropping field '{field.name}': negative offset_start="
+                    f"{field.offset_start} (LLM described a trailer/relative "
+                    f"offset that has no absolute position)."
+                )
+                continue
+            # Treat offset_end <= offset_start (other than -1, handled below)
+            # as an empty/invalid range and skip it.
+            if field.offset_end != -1 and field.offset_end <= field.offset_start:
+                logger.warning(
+                    f"Dropping field '{field.name}': empty/inverted range "
+                    f"[{field.offset_start}, {field.offset_end})."
+                )
+                continue
+
             # Resolve variable-length fields (offset_end=-1) to a concrete
             # size so they are NOT silently dropped by _generate_rules_for_field().
             # The mutator's _apply_field() clamps to the actual packet size at
@@ -187,11 +212,23 @@ class RuleGenerator:
             )
             rules.extend(field_rules)
 
-        # Deduplicate by (field_name, rule_type)
-        seen: set[tuple[str, str]] = set()
+        # Deduplicate by (field_name, rule_type, has_dictionary, strategy_override)
+        # Extended key allows dictionary and non-dictionary STRUCTURAL rules
+        # to coexist for the same field (Issue O3/R4 fix).
+        seen: set[tuple[str, str, bool, Optional[str]]] = set()
         unique: list[SemanticRule] = []
         for r in rules:
-            key = (r.target_field_name, r.rule_type.value)
+            override_key = (
+                r.mutation_strategy_override.value
+                if r.mutation_strategy_override
+                else None
+            )
+            key = (
+                r.target_field_name,
+                r.rule_type.value,
+                bool(r.dictionary_values),
+                override_key,
+            )
             if key not in seen:
                 seen.add(key)
                 unique.append(r)
@@ -443,7 +480,7 @@ class RuleGenerator:
                 constraints=MutationConstraints(
                     min_value=0,
                     max_value=max_val,
-                    invalid_values=list(set(boundary_values)),
+                    invalid_values=list(dict.fromkeys(boundary_values)),
                 ),
                 preserve_bytes=magic_bytes,
                 priority=priority,
@@ -542,6 +579,24 @@ class RuleGenerator:
                     description=f"Invalid enum value fuzz for {field.name}",
                 )
             )
+
+            # Dictionary: pick from known enum values directly
+            rules.append(
+                SemanticRule(
+                    rule_type=RuleType.STRUCTURAL,
+                    target_field_name=field.name,
+                    offset_start=field.offset_start,
+                    offset_end=field.offset_end,
+                    field_type=field.field_type,
+                    preserve_bytes=magic_bytes,
+                    dictionary_values=field.possible_values,
+                    priority=priority * 0.90,
+                    description=(
+                        f"Dictionary fuzz for {field.name} "
+                        f"({len(field.possible_values)} known enum values)"
+                    ),
+                )
+            )
         else:
             # No known values — conservative bit-flip
             rules.append(
@@ -609,6 +664,23 @@ class RuleGenerator:
             )
         )
 
+        # Format string injection — targets printf-family vulnerabilities
+        # (%s%s%s%n, %x%x%x, etc.). Uses mutation_strategy_override
+        # to bypass the STRUCTURAL → RANDOM_BYTES default mapping.
+        rules.append(
+            SemanticRule(
+                rule_type=RuleType.STRUCTURAL,
+                target_field_name=field.name,
+                offset_start=field.offset_start,
+                offset_end=field.offset_end,
+                field_type=field.field_type,
+                preserve_bytes=magic_bytes,
+                mutation_strategy_override=MutationStrategy.FORMAT_STRING,
+                priority=priority * 0.60,
+                description=f"Format-string fuzz for {field.name}",
+            )
+        )
+
         return rules
 
     # -----------------------------------------------------------------
@@ -621,8 +693,15 @@ class RuleGenerator:
         priority: float,
         magic_bytes: bytes = b"",
     ) -> list[SemanticRule]:
-        """Generate bit-flip rules for raw byte fields."""
-        return [
+        """Generate bit-flip and random-bytes rules for raw byte fields.
+
+        Previously only yielded BIT_FLIP — now also includes RANDOM_BYTES
+        for broader coverage of payload regions (Issue R1).
+        """
+        rules: list[SemanticRule] = []
+
+        # Bit-flip baseline
+        rules.append(
             SemanticRule(
                 rule_type=RuleType.BIT_FLIP,
                 target_field_name=field.name,
@@ -633,7 +712,23 @@ class RuleGenerator:
                 priority=priority * 0.50,
                 description=f"Bit-flip fuzz for byte field {field.name}",
             )
-        ]
+        )
+
+        # Random-bytes replacement — covers more ground than bit-flip alone
+        rules.append(
+            SemanticRule(
+                rule_type=RuleType.STRUCTURAL,
+                target_field_name=field.name,
+                offset_start=field.offset_start,
+                offset_end=field.offset_end,
+                field_type=field.field_type,
+                preserve_bytes=magic_bytes,
+                priority=priority * 0.35,
+                description=f"Random-bytes fuzz for byte field {field.name}",
+            )
+        )
+
+        return rules
 
     # -----------------------------------------------------------------
     # Bool Field Rules

@@ -126,6 +126,7 @@ class TrafficParser:
 
         self._last_read_position: int = 0
         self._total_packets_read: int = 0
+        self._last_file_mtime: float = 0.0
 
     # -----------------------------------------------------------------
     # Core API
@@ -150,6 +151,34 @@ class TrafficParser:
         except OSError as e:
             logger.error(f"Failed to read traffic log: {e}")
             return []
+
+        # Detect file rotation/truncation — reset position if the file
+        # was replaced or shrank. Without this, the parser silently
+        # stops reading new packets after a rotation.
+        try:
+            cur_mtime = self.log_path.stat().st_mtime
+        except OSError:
+            cur_mtime = 0.0
+
+        rotation_detected = False
+        if self._last_read_position > len(lines):
+            # File shrank — classic truncation/rotation
+            rotation_detected = True
+        elif self._last_file_mtime > 0 and cur_mtime < self._last_file_mtime - 1.0:
+            # mtime went backwards — file was replaced (new inode).
+            # Allow 1s tolerance for filesystem timestamp granularity.
+            rotation_detected = True
+
+        if rotation_detected:
+            logger.info(
+                f"Traffic log rotated/truncated "
+                f"(last_pos={self._last_read_position}, lines={len(lines)}, "
+                f"mtime {self._last_file_mtime:.1f}→{cur_mtime:.1f}) "
+                f"— resetting read position"
+            )
+            self._last_read_position = 0
+
+        self._last_file_mtime = cur_mtime
 
         # Parse new lines (incremental)
         new_entries: list[dict[str, Any]] = []
@@ -198,14 +227,23 @@ class TrafficParser:
         for session in sessions:
             packets: list[dict[str, Any]] = []
             for idx, pkt in enumerate(session.packets):
+                hex_payload = pkt.get("payload", "")
+                # Safe length calculation — tolerate bad hex data from
+                # corrupted traffic log entries instead of crashing the
+                # entire Slow Loop inference cycle.
+                try:
+                    pkt_len = pkt.get("length", len(bytes.fromhex(hex_payload)))
+                except (ValueError, TypeError):
+                    # Odd-length or non-hex chars: estimate byte count from
+                    # hex string length (2 hex chars = 1 byte).
+                    pkt_len = pkt.get("length", len(hex_payload) // 2)
+
                 packets.append({
                     "seq": idx,
                     "direction": pkt.get("direction", "unknown"),
-                    "hex": pkt.get("payload", ""),
-                    "ascii": self._bytes_to_ascii(
-                        pkt.get("payload", "")
-                    ),
-                    "length": pkt.get("length", len(bytes.fromhex(pkt.get("payload", "")))),
+                    "hex": hex_payload,
+                    "ascii": self._bytes_to_ascii(hex_payload),
+                    "length": pkt_len,
                 })
             session_dicts.append({
                 "session_id": session.session_id,
@@ -297,7 +335,12 @@ class TrafficParser:
             if len(hex_byte) < 2:
                 result.append(".")
                 continue
-            byte_val = int(hex_byte, 16)
+            try:
+                byte_val = int(hex_byte, 16)
+            except ValueError:
+                # Non-hex character (e.g. 'g', 'z') — render as dot
+                result.append(".")
+                continue
             if 0x20 <= byte_val <= 0x7E:
                 result.append(chr(byte_val))
             else:
@@ -353,11 +396,12 @@ class TrafficParser:
 
         prefix = all_hex[0]
         for hex_data in all_hex[1:]:
-            # Find common prefix length in characters (2 chars = 1 byte)
+            # Find common prefix length in characters (2 chars = 1 byte).
+            # Iterate by 2 (byte-aligned) to avoid slicing across nibble
+            # boundaries which produces odd-length hex strings.
             common_len = 0
-            for i in range(0, min(len(prefix), len(hex_data))):
-                if i + 2 > len(hex_data):
-                    break
+            max_pos = min(len(prefix), len(hex_data))
+            for i in range(0, max_pos - 1, 2):
                 if prefix[i:i+2] == hex_data[i:i+2]:
                     common_len = i + 2
                 else:

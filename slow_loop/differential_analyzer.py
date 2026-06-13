@@ -19,7 +19,7 @@ ALGORITHM (per byte offset i):
     │    r_L(V_i) = Cov(V_i, L) / (σ_V · σ_L)  ← Pearson w/ Length │
     │                                                                 │
     │ 3. Label:                                                       │
-    │    H = 0.0              → STATIC       (magic bytes, version)   │
+    │    H ≤ 0.1              → STATIC       (magic bytes, version)   │
     │    |r_L| > 0.85         → CALCULATED   (length field)           │
     │    τ > 0.75             → CALCULATED   (sequence number)        │
     │    H > 3.5              → HIGH_ENTROPY (payload / encrypted)    │
@@ -58,7 +58,7 @@ log = get_logger("slow_loop.differential_analyzer")
 # ===========================================================================
 
 # Shannon entropy thresholds (bits, max = log₂(256) = 8.0)
-_H_STATIC_MAX    = 0.0    # Exactly constant
+_H_STATIC_MAX    = 0.1    # Near-constant (allows floating-point noise)
 _H_LOW_MAX       = 3.0    # Structured but varying (flags, enums, type codes)
 _H_HIGH_MIN      = 3.5    # High entropy → payload / encrypted region
 
@@ -235,12 +235,14 @@ class HeatmapResult:
             },
         }
 
-    def to_llm_hint(self) -> str:
+    def to_llm_hint(self, compact: bool = True) -> str:
         """
         Format the heatmap as a token-efficient hint block for the LLM prompt.
 
         P3-I: Uses pipe-delimited columns instead of Unicode box-drawing chars.
-        Saves ~200 tokens per hint (~40% reduction) with no information loss.
+        Bug #5 fix: compact mode (default) omits the per-offset table, saving
+        ~500 tokens per hint. Field groups already contain all structural info
+        the LLM needs. Use compact=False for debugging.
 
         This is injected verbatim into the LLM's system/user message.
         Goal: give the LLM a pre-computed head start so it focuses on
@@ -254,34 +256,46 @@ class HeatmapResult:
             OffsetLabel.UNKNOWN:      "UNKN",
         }
 
+        # Summary line with label counts
+        label_counts = Counter(s.label.value for s in self.offset_stats.values())
+        summary = ", ".join(
+            f"{label_tags.get(k, k)}={v}"
+            for k, v in sorted(label_counts.items())
+        )
+
         lines = [
             "## MATHEMATICAL PRE-ANALYSIS (computed before LLM — trust this)",
             f"Packets: {self.packet_count} | "
             f"Length: {self.min_length}-{self.max_length}B | "
-            f"Depth: {self.analysis_depth}B",
-            "",
-            "offset | label | H(X)  | variance | notes",
-            "-------|-------|-------|----------|------",
+            f"Depth: {self.analysis_depth}B | "
+            f"{summary}",
         ]
 
-        for off, s in sorted(self.offset_stats.items()):
-            tag = label_tags.get(s.label, "?")
-            h_str = f"{s.entropy:.3f}"
-            var_str = f"{s.variance:.1f}"
+        if not compact:
+            # Verbose mode: per-offset table (for debugging)
+            lines += [
+                "",
+                "offset | label | H(X)  | variance | notes",
+                "-------|-------|-------|----------|------",
+            ]
+            for off, s in sorted(self.offset_stats.items()):
+                tag = label_tags.get(s.label, "?")
+                h_str = f"{s.entropy:.3f}"
+                var_str = f"{s.variance:.1f}"
 
-            if s.label == OffsetLabel.STATIC:
-                note = f"const=0x{s.constant_value:02X} conf={s.confidence:.2f}"
-            elif s.label == OffsetLabel.CALCULATED:
-                if s.sub_type == CalcSubType.LENGTH_FIELD:
-                    note = f"r={s.best_corr:+.3f} enc={s.best_encoding}"
+                if s.label == OffsetLabel.STATIC:
+                    note = f"const=0x{s.constant_value:02X} conf={s.confidence:.2f}"
+                elif s.label == OffsetLabel.CALCULATED:
+                    if s.sub_type == CalcSubType.LENGTH_FIELD:
+                        note = f"r={s.best_corr:+.3f} enc={s.best_encoding}"
+                    else:
+                        note = f"tau={s.kendall_tau:+.3f} (monotonic)"
+                elif s.label == OffsetLabel.HIGH_ENTROPY:
+                    note = f"unique={s.unique_count}/256 conf={s.confidence:.2f}"
                 else:
-                    note = f"tau={s.kendall_tau:+.3f} (monotonic)"
-            elif s.label == OffsetLabel.HIGH_ENTROPY:
-                note = f"unique={s.unique_count}/256 conf={s.confidence:.2f}"
-            else:
-                note = f"unique={s.unique_count} conf={s.confidence:.2f}"
+                    note = f"unique={s.unique_count} conf={s.confidence:.2f}"
 
-            lines.append(f"{off:5d}  | {tag:5s} | {h_str:5s} | {var_str:8s} | {note}")
+                lines.append(f"{off:5d}  | {tag:5s} | {h_str:5s} | {var_str:8s} | {note}")
 
         lines += [
             "",
@@ -337,7 +351,7 @@ class HeatmapResult:
             rule = FieldRule(
                 field_name         = f"field_{i:02d}_{g.label.value.lower()}",
                 offset             = g.start,
-                length             = g.length if g.end != -1 else -1,
+                length             = g.length,  # Bug #8 fix: property handles end=-1
                 mutation_strategy  = g.suggested_strategy,
                 static_value       = g.static_hex if g.label == OffsetLabel.STATIC else None,
                 calculation_source = "payload" if (g.sub_type == CalcSubType.LENGTH_FIELD) else None,
@@ -652,7 +666,20 @@ class DifferentialAnalyzer:
         lengths        = [len(p) for p in packets]
         min_len        = min(lengths)
         max_len        = max(lengths)
-        analysis_depth = min(min_len, self.max_depth)
+
+        # Bug #2 fix: use P10 percentile instead of min() so that a single
+        # short ACK/keepalive packet cannot destroy the entire analysis.
+        # _MIN_COVERAGE already filters offsets present in < 60% of packets,
+        # so using a percentile is safe — rare offsets get None from
+        # _analyze_offset() and are excluded.
+        #
+        # Edge case: for n < 10 packets, int(n*0.1) = 0, which is just min().
+        # To avoid this, use max(1, ...) so at least the 2nd shortest packet
+        # is used, which still tolerates 1 outlier in small corpora.
+        sorted_lens = sorted(lengths)
+        p10_idx = min(max(1, int(len(sorted_lens) * 0.1)), len(sorted_lens) - 1)
+        p10_len = sorted_lens[p10_idx]
+        analysis_depth = min(p10_len, self.max_depth)
 
         log.info(
             "Starting differential analysis",
@@ -670,15 +697,19 @@ class DifferentialAnalyzer:
         consecutive_high: int = 0  # P2-A: track HIGH_ENTROPY streak
         effective_depth: int = analysis_depth
 
+        # Bug #9 fix: compute header candidates once, not per-offset.
+        header_candidates = self._compute_header_candidates(lengths)
+
         for offset in range(analysis_depth):
-            stats = self._analyze_offset(offset, packets, lengths)
+            stats = self._analyze_offset(offset, packets, lengths, header_candidates)
             if stats is not None:
                 all_stats[offset] = stats
 
                 # P2-A: early-stop on consecutive HIGH_ENTROPY offsets
                 if stats.label == OffsetLabel.HIGH_ENTROPY:
                     consecutive_high += 1
-                    if consecutive_high >= self.early_stop_consecutive:
+                    if (self.early_stop_consecutive > 0
+                            and consecutive_high >= self.early_stop_consecutive):
                         # Truncate: keep offsets up to the start of this streak
                         effective_depth = max(0, offset - self.early_stop_consecutive + 1)
                         # Remove the HIGH_ENTROPY streak offsets
@@ -692,6 +723,11 @@ class DifferentialAnalyzer:
                         break
                 else:
                     consecutive_high = 0
+            else:
+                # Bug #1 fix: coverage gap (stats is None) resets the streak.
+                # Without this, a gap between HIGH_ENTROPY offsets inflates
+                # consecutive_high and causes incorrect effective_depth.
+                consecutive_high = 0
 
         # -------------------------------------------------------------------
         # Step 2: Cluster into field groups
@@ -741,9 +777,10 @@ class DifferentialAnalyzer:
 
     def _analyze_offset(
         self,
-        offset:   int,
-        packets:  list[bytes],
-        lengths:  list[int],
+        offset:            int,
+        packets:           list[bytes],
+        lengths:           list[int],
+        header_candidates: list[int] | None = None,
     ) -> Optional[OffsetStats]:
         """
         Compute the full statistical profile for a single byte offset.
@@ -781,7 +818,7 @@ class DifferentialAnalyzer:
 
         # Length correlation across all integer encodings
         best_corr, best_enc, best_ref = self._best_length_correlation(
-            offset, packets, pkt_lengths, lengths
+            offset, packets, lengths, header_candidates
         )
 
         # Determine label (priority order matters!)
@@ -835,10 +872,10 @@ class DifferentialAnalyzer:
 
     def _best_length_correlation(
         self,
-        offset:      int,
-        packets:     list[bytes],
-        pkt_lengths: list[int],  # lengths for packets that have this offset
-        all_lengths: list[int],  # all packet lengths (aligned with packets)
+        offset:            int,
+        packets:           list[bytes],
+        all_lengths:       list[int],  # all packet lengths (aligned with packets)
+        header_candidates: list[int] | None = None,  # Bug #9: pre-computed cache
     ) -> tuple[float, str, str]:
         """
         Try to decode bytes at `offset` in multiple integer encodings and
@@ -851,10 +888,11 @@ class DifferentialAnalyzer:
         best_enc    = ""
         best_ref    = ""
 
-        # P2-G: Data-driven header candidates instead of hardcoded list.
-        # The field might encode payload_length = total_length - header_size.
-        # We derive candidates from the observed packet length distribution.
-        header_guesses = self._compute_header_candidates(all_lengths)
+        # Bug #9 fix: use pre-computed header candidates when available.
+        if header_candidates is not None:
+            header_guesses = header_candidates
+        else:
+            header_guesses = self._compute_header_candidates(all_lengths)
 
         for enc_name, (fmt, size) in _INT_ENCODINGS.items():
             # Extract parsed integer values for packets that have offset + size bytes
@@ -873,9 +911,24 @@ class DifferentialAnalyzer:
 
             # Try correlating with total length and payload lengths
             xs = [float(v) for v in parsed_vals]
+            enc_max_val = (1 << (size * 8)) - 1
 
             for hdr_size in header_guesses:
-                ys = [float(max(0, l - hdr_size)) for l in ref_lengths]
+                # Bug #7 fix (revised): plausibility check per header size.
+                # The encoding must be able to represent the *payload* length
+                # (total - header), not the total length. A uint8 length field
+                # encoding payload_length = total - 6 is plausible for packets
+                # up to 261B (payload max 255), even though total > 255.
+                # Allow a margin of +enc_size bytes above max encodable value
+                # to tolerate off-by-one and overflow test values, but not
+                # values that are clearly impossible (e.g. payload=400 in uint8).
+                payload_lengths = [max(0, l - hdr_size) for l in ref_lengths]
+                max_payload = max(payload_lengths) if payload_lengths else 0
+                plausibility_limit = enc_max_val + (enc_max_val >> 3)  # +12.5% margin
+                if max_payload > plausibility_limit:
+                    continue  # Encoding too small for this header offset
+
+                ys = [float(pl) for pl in payload_lengths]
                 r  = _pearson_r(xs, ys)
                 if abs(r) > abs(best_r):
                     best_r   = r
@@ -899,9 +952,17 @@ class DifferentialAnalyzer:
         Returns:
             (label, sub_type, confidence)
         """
-        # --- STATIC: perfectly constant ---
+        # --- STATIC: near-constant (H ≤ h_static_max) ---
+        # Bug #3 fix: relaxed threshold from 0.0 to 0.1. Confidence scales
+        # down as H increases toward the threshold, so H=0.0 → 1.0 and
+        # H=0.1 → ~0.7. This is scientifically correct — a field with
+        # 99/100 identical values is not "perfectly constant".
         if H <= self.h_static_max:
-            return OffsetLabel.STATIC, None, 1.0
+            if self.h_static_max > 0:
+                confidence = 1.0 - 0.3 * _scale(H, 0.0, self.h_static_max)
+            else:
+                confidence = 1.0
+            return OffsetLabel.STATIC, None, confidence
 
         # --- CALCULATED / LENGTH FIELD ---
         if best_corr >= self.corr_length_min:
@@ -954,16 +1015,15 @@ class DifferentialAnalyzer:
         if not all_stats:
             return []
 
+        # Bug #6 fix: initialize from actual first stat instead of fragile
+        # double-dummy OffsetStats construction.
+        first_offset = min(all_stats.keys())
+        first_stat   = all_stats.get(first_offset)
+        cur_start:  int            = first_offset
+        cur_label:  OffsetLabel    = first_stat.label if first_stat else OffsetLabel.UNKNOWN
+        cur_sub:    Optional[str]  = first_stat.sub_type if first_stat else None
+
         groups:   list[FieldGroup] = []
-        cur_start:  int            = 0
-        cur_label:  OffsetLabel    = all_stats.get(0, OffsetStats(
-            0, 0, 0.0, 0.0, 0.0, 0, [], None, 0.0, "", "", 0.0,
-            OffsetLabel.UNKNOWN, None, 0.0,
-        )).label
-        cur_sub:    Optional[str]  = all_stats.get(0, OffsetStats(
-            0, 0, 0.0, 0.0, 0.0, 0, [], None, 0.0, "", "", 0.0,
-            OffsetLabel.UNKNOWN, None, 0.0,
-        )).sub_type
         accum_conf: list[float]    = []
         accum_stat: list[OffsetStats] = []
 

@@ -272,10 +272,11 @@ class TestPatternDetection:
         sessions = await parser.read_log()
         prefix_len, prefix_hex = TrafficParser.find_common_prefix(sessions)
 
-        # All client→server packets share "deadbeef000"
+        # All client→server packets share "deadbeef00"
         # (4-byte magic + first byte of length field = 0x00)
+        # Byte-aligned: 5 bytes = 10 hex chars (even-length, valid hex).
         assert prefix_len == 5
-        assert prefix_hex == "deadbeef000"
+        assert prefix_hex == "deadbeef00"
 
     @pytest.mark.asyncio
     async def test_find_common_prefix_empty(self):

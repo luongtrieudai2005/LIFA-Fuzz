@@ -122,13 +122,22 @@ def _encode(value: int, field_type: FieldType, field_len: int) -> bytes:
 
 def _decode(buf: bytearray, offset: int, field_type: FieldType,
             field_len: int) -> int:
-    """Decode an integer from *buf* at *offset* according to *field_type*."""
+    """Decode an integer from *buf* at *offset* according to *field_type*.
+
+    Returns 0 if the buffer is too short for the requested field (bounds-safe).
+    """
     if field_type in _FMT_MAP:
         fmt, size = _FMT_MAP[field_type]
-        return struct.unpack(fmt, bytes(buf[offset : offset + size]))[0]
+        needed = offset + size
+        if needed > len(buf):
+            return 0  # Buffer too short — return default
+        return struct.unpack(fmt, bytes(buf[offset : needed]))[0]
     # Fallback for non-numeric types: big-endian, consistent with _encode.
+    needed = offset + field_len
+    if needed > len(buf):
+        return 0  # Buffer too short — return default
     return int.from_bytes(
-        bytes(buf[offset : offset + field_len]), byteorder="big"
+        bytes(buf[offset : needed]), byteorder="big"
     )
 
 

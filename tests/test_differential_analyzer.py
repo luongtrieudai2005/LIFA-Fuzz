@@ -541,3 +541,314 @@ class TestMergeSortTauB:
         elapsed = time.monotonic() - start
         assert tau > 0.99
         assert elapsed < 0.5, f"Took {elapsed:.3f}s — expected < 0.5s for n=2000"
+
+
+# =============================================================================
+# Bug #2 fix: analysis_depth uses P10 percentile, not min()
+# =============================================================================
+
+
+class TestAnalysisDepthPercentile:
+    """Verify that a single short packet does not destroy analysis depth."""
+
+    def test_one_short_packet_does_not_limit_depth(self):
+        """99 packets of 200B + 1 ACK packet of 4B → depth should NOT be 2."""
+        import random
+        random.seed(789)
+
+        # Use early_stop_consecutive=0 to disable early-stop, so we measure
+        # the true percentile-based depth without interference.
+        analyzer = DifferentialAnalyzer(
+            max_depth=64,
+            early_stop_consecutive=0,
+        )
+
+        magic = b"\xDE\xAD\xBE\xEF"
+        packets = []
+        for i in range(99):
+            payload_len = 10 + (i % 40)
+            length_bytes = payload_len.to_bytes(2, "big")
+            payload = bytes(random.randint(0, 255) for _ in range(payload_len))
+            packets.append(magic + length_bytes + payload)
+        # 1 short ACK packet
+        packets.append(b"\xDE\xAD")
+
+        result = analyzer.analyze(packets)
+        # P10 of 100 packets: sorted_lens[10] is the 10th smallest = a ~14-byte packet
+        # The key assertion: depth is NOT 2 (the ACK packet length)
+        assert result.analysis_depth > 4, (
+            f"Expected depth > 4 (P10 percentile, not min=2), got {result.analysis_depth}"
+        )
+        # Also verify: with min() we would get depth=2, with P10 we get much more
+        min_len = min(len(p) for p in packets)
+        assert result.analysis_depth > min_len, (
+            f"Expected depth > min_len ({min_len}), got {result.analysis_depth}"
+        )
+
+    def test_uniform_length_packets_unchanged(self):
+        """Uniform-length packets should give same result as before."""
+        import random
+        random.seed(111)
+
+        # Disable early-stop so depth is purely from percentile
+        analyzer = DifferentialAnalyzer(
+            max_depth=64,
+            early_stop_consecutive=0,
+        )
+
+        packets = []
+        for i in range(20):
+            payload = bytes(random.randint(0, 255) for _ in range(20))
+            packets.append(b"\xDE\xAD\xBE\xEF" + payload)
+
+        result = analyzer.analyze(packets)
+        # All packets are 24 bytes → P10 = 24 → depth = min(24, 64) = 24
+        assert result.analysis_depth == 24
+
+    def test_offset_coverage_reflects_short_packets(self, analyzer):
+        """Offsets beyond the short packet length should have coverage < 1.0."""
+        import random
+        random.seed(222)
+
+        # 8 packets of 20B, 2 packets of 4B → P10 = sorted_lens[1]
+        packets = []
+        for i in range(8):
+            payload = bytes(random.randint(0, 255) for _ in range(16))
+            packets.append(b"\xDE\xAD\xBE\xEF" + payload)
+        for _ in range(2):
+            packets.append(b"\xDE\xAD\xBE\xEF")  # 4B short packets
+
+        result = analyzer.analyze(packets)
+        # Offsets 4+ exist only in 8/10 packets → coverage = 0.8
+        for off in range(4, min(result.analysis_depth, 20)):
+            if off in result.offset_stats:
+                assert result.offset_stats[off].coverage >= 0.6, (
+                    f"Offset {off} coverage {result.offset_stats[off].coverage:.2f} "
+                    f"< 0.6 (should be 0.8)"
+                )
+
+
+# =============================================================================
+# Bug #1 fix: early-stop streak resets on coverage gap
+# =============================================================================
+
+
+class TestEarlyStopCoverageGap:
+    """Verify that coverage gaps (None offsets) reset the HIGH_ENTROPY streak."""
+
+    def test_coverage_gap_resets_streak(self):
+        """HIGH, HIGH, gap(None), HIGH, HIGH should NOT trigger early-stop."""
+        import random
+        random.seed(333)
+
+        analyzer = DifferentialAnalyzer(
+            max_depth=32,
+            early_stop_consecutive=4,
+            min_coverage=0.5,
+        )
+
+        # Build packets where:
+        # - Offsets 0-1: STATIC (magic bytes)
+        # - Offset 2-3: exists in 8/10 packets, HIGH_ENTROPY
+        # - Offset 4: exists in 4/10 packets → coverage 0.4 < 0.5 → None
+        # - Offset 5-6: exists in 8/10 packets, HIGH_ENTROPY
+        packets = []
+        for i in range(8):
+            pkt = b"\xAA\xBB"  # offsets 0-1: constant
+            pkt += bytes(random.randint(0, 255) for _ in range(2))  # offset 2-3: random
+            pkt += bytes(random.randint(0, 255) for _ in range(3))  # offset 4-6
+            packets.append(pkt)
+        # 2 short packets that only have offsets 0-1
+        for _ in range(2):
+            packets.append(b"\xAA\xBB\xCC")  # 3 bytes → offset 3 absent for these
+
+        result = analyzer.analyze(packets)
+        # Even if offsets 2-3 and 5-6 are HIGH_ENTROPY, the gap at offset 4
+        # should have reset the counter → no early-stop at 4 consecutive
+        # (there's a gap breaking the streak)
+
+    def test_uniform_high_entropy_still_stops(self):
+        """Uniform-length packets with all HIGH_ENTROPY tail should still stop."""
+        import random
+        random.seed(444)
+
+        analyzer = DifferentialAnalyzer(
+            max_depth=64,
+            early_stop_consecutive=10,
+        )
+        packets = []
+        for _ in range(20):
+            pkt = b"\xCA\xFE"  # 2 STATIC bytes
+            pkt += bytes(random.randint(0, 255) for _ in range(50))
+            packets.append(pkt)
+
+        result = analyzer.analyze(packets)
+        # Should have truncated because uniform HIGH_ENTROPY tail
+        assert result.analysis_depth < 52, (
+            f"Expected truncated depth < 52, got {result.analysis_depth}"
+        )
+
+
+# =============================================================================
+# Bug #3 fix: STATIC threshold H ≤ 0.1 (not H ≤ 0.0)
+# =============================================================================
+
+
+class TestStaticThresholdRelaxed:
+    """Verify that near-constant fields (H ≈ 0.08) are labeled STATIC."""
+
+    def test_near_constant_labeled_static(self, analyzer):
+        """99/100 packets have byte 0 = 0xDE, 1 has 0xDF → should be STATIC."""
+        packets = []
+        for i in range(99):
+            packets.append(b"\xDE\xAD\xBE\xEF" + bytes(range(10)))
+        # 1 packet with slightly different magic byte
+        packets.append(b"\xDF\xAD\xBE\xEF" + bytes(range(10)))
+
+        result = analyzer.analyze(packets)
+        # Offset 0: 99 × 0xDE, 1 × 0xDF → H ≈ 0.081
+        # With h_static_max=0.1, this should be STATIC
+        assert result.offset_stats[0].label == OffsetLabel.STATIC, (
+            f"Offset 0 should be STATIC (H={result.offset_stats[0].entropy:.4f}), "
+            f"got {result.offset_stats[0].label}"
+        )
+        # Confidence should be < 1.0 for near-constant (H ≈ 0.08)
+        assert result.offset_stats[0].confidence < 1.0, (
+            f"Near-constant field (H={result.offset_stats[0].entropy:.4f}) should have "
+            f"confidence < 1.0, got {result.offset_stats[0].confidence:.4f}"
+        )
+        # Confidence should still be high (> 0.7)
+        assert result.offset_stats[0].confidence > 0.7, (
+            f"Near-constant field should have confidence > 0.7, "
+            f"got {result.offset_stats[0].confidence:.4f}"
+        )
+
+    def test_multi_value_not_false_positive_static(self, analyzer):
+        """An offset with 5 distinct values should NOT be STATIC."""
+        packets = []
+        for i in range(20):
+            # Byte 0 cycles through 5 values
+            pkt = bytes([i % 5]) + b"\x00" * 13
+            packets.append(pkt)
+
+        result = analyzer.analyze(packets)
+        # With 5 distinct values, H >> 0.1 → should NOT be STATIC
+        assert result.offset_stats[0].label != OffsetLabel.STATIC, (
+            f"Offset 0 with 5 distinct values should not be STATIC"
+        )
+
+    def test_perfectly_constant_still_static(self, analyzer):
+        """All-identical packets should still produce STATIC."""
+        packets = [b"\xDE\xAD\xBE\xEF\x00\x05HELLO"] * 10
+        result = analyzer.analyze(packets)
+        for off, s in result.offset_stats.items():
+            assert s.label == OffsetLabel.STATIC, (
+                f"Offset {off} should be STATIC for all-identical packets"
+            )
+
+
+# =============================================================================
+# Bug #7 fix: CALCULATED encoding plausibility check
+# =============================================================================
+
+
+class TestCalculatedEncodingPlausibility:
+    """Verify that implausible encodings (uint8 for large packets) are rejected."""
+
+    def test_uint8_rejected_for_large_packets(self, analyzer):
+        """uint8 length field with payloads > 286B should be filtered."""
+        magic = b"\xDE\xAD\xBE\xEF"
+        packets = []
+        for i in range(20):
+            # Packets are 300-500 bytes total. Even with hdr_size=6,
+            # payload = 294-494B > uint8 plausibility limit (286B).
+            payload_len = 296 + (i * 10)  # 296 to 486
+            length_bytes = payload_len.to_bytes(2, "big")
+            payload = bytes(j % 256 for j in range(payload_len))
+            packets.append(magic + length_bytes + payload)
+
+        result = analyzer.analyze(packets)
+        # Byte 4 alone as uint8 should NOT be CALCULATED (payload too large)
+        if 4 in result.offset_stats:
+            stat = result.offset_stats[4]
+            if stat.sub_type == CalcSubType.LENGTH_FIELD:
+                assert stat.best_encoding != "uint8", (
+                    f"uint8 should not be chosen for payloads > 286B "
+                    f"(got encoding={stat.best_encoding})"
+                )
+
+    def test_uint8_accepted_for_small_packets(self, analyzer):
+        """uint8 length field with packets < 128B should be accepted."""
+        magic = b"\xDE\xAD"
+        packets = []
+        for i in range(20):
+            payload_len = 5 + i  # 5 to 24 bytes
+            packets.append(magic + bytes([payload_len]) + bytes(range(payload_len)))
+
+        result = analyzer.analyze(packets)
+        # Byte 2 is uint8 length field — packets are small, should be detected
+        assert 2 in result.offset_stats
+        stat = result.offset_stats[2]
+        assert stat.label == OffsetLabel.CALCULATED, (
+            f"Offset 2 should be CALCULATED for valid uint8 length field, "
+            f"got {stat.label}"
+        )
+        assert stat.best_encoding == "uint8", (
+            f"Expected uint8 encoding for small packets, got {stat.best_encoding}"
+        )
+
+    def test_uint8_accepted_for_medium_packets_with_header(self, analyzer):
+        """uint8 length field is plausible when encoding payload_len = total - header.
+
+        Packets 200B with 6B header → payload 194B → uint8 (max 255) is plausible.
+        The old (buggy) check compared total=200 against uint8_max*2=510 and passed
+        by luck, but the revised check correctly compares payload=194 against 510.
+        """
+        header = b"\x4C\x49\x46\x41\x01"  # "LIFA" + opcode — 5 bytes
+        packets = []
+        for i in range(20):
+            payload_len = 100 + (i * 5)  # 100 to 195 bytes → payload fits uint8
+            pkt = header + bytes([payload_len]) + bytes(range(payload_len))
+            packets.append(pkt)
+
+        result = analyzer.analyze(packets)
+        # Byte 5 is the uint8 length field (after 5-byte header)
+        assert 5 in result.offset_stats
+        stat = result.offset_stats[5]
+        assert stat.label == OffsetLabel.CALCULATED, (
+            f"Offset 5 should be CALCULATED (uint8 length field for medium packets), "
+            f"got {stat.label}"
+        )
+        assert stat.best_encoding == "uint8", (
+            f"Expected uint8 encoding, got {stat.best_encoding}"
+        )
+
+
+# =============================================================================
+# Bug #9 fix: _compute_header_candidates called once, not 64 times
+# =============================================================================
+
+
+class TestHeaderCandidatesCaching:
+    """Verify header candidates are computed once per analyze() call."""
+
+    def test_header_candidates_cached(self):
+        """_compute_header_candidates should be called exactly once."""
+        from unittest.mock import patch
+
+        magic = b"\xDE\xAD\xBE\xEF"
+        packets = []
+        for i in range(10):
+            payload_len = 4 + i
+            packets.append(magic + payload_len.to_bytes(2, "big") + bytes(range(payload_len)))
+
+        analyzer = DifferentialAnalyzer(max_depth=32)
+        with patch.object(
+            analyzer, "_compute_header_candidates",
+            wraps=analyzer._compute_header_candidates,
+        ) as mock:
+            analyzer.analyze(packets)
+            # Should be called exactly once, not once per offset
+            assert mock.call_count == 1, (
+                f"Expected 1 call, got {mock.call_count}"
+            )

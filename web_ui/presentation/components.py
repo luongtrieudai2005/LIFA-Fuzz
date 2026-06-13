@@ -11,7 +11,7 @@ directly to change the layout. No Python changes needed.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import pandas as pd
@@ -53,10 +53,13 @@ def _format_duration(seconds: float) -> str:
     return f"{sec}s"
 
 
+_GMT7 = timezone(timedelta(hours=7))
+
+
 def _format_eta(unix_ts: float) -> str:
     """Format a unix timestamp as a local time string for ETA display."""
     try:
-        return datetime.fromtimestamp(unix_ts).strftime("%H:%M")
+        return datetime.fromtimestamp(unix_ts, tz=_GMT7).strftime("%H:%M")
     except (TypeError, ValueError, OSError):
         return "—"
 
@@ -112,17 +115,24 @@ def render_evaluation_progress(eval_state: dict, stats: dict) -> None:
         "C": ("C: Full", "#2ecc71"),
     }
 
-    for i in range(total_baselines):
-        bid = BASELINE_ORDER[i] if i < len(BASELINE_ORDER) else str(i)
+    # FIX: Always show all 3 baseline chips (A, B, C) regardless of
+    # total_baselines. Use the actual baseline_id from runtime state
+    # to determine which one is currently running.
+    for bid in BASELINE_ORDER:
         label, color = baseline_labels.get(bid, (f"Baseline {bid}", "#7a8390"))
 
-        if i < baseline_index:
+        # FIX: Use baseline_id to determine current, not index-based logic
+        # which breaks when running baselines one at a time (total_baselines=1)
+        bid_order = BASELINE_ORDER.index(bid) if bid in BASELINE_ORDER else 99
+        current_order = BASELINE_ORDER.index(baseline_id) if baseline_id in BASELINE_ORDER else 99
+
+        if bid_order < current_order:
             # Completed
             chip_html_parts.append(
                 f"<span style='background:{color};color:#fff;padding:3px 10px;"
                 f"border-radius:4px;font-size:0.8em;font-weight:600;'>✅ {label}</span>"
             )
-        elif i == baseline_index:
+        elif bid == baseline_id:
             # Running
             chip_html_parts.append(
                 f"<span style='background:{color};color:#fff;padding:3px 10px;"
@@ -266,6 +276,8 @@ def render_pipeline_status(pipeline_state: dict) -> None:
     # logic so the engine can show "down" (red) when actually stopped.
     if status == "stopped":
         engine_alive = False
+    elif status == "degraded":
+        engine_alive = None  # unknown/warning state
     else:
         engine_alive = True  # Any running mode (dumb, random_subset, one_at_a_time, etc.)
     engine_cls, engine_dot = _health_class(engine_alive)
@@ -282,8 +294,24 @@ def render_pipeline_status(pipeline_state: dict) -> None:
 
     sl_cycles = slow_loop.get("total_inferences", 0)
     sl_last = slow_loop.get("last_cycle_time", "")
-    sl_secondary = f"{sl_last[-8:]}" if sl_last and len(sl_last) >= 8 else "waiting"
-    sl_detail = f"{sl_cycles} inferences" if sl_cycles else "idle"
+    sl_alive_val = slow_loop.get("alive")
+    sl_total_rules = slow_loop.get("total_rules_pushed", 0)
+
+    # Determine display based on actual state:
+    # - alive=True + cycles > 0 → "N inferences" + time
+    # - alive=True + 0 cycles   → "running" + "active" (in-process, hasn't completed a cycle yet)
+    # - alive=None + running pipeline → "in-process" + "active"
+    # - alive=False/None + stopped → "idle" + "waiting"
+    if sl_cycles > 0:
+        sl_detail = f"{sl_cycles} inference{'s' if sl_cycles != 1 else ''}"
+        sl_secondary = f"{sl_last[-8:]}" if sl_last and len(sl_last) >= 8 else "active"
+    elif sl_alive_val is True or (sl_alive_val is None and status == "running"):
+        # Slow Loop is alive but no inference cycle completed yet — show "running"
+        sl_detail = f"{sl_total_rules} rules" if sl_total_rules else "running"
+        sl_secondary = "active"
+    else:
+        sl_detail = "idle"
+        sl_secondary = "waiting"
 
     mode = mutator.get("mode", "dumb").upper().replace("_", " ")
     k = mutator.get("k", "?")
@@ -398,6 +426,12 @@ def render_eps_chart(eps_history: list) -> None:
     """Render the real-time EPS line chart."""
     _section_label("EPS Over Time")
 
+    # Filter out NaN/inf values
+    eps_history = [
+        (t, e) for t, e in eps_history
+        if isinstance(e, (int, float)) and e == e  # NaN check
+    ]
+
     if len(eps_history) < 2:
         st.info("Collecting data — EPS chart will appear after a few refresh cycles.")
         return
@@ -419,10 +453,10 @@ PAGE_SIZE = 20
 
 
 def _format_timestamp(ts: float) -> str:
-    """Safely format a unix timestamp to a human-readable string."""
+    """Safely format a unix timestamp to a human-readable string (GMT+7)."""
     try:
-        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
-            "%Y-%m-%d %H:%M:%S UTC"
+        return datetime.fromtimestamp(ts, tz=_GMT7).strftime(
+            "%Y-%m-%d %H:%M:%S GMT+7"
         )
     except (TypeError, ValueError, OSError):
         return "unknown"
@@ -588,7 +622,7 @@ def render_rules_table(rules: list) -> None:
             "Type":      r.get("rule_type", "?"),
             "Offset":    f"{r.get('offset_start', '?')}-{r.get('offset_end', '?')}",
             "FieldType": r.get("field_type", "?"),
-            "Priority":  f"{r.get('priority', 0):.2f}",
+            "Priority":  f"{max(0, min(1, float(r.get('priority', 0)))):.2f}",
             "Hits":      r.get("hit_count", 0),
             "Crashes":   r.get("crash_count", 0),
         })
@@ -653,8 +687,8 @@ def render_footer(stats: dict) -> None:
     if latest_ts:
         try:
             dt = datetime.fromtimestamp(
-                latest_ts, tz=timezone.utc
-            ).strftime("%H:%M:%S UTC")
+                latest_ts, tz=_GMT7
+            ).strftime("%H:%M:%S GMT+7")
             last_seen = f"Last packet: {dt}"
         except (TypeError, ValueError):
             last_seen = "Last packet: unknown"

@@ -13,8 +13,18 @@ Or via Docker:
 
 from __future__ import annotations
 
+import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+# Ensure project root is on sys.path so `from web_ui.xxx` always resolves.
+# This fixes the classic "No module named 'web_ui'" when running:
+#     streamlit run web_ui/app.py
+# from any working directory.
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 import streamlit as st
 
@@ -95,8 +105,9 @@ def main() -> None:
     elapsed = now - st.session_state.last_refresh
     eps = compute_eps(stats, st.session_state.prev_stats, elapsed)
 
-    # Update EPS history
-    ts_label = datetime.now().strftime("%H:%M:%S")
+    # Update EPS history (GMT+7 timezone)
+    _GMT7 = timezone(timedelta(hours=7))
+    ts_label = datetime.now(tz=_GMT7).strftime("%H:%M:%S")
     st.session_state.eps_history.append((ts_label, eps))
     if len(st.session_state.eps_history) > EPS_HISTORY_LEN:
         st.session_state.eps_history = \

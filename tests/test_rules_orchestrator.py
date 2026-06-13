@@ -51,10 +51,13 @@ class TestPacketSignature:
         sig = packet_signature("", prefix_bytes=4)
         assert sig.startswith(":0:")
 
-    def test_same_prefix_same_length_is_duplicate(self):
+    def test_same_prefix_same_length_short_packets_are_distinct(self):
+        """Short packets with same prefix+length but different trailing bytes
+        should produce DIFFERENT signatures — they are not true duplicates.
+        This prevents over-deduplication of short protocol messages."""
         sig1 = packet_signature("deadbeef0005aa", prefix_bytes=4)
         sig2 = packet_signature("deadbeef0005bb", prefix_bytes=4)
-        assert sig1 == sig2  # Same prefix + same length → duplicate
+        assert sig1 != sig2  # Different trailing bytes → different signature
 
     def test_different_content_different_sig(self):
         """Packets with same prefix+length but different body content

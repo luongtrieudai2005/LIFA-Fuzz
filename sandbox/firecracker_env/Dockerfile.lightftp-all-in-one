@@ -1,0 +1,48 @@
+FROM debian:bookworm-slim AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc make git libssl-dev libc6-dev libgnutls28-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone and compile LightFTP with ASAN
+RUN cd /tmp && \
+    git clone https://github.com/hfiref0x/LightFTP.git && \
+    cd LightFTP && \
+    git checkout 5980ea1 && \
+    cd Source/Release && \
+    gcc -fsanitize=address -static-libasan -g -O2 -c ../*.c -I.. && \
+    gcc -fsanitize=address -static-libasan -g -O2 -o fftp *.o -lpthread -lgnutls && \
+    cp fftp /usr/local/bin/fftp && \
+    chmod +x /usr/local/bin/fftp
+
+# Runtime image
+FROM debian:bookworm-slim
+
+# Install runtime dependencies only (no gcc/git)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    iproute2 libssl3 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy compiled fftp from builder
+COPY --from=builder /usr/local/bin/fftp /usr/local/bin/fftp
+
+# Write fftp.conf
+RUN mkdir -p /tmp/ftp_root && \
+    printf 'rootdir=/tmp/ftp_root\nport=21\nmaxusers=100\nmaxcmds=10000\ngoodbyemsg=Goodbye!\n' > /etc/fftp.conf
+
+# Create /init script — starts fftp directly (no SSH needed!)
+RUN printf '#!/bin/sh\n\
+mount -t proc proc /proc\n\
+mount -t sysfs sysfs /sys\n\
+mount -t devtmpfs devtmpfs /dev\n\
+mount -t tmpfs tmpfs /tmp\n\
+mkdir -p /dev/pts\n\
+mount -t devpts devpts /dev/pts\n\
+ip link set lo up\n\
+ip addr add 172.16.0.2/24 dev eth0\n\
+ip link set eth0 up\n\
+ip route add default via 172.16.0.1\n\
+echo "LIFA-Fuzz: LightFTP ready on 172.16.0.2:21 (ASAN enabled)"\n\
+exec /usr/local/bin/fftp /etc/fftp.conf\n' > /init && chmod +x /init
+

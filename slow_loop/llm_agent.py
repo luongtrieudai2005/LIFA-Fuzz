@@ -443,6 +443,64 @@ TRAFFIC_SAMPLE_TEMPLATE = """\
 {hex_xxd}
 """
 
+SYSTEM_PROMPT_INCREMENTAL_APPEND = """\
+
+## INCREMENTAL GRAMMAR UPDATE MODE
+
+A "PREVIOUS GRAMMAR" block is provided below containing your prior \
+inference of this protocol.  NEW packets have arrived since that analysis.
+
+Your task is to UPDATE the grammar based on the new evidence:
+1. **Confirm**: If new packets validate existing fields, keep them (adjust \
+   confidence UP).
+2. **Extend**: If new packets reveal additional enum values, wider length \
+   ranges, or new field boundaries, add or modify fields accordingly.
+3. **Correct**: If new evidence contradicts a previous field (wrong offset, \
+   wrong type, wrong strategy), fix it.
+4. **Prune**: Remove fields that were likely hallucinated if new packets \
+   show no evidence for them.
+
+IMPORTANT RULES:
+- Return the COMPLETE updated grammar — not a diff.  Every field from the \
+  previous grammar must appear in your output unless you have explicit \
+  evidence to remove it.
+- New fields should only be added when you have clear evidence from the \
+  new packets.
+- The output format is IDENTICAL to a full inference.
+- Do NOT duplicate fields.  If a field's boundaries change, output the \
+  corrected version only.
+"""
+
+SYSTEM_PROMPT_FEEDBACK_APPEND = """\
+
+## RESPONSE FEEDBACK GUIDELINES
+
+A "RESPONSE FEEDBACK" block provides REAL server response statistics from
+your previously generated rules. This is the most valuable signal for
+improving your grammar.
+
+Follow these rules:
+
+1. **High rejection rate (>70%)** → Your field offsets or types are likely WRONG.
+   The server rejects packets because the mutated bytes are not at the expected
+   protocol field locations. Try DIFFERENT offsets or field boundaries.
+
+2. **High timeout rate (>30%)** → The server may be crashing or hanging.
+   This could indicate a real vulnerability, OR your packets are malformed.
+   Check if length fields are causing buffer overflows.
+
+3. **Normal exits** → Your rules are causing the server to shut down.
+   This is NOT a crash — it's the server closing the connection gracefully.
+   Reduce the aggressiveness of boundary values.
+
+4. **Low rejection, high acceptance** → Your grammar is ACCURATE.
+   Keep these fields and focus on deepening coverage.
+
+5. **CRITICAL**: Use this feedback to CORRECT your previous grammar.
+   Do NOT repeat the same mistakes. If boundary_values on offset X has
+   95% rejection, either the offset is wrong or the field type is wrong.
+"""
+
 
 # =============================================================================
 # LLMAgent
@@ -505,7 +563,14 @@ class LLMAgent:
         self.max_retries = max_retries
         self.session_budget_tokens = session_budget_tokens
         self.session_budget_usd = session_budget_usd
-        self.enable_thinking = True  # Override via setter after init
+        # Default to thinking-DISABLED. enable_thinking is a GLM/Z.ai-specific
+        # flag passed via extra_body; with it left ON, GLM-5 spends all tokens
+        # on reasoning_content and returns an empty .content → every call fails
+        # → silent bootstrap fallback. Thinking ON is the wrong default for the
+        # project's configured provider, and harmless to disable for
+        # OpenAI/Anthropic (they ignore the extra_body field). Config can still
+        # opt back in via the setter, e.g. agent.enable_thinking = True.
+        self.enable_thinking = False
 
         # Runtime stats
         self._total_inferences: int = 0
@@ -543,6 +608,8 @@ class LLMAgent:
         self,
         traffic_input: Union[list[TrafficRecord], dict[str, Any]],
         math_hint: Optional[str] = None,
+        previous_grammar_summary: Optional[dict[str, Any]] = None,
+        response_feedback: Optional[str] = None,
     ) -> ProtocolGrammar:
         """Analyze traffic and infer protocol grammar.
 
@@ -558,6 +625,16 @@ class LLMAgent:
                            into the LLM prompt so the model can focus on
                            semantic naming and confirmation rather than raw
                            byte-level discovery.
+            previous_grammar_summary: Optional condensed grammar from the
+                           previous successful LLM inference.  When provided,
+                           the prompt is switched to incremental mode: only
+                           new packets are sent and the LLM is instructed to
+                           UPDATE the existing grammar rather than re-derive
+                           from scratch.  Reduces token consumption from
+                           O(N) to O(ΔN).
+            response_feedback: Optional response statistics text from the
+                           mutator showing accepted/rejected/timeout counts
+                           per rule type. Enables closed-loop grammar refinement.
 
         Returns:
             A validated ``ProtocolGrammar`` with inferred protocol structure.
@@ -567,7 +644,12 @@ class LLMAgent:
             RuntimeError: If the LLM API call fails after all retries.
             ValueError: If the LLM response cannot be parsed.
         """
-        prompt = self._build_prompt_from_input(traffic_input, math_hint=math_hint)
+        prompt = self._build_prompt_from_input(
+            traffic_input,
+            math_hint=math_hint,
+            previous_grammar_summary=previous_grammar_summary,
+            response_feedback=response_feedback,
+        )
 
         # ── Context window guard ─────────────────────────────────────
         estimated = estimate_tokens(prompt)
@@ -811,7 +893,11 @@ class LLMAgent:
     # -----------------------------------------------------------------
 
     def build_prompt(
-        self, samples: list[TrafficRecord], math_hint: Optional[str] = None
+        self,
+        samples: list[TrafficRecord],
+        math_hint: Optional[str] = None,
+        previous_grammar_summary: Optional[dict[str, Any]] = None,
+        response_feedback: Optional[str] = None,
     ) -> str:
         """Construct the user prompt from traffic samples.
 
@@ -825,10 +911,17 @@ class LLMAgent:
               LLM treats it as a prior, not an afterthought.
             - xxd-style formatting with offset rulers eliminates off-by-one
               errors in offset_start/offset_end.
+            - When ``previous_grammar_summary`` is provided, the prompt is
+              switched to INCREMENTAL mode: the previous grammar is included
+              so the LLM can UPDATE rather than re-derive.
 
         Args:
             samples: Traffic records to include in the prompt.
             math_hint: Optional pre-computed heatmap from DifferentialAnalyzer.
+            previous_grammar_summary: Optional condensed grammar from the
+                previous inference cycle (enables incremental mode).
+            response_feedback: Optional response stats from the mutator
+                (enables closed-loop grammar refinement).
 
         Returns:
             The formatted user message string.
@@ -854,22 +947,51 @@ class LLMAgent:
                 )
             )
 
-        header = (
-            f"Analyze {len(clean_samples)} clean network traffic packets below.\n"
-            f"Each packet shows hex data with byte-offset rulers.\n"
-            f"Identify magic bytes, length fields, checksums, enum values, "
-            f"and any repeating structural patterns.\n\n"
-        )
+        # ── Incremental vs. full-inference header ──────────────────
+        if previous_grammar_summary:
+            header = (
+                f"Review {len(clean_samples)} NEW network traffic packets that "
+                f"arrived since your last analysis.\n"
+                f"Each packet shows hex data with byte-offset rulers.\n"
+                f"Compare them against the PREVIOUS GRAMMAR below and "
+                f"return the COMPLETE UPDATED grammar.\n\n"
+            )
+        else:
+            header = (
+                f"Analyze {len(clean_samples)} clean network traffic packets below.\n"
+                f"Each packet shows hex data with byte-offset rulers.\n"
+                f"Identify magic bytes, length fields, checksums, enum values, "
+                f"and any repeating structural patterns.\n\n"
+            )
 
         # Heatmap BEFORE samples — LLM reads top-to-bottom, so the
         # mathematical priors establish a framework before seeing raw bytes.
         prompt = header
         if math_hint:
             prompt += math_hint + "\n\n"
-            prompt += (
-                "Using the heatmap above as priors, "
-                "analyze the raw packets below:\n\n"
-            )
+            if previous_grammar_summary:
+                prompt += (
+                    "Using the heatmap above AND the previous grammar below, "
+                    "analyze the new packets:\n\n"
+                )
+            else:
+                prompt += (
+                    "Using the heatmap above as priors, "
+                    "analyze the raw packets below:\n\n"
+                )
+
+        # Response feedback — placed after heatmap but before traffic
+        # so the LLM sees how its previous rules performed BEFORE
+        # analyzing new traffic.
+        if response_feedback:
+            prompt += response_feedback + "\n\n"
+
+        # Previous grammar — placed after heatmap but BEFORE new packets
+        # so the LLM can reference it while analysing new data.
+        if previous_grammar_summary:
+            prompt += self._format_previous_grammar(previous_grammar_summary)
+            prompt += "\n\n"
+
         prompt += "\n".join(parts)
 
         return prompt
@@ -878,6 +1000,8 @@ class LLMAgent:
         self,
         traffic_input: Union[list[TrafficRecord], dict[str, Any]],
         math_hint: Optional[str] = None,
+        previous_grammar_summary: Optional[dict[str, Any]] = None,
+        response_feedback: Optional[str] = None,
     ) -> str:
         """Route to the correct prompt builder based on input type."""
         if isinstance(traffic_input, dict):
@@ -889,18 +1013,50 @@ class LLMAgent:
             prompt = ""
             if math_hint:
                 prompt += math_hint + "\n\n"
-                prompt += (
-                    "Using the mathematical heatmap above as priors, "
-                    "analyze the traffic sessions below:\n\n"
+                if previous_grammar_summary:
+                    prompt += (
+                        "Using the heatmap above AND the previous grammar "
+                        "below, analyze the new traffic sessions:\n\n"
+                    )
+                else:
+                    prompt += (
+                        "Using the mathematical heatmap above as priors, "
+                        "analyze the traffic sessions below:\n\n"
+                    )
+
+            # Response feedback — after heatmap, before traffic
+            if response_feedback:
+                prompt += response_feedback + "\n\n"
+
+            # Previous grammar — incremental context for the LLM
+            if previous_grammar_summary:
+                prompt += self._format_previous_grammar(
+                    previous_grammar_summary
                 )
+                prompt += "\n\n"
+
             prompt += traffic_str
-            prompt += (
-                "\n\nAnalyze the traffic sessions above and infer the "
-                "protocol wire format. Output a single JSON object."
-            )
+
+            # Closing instruction — varies by mode
+            if previous_grammar_summary:
+                prompt += (
+                    "\n\nCompare the NEW traffic sessions above against the "
+                    "PREVIOUS GRAMMAR and return the COMPLETE UPDATED grammar "
+                    "as a single JSON object."
+                )
+            else:
+                prompt += (
+                    "\n\nAnalyze the traffic sessions above and infer the "
+                    "protocol wire format. Output a single JSON object."
+                )
             return prompt
         elif isinstance(traffic_input, list):
-            return self.build_prompt(traffic_input, math_hint=math_hint)
+            return self.build_prompt(
+                traffic_input,
+                math_hint=math_hint,
+                previous_grammar_summary=previous_grammar_summary,
+                response_feedback=response_feedback,
+            )
         else:
             raise TypeError(
                 f"Expected list[TrafficRecord] or dict, got {type(traffic_input)}"
@@ -976,6 +1132,17 @@ class LLMAgent:
         # build_prompt() injects it deterministically.
         if "MATHEMATICAL PRE-ANALYSIS" in prompt:
             system_content += SYSTEM_PROMPT_FUSION_APPEND
+
+        # Incremental inference: when a previous grammar summary was
+        # provided, append the incremental update instructions so the
+        # LLM knows to UPDATE rather than re-derive from scratch.
+        if "PREVIOUS GRAMMAR" in prompt:
+            system_content += SYSTEM_PROMPT_INCREMENTAL_APPEND
+
+        # Response feedback: when server response stats are provided,
+        # append the feedback guidelines so the LLM knows how to use them.
+        if "RESPONSE FEEDBACK" in prompt:
+            system_content += SYSTEM_PROMPT_FEEDBACK_APPEND
 
         messages = [
             {"role": "system", "content": system_content},
@@ -1166,6 +1333,69 @@ class LLMAgent:
         # Apply ±25% jitter to prevent synchronized retries
         jitter = base * 0.25 * (2 * random.random() - 1)
         return max(0.5, base + jitter)
+
+    # -----------------------------------------------------------------
+    # Incremental Grammar Formatting
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def _format_previous_grammar(summary: dict[str, Any]) -> str:
+        """Format a previous grammar summary as a token-efficient text block.
+
+        Designed to be injected verbatim into the LLM's user prompt.
+        Uses pipe-delimited columns (same style as the math heatmap)
+        for consistency and token efficiency.
+
+        Args:
+            summary: Condensed grammar dict from
+                ``RulesOrchestrator._condense_grammar()``.
+
+        Returns:
+            Multi-line string with the previous grammar context.
+        """
+        proto = summary.get("protocol_name", "unknown")
+        conf = summary.get("confidence") or 0.0
+        magic = summary.get("magic_bytes", "none")
+        fields = summary.get("fields", [])
+
+        lines = [
+            "## PREVIOUS GRAMMAR (your last inference — UPDATE this)",
+            f'Protocol: "{proto}"  Confidence: {conf:.2f}  '
+            f"Magic: {magic or 'none'}",
+            f"Fields: {len(fields)}",
+            "",
+            "  # | name          | offset      | type       | strategy         | const | values",
+            "----+---------------+-------------+------------+------------------+-------+--------",
+        ]
+
+        for i, f in enumerate(fields, 1):
+            offset_end = f.get("offset_end", -1)
+            if offset_end == -1:
+                off_str = f"[{f['offset_start']}, end)"
+            else:
+                off_str = f"[{f['offset_start']}, {offset_end})"
+            name = f.get("name", "?")[:13]
+            ftype = f.get("field_type", "?")[:10]
+            strat = f.get("mutation_strategy", "?")[:16]
+            const = "YES" if f.get("is_constant") else ""
+            vals = ""
+            pv = f.get("possible_values")
+            if pv:
+                vals = ",".join(str(v) for v in pv[:5])
+                if len(pv) > 5:
+                    vals += f",...({len(pv)})"
+            lines.append(
+                f"  {i} | {name:<13s} | {off_str:<11s} | "
+                f"{ftype:<10s} | {strat:<16s} | {const:<5s} | {vals}"
+            )
+
+        reasoning = summary.get("reasoning")
+        if reasoning:
+            # Truncate to keep prompt compact
+            lines.append("")
+            lines.append(f"Previous reasoning: {reasoning[:400]}")
+
+        return "\n".join(lines)
 
     # -----------------------------------------------------------------
     # Response Parsing

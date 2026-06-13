@@ -37,6 +37,12 @@ sandbox:
     host_ip: "172.16.0.1"         # Host-side IP on the TAP bridge
     vm_ip: "172.16.0.2"           # Static IP assigned to the VM
     socket_path: "/tmp/firecracker-lifa.sock"
+    # Target name: "vulnerable_server" (default), "lightftp", or "lighttpd"
+    # When "lightftp": rootfs must be built with scripts/build_rootfs_lightftp.sh,
+    # driver will SSH-provision LightFTP (clone + ASAN compile) at VM boot.
+    target_name: "lightftp"
+    # Rootfs path — must match the target. Use rootfs_lightftp.ext4 for LightFTP.
+    rootfs_path: "sandbox/firecracker_env/rootfs_lightftp.ext4"
 
 # -----------------------------------------------------------------------------
 # Fast Loop (Block 2)
@@ -102,7 +108,7 @@ slow_loop:
   parser:
     read_interval_ms: 5000       # How often to read the traffic log
     max_samples_per_batch: 20   # Max traffic samples sent to LLM per inference
-    min_samples_before_infer: 5 # Minimum samples before first LLM inference
+    min_samples_before_infer: 2 # Minimum samples before first LLM inference
 
   # LLM Agent settings
   llm_agent:

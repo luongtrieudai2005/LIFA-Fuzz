@@ -7,13 +7,10 @@ Spins up:
     1. Docker Sandbox (target server only)
     2. Interceptor (async MitM proxy between client and target)
     3. Client Subprocess (local process connecting to Interceptor)
-	    4. Mutation Engine (captures packets, injects mutations)
+    4. Mutation Engine (captures packets, injects mutations)
     5. Crash Monitor (watches for target crashes, auto-recovers)
     6. Slow Loop Daemon (Parser → LLM → Rule Generator, as subprocess)
-
-Visual monitoring is handled by the Streamlit Web Dashboard:
-    docker compose -f sandbox/docker-compose.yml up web_dashboard
-    → http://localhost:8501
+    7. Streamlit Dashboard (auto-started at http://localhost:8501)
 
 Usage:
     # FREE Mock Mode — no API key needed:
@@ -25,14 +22,17 @@ Usage:
     # Production (no test payloads):
     python main.py --no-kill-server
 
+    # Headless (no dashboard):
+    python main.py --no-dashboard
+
     # Stop and cleanup:
     python main.py --stop
 
 Architecture:
     All Fast Loop components run in a single asyncio event loop.
-    The Slow Loop runs as a separate subprocess (independent lifecycle,
-    independent failure domain — a hung LLM call never blocks the
-    Fast Loop).
+    The Slow Loop and Dashboard run as separate subprocesses
+    (independent lifecycles, independent failure domains —
+    a hung LLM call or dashboard crash never blocks the Fast Loop).
 """
 
 from __future__ import annotations
@@ -100,8 +100,8 @@ async def start_slow_loop(
     try:
         proc = subprocess.Popen(
             [sys.executable, str(slow_loop_script), "--config", config_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             cwd=str(Path(__file__).parent),
         )
         logger.info(f"Slow Loop daemon started (PID={proc.pid})")
@@ -133,6 +133,102 @@ def stop_slow_loop(proc: Optional[subprocess.Popen]) -> None:
 
 
 # =============================================================================
+# Dashboard Subprocess Manager
+# =============================================================================
+
+
+def _find_streamlit() -> Optional[str]:
+    """Locate the streamlit executable in the current Python environment.
+
+    Returns:
+        Absolute path to the streamlit binary, or None if not found.
+    """
+    # 1. Check in the same bin/ directory as the current interpreter
+    python_bin = Path(sys.executable).parent
+    candidate = python_bin / "streamlit"
+    if candidate.exists():
+        return str(candidate)
+
+    # 2. Try python -m streamlit (works even if no standalone binary)
+    return None
+
+
+def start_dashboard(port: int = 8501) -> Optional[subprocess.Popen]:
+    """Launch the Streamlit dashboard as a background subprocess.
+
+    The dashboard reads from shared files (runtime_state.json,
+    active_rules.json, crashes/) — fully stateless, no IPC needed.
+
+    Args:
+        port: Port to serve the dashboard on (default 8501).
+
+    Returns:
+        The subprocess handle, or None if launch failed.
+    """
+    dashboard_script = Path(__file__).parent / "web_ui" / "app.py"
+    if not dashboard_script.exists():
+        logger.warning(
+            "web_ui/app.py not found — dashboard will not start"
+        )
+        return None
+
+    # Build command: prefer `streamlit run`, fall back to `python -m streamlit`
+    streamlit_bin = _find_streamlit()
+    if streamlit_bin:
+        cmd = [
+            streamlit_bin, "run", str(dashboard_script),
+            "--server.port", str(port),
+            "--server.headless", "true",
+            "--browser.gatherUsageStats", "false",
+        ]
+    else:
+        cmd = [
+            sys.executable, "-m", "streamlit", "run", str(dashboard_script),
+            "--server.port", str(port),
+            "--server.headless", "true",
+            "--browser.gatherUsageStats", "false",
+        ]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=str(Path(__file__).parent),
+        )
+        logger.info(
+            f"Dashboard started (PID={proc.pid}) → http://localhost:{port}"
+        )
+        return proc
+    except FileNotFoundError:
+        logger.warning(
+            "streamlit not found — install with: pip install streamlit"
+        )
+        return None
+    except OSError as e:
+        logger.error(f"Failed to start dashboard: {e}")
+        return None
+
+
+def stop_dashboard(proc: Optional[subprocess.Popen]) -> None:
+    """Stop the dashboard subprocess gracefully."""
+    if proc is None:
+        return
+    logger.info(f"Stopping dashboard (PID={proc.pid})...")
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            logger.warning("Dashboard did not exit in time — killing")
+            proc.kill()
+            proc.wait(timeout=3)
+        logger.info("Dashboard stopped")
+    except Exception as e:
+        logger.error(f"Error stopping dashboard: {e}")
+
+
+# =============================================================================
 # Runtime State Writer (background task — feeds the dashboard)
 # =============================================================================
 
@@ -156,8 +252,16 @@ async def _state_writer_task(
     Writes shared/runtime_state.json for the dashboard to read.
     Each component read is wrapped in its own try/except so one
     failure does not prevent the others from being written.
+
+    Step 3: Also writes CSV telemetry snapshots every ~10s for
+    state coverage plotting (logs/state_coverage_stats.csv).
     """
     state_path = RUNTIME_STATE_FILE
+
+    # Step 3: CSV logger for state coverage telemetry
+    _csv_logger = None
+    _csv_write_interval = 10.0  # seconds between CSV snapshots
+    _last_csv_write = 0.0
 
     while not shutdown_event.is_set():
         try:
@@ -225,8 +329,10 @@ async def _state_writer_task(
                     total_accepted=ms.total_accepted,
                     total_rejected=ms.total_rejected,
                     total_crashes=ms.total_crashes,
+                    total_timeout=ms.total_timeout,
                     investigation_mode=ms.investigation_mode,
                     rule_set_version=ms.rule_set_version,
+                    active_rule_count=ms.active_rule_count,
                 )
             except Exception:
                 mutator_state = MutatorState()
@@ -300,6 +406,24 @@ async def _state_writer_task(
             )
             write_runtime_state(state, state_path)
 
+            # ── Step 3: CSV Telemetry (every ~10s) ────────────────────
+            if uptime - _last_csv_write >= _csv_write_interval:
+                try:
+                    if _csv_logger is None:
+                        from evaluation.state_coverage_logger import StateCoverageLogger
+                        _csv_logger = StateCoverageLogger()
+                        _csv_logger.init_file()
+                    cs = mutator.coverage_summary
+                    _csv_logger.write_snapshot(
+                        executions=cs["total_mutations"],
+                        unique_code_branches=cs["unique_offsets_fuzzed"],
+                        unique_states=cs.get("unique_states", 0),
+                        unique_state_edges=cs.get("unique_state_edges", 0),
+                    )
+                    _last_csv_write = uptime
+                except Exception:
+                    pass  # CSV failure must not crash the state writer
+
         except Exception as e:
             logger.warning(f"State writer error: {e}")
 
@@ -314,18 +438,33 @@ async def _state_writer_task(
 async def run_pipeline(
     driver_name: str = "docker",
     kill_server_ratio: float = 0.01,
+    config: Optional[dict[str, Any]] = None,
+    no_dashboard: bool = False,
+    dashboard_port: int = 8501,
 ) -> None:
     """Start the full LIFA-Fuzz pipeline.
 
-    Boots: Sandbox → Interceptor → Mutator → Crash Monitor → Slow Loop.
-    All visual monitoring is handled by the separate Web Dashboard.
+    Boots: Sandbox → Interceptor → Mutator → Crash Monitor → Slow Loop → Dashboard.
     """
     global _shutdown_event
     _shutdown_event = asyncio.Event()
 
+    # Load config (passed from main() or loaded fresh for standalone use)
+    _cfg = config or {}
+    if not _cfg:
+        _config_path = Path("config.yaml")
+        if _config_path.exists():
+            try:
+                import yaml
+                with open(_config_path, encoding="utf-8") as f:
+                    _cfg = yaml.safe_load(f) or {}
+            except Exception:
+                pass
+
     # Track background tasks for clean shutdown
     background_tasks: list[asyncio.Task] = []
     slow_loop_proc: Optional[subprocess.Popen] = None
+    dashboard_proc: Optional[subprocess.Popen] = None
     pipeline_start_time = time.monotonic()
 
     try:
@@ -361,6 +500,21 @@ async def run_pipeline(
 
         sandbox: BaseSandbox = driver_cls()
 
+        # For Firecracker: pass config parameters to the driver
+        # so it selects the correct rootfs and target provisioning.
+        if driver_name == "firecracker":
+            fc_cfg = _cfg.get("sandbox", {}).get("firecracker", {})
+            # Update driver attributes from config before start()
+            for key, val in fc_cfg.items():
+                if hasattr(sandbox, key) and not key.startswith("_"):
+                    try:
+                        setattr(sandbox, key, val)
+                    except (AttributeError, TypeError):
+                        pass
+            # Re-apply target-aware defaults (rootfs_path, kernel_args, target_port)
+            # now that target_name is set from config
+            sandbox._apply_target_defaults()
+
         logger.info("Starting LIFA-Fuzz pipeline")
         await sandbox.start()
 
@@ -370,7 +524,12 @@ async def run_pipeline(
 
         # Wait for containers to stabilize
         await asyncio.sleep(2)
-        assert await sandbox.is_target_alive(), "Target is not alive!"
+        alive = await sandbox.is_target_alive()
+        if not alive:
+            raise RuntimeError(
+                "Target server is not alive after startup. "
+                "Check sandbox logs for errors."
+            )
 
         # ── 2. Interceptor ──────────────────────────────────────────
         from fast_loop.interceptor import Interceptor
@@ -397,8 +556,19 @@ async def run_pipeline(
         # ── 3. Client Subprocess ──────────────────────────────────
         from fast_loop.client_process import ClientSubprocess
 
+        # Select client script based on target protocol
+        # "lightftp" → FTP client, everything else → default LIFA binary client
+        fc_cfg = _cfg.get("sandbox", {}).get("firecracker", {})
+        target_name = fc_cfg.get("target_name", "vulnerable_server")
+        if target_name == "lightftp":
+            client_script = "sandbox/client/ftp_client.py"
+            logger.info("Using FTP client for LightFTP target")
+        else:
+            client_script = "sandbox/client/client.py"
+            logger.info("Using default LIFA binary protocol client")
+
         client_proc = ClientSubprocess(
-            script_path="sandbox/client/client.py",
+            script_path=client_script,
             target_host="127.0.0.1",
             target_port=8001,  # Interceptor's listen port
         )
@@ -468,6 +638,7 @@ async def run_pipeline(
             sequence is flushed as one SeedSequence.
             """
             last_pos = 0
+            last_byte_offset = 0
             last_size = 0
             session_timeout = 2.0   # seconds before flushing a session buffer
             # session_id → {"packets": [TrafficRecord, ...], "last_seen": float}
@@ -482,17 +653,18 @@ async def run_pipeline(
                     cur_size = p.stat().st_size
                     # Detect file rotation/truncation — reset position
                     if cur_size < last_size:
-                        last_pos = 0
+                        last_byte_offset = 0
                         session_buffers.clear()
                     last_size = cur_size
 
-                    with open(p) as f:
-                        lines = f.readlines()
-                    # Clamp last_pos in case of external truncation
-                    if last_pos > len(lines):
-                        last_pos = 0
+                    new_lines = []
+                    with open(p, "r", encoding="utf-8") as f:
+                        f.seek(last_byte_offset)
+                        new_lines = f.readlines()
+                        last_byte_offset = f.tell()
+
                     now = time.time()
-                    for line in lines[last_pos:]:
+                    for line in new_lines:
                         line = line.strip()
                         if not line:
                             continue
@@ -529,7 +701,6 @@ async def run_pipeline(
                                     await seed_queue.put(
                                         SeedSequence(packets=[tr])
                                     )
-                    last_pos = len(lines)
 
                     # Flush session buffers that have been idle too long
                     expired = [
@@ -547,8 +718,8 @@ async def run_pipeline(
                             )
                         )
 
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Seed feeder error (non-fatal): {e}")
                 await asyncio.sleep(1.0)
 
             # Final flush: emit any remaining buffered sessions on shutdown
@@ -558,8 +729,8 @@ async def run_pipeline(
                         await seed_queue.put(
                             SeedSequence(session_id=sid, packets=buf["packets"])
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Seed feeder final flush error: {e}")
             session_buffers.clear()
 
         seed_feeder_task = asyncio.create_task(
@@ -570,6 +741,12 @@ async def run_pipeline(
         # ── 7. Slow Loop Daemon ────────────────────────────────────
         llm_mode = os.environ.get("LLM_MODE", "REAL").upper()
         slow_loop_proc = await start_slow_loop()
+
+        # ── 7a. Dashboard ──────────────────────────────────────────
+        if not no_dashboard:
+            dashboard_proc = start_dashboard(port=dashboard_port)
+        else:
+            logger.info("Dashboard disabled (--no-dashboard flag)")
 
         # ── 7b. Runtime State Writer ───────────────────────────────
         # Background task: aggregates state from all components every 2s
@@ -605,7 +782,8 @@ async def run_pipeline(
                 "kill_server_ratio": kill_server_ratio,
                 "llm_mode": llm_mode,
                 "slow_loop_pid": slow_loop_proc.pid if slow_loop_proc else None,
-                "dashboard": "http://localhost:8501",
+                "dashboard_pid": dashboard_proc.pid if dashboard_proc else None,
+                "dashboard": f"http://localhost:{dashboard_port}",
             }},
         )
 
@@ -673,8 +851,8 @@ async def run_pipeline(
                     "total_injected": ms.total_sent,
                 }},
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Could not collect final stats: {e}")
 
         # 4. Stop components in reverse order
         try:
@@ -695,7 +873,10 @@ async def run_pipeline(
         # 5. Stop Slow Loop subprocess
         stop_slow_loop(slow_loop_proc)
 
-        # 6. Flush logs
+        # 6. Stop Dashboard subprocess
+        stop_dashboard(dashboard_proc)
+
+        # 7. Flush logs
         shutdown_logging()
         logger.info("Cleanup complete. Goodbye!")
 
@@ -755,9 +936,11 @@ Examples:
   # Production (no test payloads):
   python main.py --no-kill-server
 
-  # Dashboard (separate terminal):
-  docker compose -f sandbox/docker-compose.yml up web_dashboard
-  → http://localhost:8501
+  # Headless (no dashboard):
+  python main.py --no-dashboard
+
+  # Custom dashboard port:
+  python main.py --dashboard-port 9000
 
   # Cleanup:
   python main.py --stop
@@ -779,6 +962,17 @@ Examples:
         action="store_true",
         help="Disable KILL_SERVER payloads (for production fuzzing)",
     )
+    parser.add_argument(
+        "--no-dashboard",
+        action="store_true",
+        help="Do not auto-start the Streamlit dashboard",
+    )
+    parser.add_argument(
+        "--dashboard-port",
+        type=int,
+        default=8501,
+        help="Dashboard port (default: 8501)",
+    )
 
     args = parser.parse_args()
 
@@ -792,6 +986,9 @@ Examples:
         asyncio.run(run_pipeline(
             driver_name=args.driver,
             kill_server_ratio=kill_server_ratio,
+            config=_cfg,
+            no_dashboard=args.no_dashboard,
+            dashboard_port=args.dashboard_port,
         ))
 
 

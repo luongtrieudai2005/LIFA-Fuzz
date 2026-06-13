@@ -70,8 +70,10 @@ class MutatorState(BaseModel):
     total_accepted: int = 0
     total_rejected: int = 0
     total_crashes: int = 0
+    total_timeout: int = 0
     investigation_mode: bool = False
     rule_set_version: int = 0
+    active_rule_count: int = 0
 
 
 class SlowLoopState(BaseModel):

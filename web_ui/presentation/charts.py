@@ -82,11 +82,10 @@ def build_eps_chart(eps_history: list[tuple[str, float]]) -> go.Figure:
 
 
 def build_traffic_breakdown(stats: dict[str, Any]) -> go.Figure:
-    """Build the traffic direction donut chart.
+    """Build the traffic direction donut chart with response breakdown.
 
-    Uses ``total_injected`` (from mutator via runtime_state.json) as the
-    mutation count since MutationEngine sends directly to target — the
-    traffic log only captures Interceptor-relayed packets.
+    Shows accepted/rejected/timeout/crash response categories from the
+    mutator's response-aware sending, plus normal traffic categories.
 
     Args:
         stats: Traffic stats dict from ``readers.read_traffic_stats()``.
@@ -94,26 +93,32 @@ def build_traffic_breakdown(stats: dict[str, Any]) -> go.Figure:
     Returns:
         Plotly Figure ready for ``st.plotly_chart()``.
     """
-    # FIX: compute disjoint traffic categories.
-    # client_packets = all C2S from traffic log (includes mutated)
-    # server_packets = all S2C from traffic log
-    # mutated = injected by mutator (bypasses interceptor)
-    # For a meaningful donut, show: (C2S legitimate) | (S2C) | (Mutated)
+    # Response breakdown from mutator (via runtime_state.json)
+    accepted = stats.get("total_accepted", 0)
+    rejected = stats.get("total_rejected", 0)
+    timeout = stats.get("total_timeout", 0)
+    crash = stats.get("total_crashes", 0)
     total_c2s = stats.get("client_packets", 0)
     total_s2c = stats.get("server_packets", 0)
-    mutated = max(
-        stats.get("mutated_packets", 0),
-        stats.get("total_injected", 0),
-    )
-    # Subtract mutated from C2S to avoid double-counting
-    legitimate_c2s = max(0, total_c2s - stats.get("mutated_packets", 0))
-    labels = ["Client → Server", "Server → Client", "Mutated"]
-    values = [
-        legitimate_c2s,
-        total_s2c,
-        mutated,
-    ]
-    colors = [_CYAN, _GREEN, _AMBER]
+
+    # Build categories — prioritize response breakdown when available
+    has_response_data = accepted + rejected + timeout + crash > 0
+
+    if has_response_data:
+        labels = ["✓ Accepted", "✗ Rejected", "⏱ Timeout", "💥 Crash",
+                  "C2S Normal", "S2C Response"]
+        values = [accepted, rejected, timeout, crash, total_c2s, total_s2c]
+        colors = ["#5fb86e", "#e74c3c", "#d4963a", "#9b59b6", _CYAN, _GREEN]
+    else:
+        # Fallback: no response data yet
+        mutated = max(
+            stats.get("mutated_packets", 0),
+            stats.get("total_injected", 0),
+        )
+        legitimate_c2s = max(0, total_c2s - stats.get("mutated_packets", 0))
+        labels = ["Client → Server", "Server → Client", "Mutated"]
+        values = [legitimate_c2s, total_s2c, mutated]
+        colors = [_CYAN, _GREEN, _AMBER]
 
     fig = go.Figure(data=[go.Pie(
         labels=labels,

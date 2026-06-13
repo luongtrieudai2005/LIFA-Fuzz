@@ -91,12 +91,24 @@ def read_traffic_stats() -> dict[str, Any]:
 
     # Override injection count from runtime_state.json (authoritative source)
     # The mutator sends directly to target, so its total_sent > log count
+    # Also read response breakdown (accepted/rejected/timeout/crash)
+    total_accepted = 0
+    total_rejected_rs = 0
+    total_timeout = 0
+    total_crashes_rs = 0
+
     if RUNTIME_STATE.exists():
         try:
             state = json.loads(RUNTIME_STATE.read_text(encoding="utf-8"))
-            mut_total_sent = state.get("mutator", {}).get("total_sent", 0)
+            mut_state = state.get("mutator", {})
+            mut_total_sent = mut_state.get("total_sent", 0)
             if mut_total_sent > injected:
                 injected = mut_total_sent
+            # Response breakdown
+            total_accepted = mut_state.get("total_accepted", 0)
+            total_rejected_rs = mut_state.get("total_rejected", 0)
+            total_timeout = mut_state.get("total_timeout", 0)
+            total_crashes_rs = mut_state.get("total_crashes", 0)
             # Also use runtime_state timestamp if fresher than traffic log
             rt_ts = state.get("timestamp", 0)
             if rt_ts and (latest_ts is None or rt_ts > latest_ts):
@@ -112,19 +124,40 @@ def read_traffic_stats() -> dict[str, Any]:
         "server_packets": server_pkts,
         "mutated_packets": mutated_pkts,
         "latest_timestamp": latest_ts,
+        "total_accepted": total_accepted,
+        "total_rejected": total_rejected_rs,
+        "total_timeout": total_timeout,
+        "total_crashes": total_crashes_rs,
     }
 
 
 def read_active_rules() -> list[dict]:
-    """Load active rules from the shared JSON file."""
+    """Load active rules from the shared JSON file.
+
+    Handles two formats:
+      - A flat list: [{...}, {...}, ...]
+      - A dict with "rules" key: {"rules": [{...}, ...], "protocol_name": ...}
+    """
     if not RULES_FILE.exists():
         return []
     try:
         with open(RULES_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, list) else []
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and "rules" in data:
+            return data["rules"] if isinstance(data["rules"], list) else []
+        return []
     except (json.JSONDecodeError, OSError):
         return []
+
+
+def _safe_mtime(p: Path) -> float:
+    """Safe mtime that returns 0 if file is deleted mid-scan."""
+    try:
+        return p.stat().st_mtime
+    except OSError:
+        return 0.0
 
 
 def read_crash_records() -> list[dict]:
@@ -141,7 +174,7 @@ def read_crash_records() -> list[dict]:
     for json_file in sorted(
         list(CRASHES_DIR.glob("crash_*.json"))
         + list(CRASHES_DIR.glob("*.report.json")),
-        key=lambda p: p.stat().st_mtime,
+        key=_safe_mtime,
         reverse=True,
     ):
         try:
