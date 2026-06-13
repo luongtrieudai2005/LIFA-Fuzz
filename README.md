@@ -300,17 +300,76 @@ LIFA-Fuzz includes automated academic benchmarking for three research questions:
 | **B** (Math-Only) | `smart` | ON | OFF | Bootstrap rules from analyzer, earlier crashes |
 | **C** (Full Fusion) | `smart` | ON | ON | Complete pipeline, fastest crash discovery |
 
-### CLI Commands
+### Reproducing the Experiments
+
+The `evaluation_runner` is a single command that runs the full A→B→C benchmark with custom duration, sandbox backend, and target. Below is the complete, copy-paste-able path from a fresh checkout to reproduced results.
+
+#### 1. One-time setup
 
 ```bash
-# Run full benchmark (requires Docker, 5 min per baseline):
-python -m evaluation.evaluation_runner --duration 300
+# Firecracker requires hardware virtualization (KVM). Verify on Linux/WSL2:
+[ -e /dev/kvm ] && echo "KVM OK" || echo "KVM missing — enable nested virtualization"
 
-# RQ1 accuracy evaluation (no Docker needed):
+# Build the LightFTP rootfs (compiles LightFTP with ASAN, packs an ext4 image).
+# Produces sandbox/firecracker_env/rootfs_lightftp.ext4
+bash scripts/build_rootfs_lightftp.sh
+
+# Baseline C needs an LLM API key. Put it in .env (see .env.example):
+#   OPENAI_API_KEY=<your key>          # Z.ai / OpenAI-compatible
+cp .env.example .env && $EDITOR .env
+```
+
+#### 2. Prep the workspace (before each campaign)
+
+```bash
+# Archives prior results, kills orphaned Firecracker/Docker resources,
+# purges stray core dumps, and clears shared state. Always run first so
+# each campaign starts from a clean, known-good baseline.
+python3 scripts/cleanup.py --force
+```
+
+#### 3. Run the benchmark
+
+```bash
+# Canonical command — run all three baselines, 600s each, on LightFTP/Firecracker
+python -m evaluation.evaluation_runner \
+    --duration 600 \
+    --baseline all \
+    --driver firecracker \
+    --target lightftp
+```
+
+- Baselines run **sequentially** (A → 10s gap → B → C). Total wall time ≈ `duration × 3`.
+- The Streamlit dashboard auto-starts at **http://localhost:8501** (live EPS, crashes, LLM insights, eval progress). Disable with `--no-dashboard`.
+- Telemetry is snapshotted every 10s into `evaluation/results/<baseline>/telemetry.jsonl`.
+
+#### 4. CLI reference
+
+| Flag | Values | Default | Purpose |
+|------|--------|---------|---------|
+| `--duration` | int (seconds) | `300` | Duration **per baseline** |
+| `--baseline` | `A` / `B` / `C` / `all` | `all` | Which baseline(s) to run |
+| `--driver` | `docker` / `firecracker` | `docker` | Sandbox backend (use `firecracker` for production) |
+| `--target` | `lifa` / `lighttpd` / `lightftp` | `lifa` | Target server (use `lightftp` for the real FTP target) |
+| `--no-dashboard` | flag | off | Skip auto-starting the dashboard |
+| `--dashboard-port` | int | `8501` | Dashboard port |
+
+> Note: the CLI defaults (`docker`, `lifa`) suit the original dummy target. **For the real experiments reported in the paper, always pass `--driver firecracker --target lightftp`.**
+
+#### 5. Common variants
+
+```bash
+# Quick smoke test — single baseline, 60s, Docker (no KVM needed)
+python -m evaluation.evaluation_runner --baseline A --duration 60 --driver docker
+
+# RQ1 grammar-inference accuracy — no sandbox/VM required
 python -m evaluation.rq1_accuracy
 
-# Generate plots from synthetic data (no Docker needed):
-python -m evaluation.plot_generator --synthetic
+# Generate paper-ready plots from the latest campaign results
+python -m evaluation.plot_generator
+
+# Quick core-dump sweep between runs (does not touch results/state)
+python3 scripts/cleanup.py --cores-only
 ```
 
 ### Generated Outputs
@@ -321,6 +380,8 @@ python -m evaluation.plot_generator --synthetic
 | Cumulative Crashes | `evaluation/plots/rq3_cumulative_crashes.png` | RQ3: Vulnerability discovery |
 | Accuracy Bars | `evaluation/plots/rq1_accuracy_bars.png` | RQ1: Grammar inference |
 | Telemetry Snapshots | `evaluation/results/{baseline}/telemetry.jsonl` | All RQs |
+| Side-by-side Summary | `evaluation/results/comparison.json` | All RQs |
+| Archived Campaigns | `evaluation/archive/<target>_<driver>_<ts>/` | History |
 
 ---
 
