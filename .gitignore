@@ -37,6 +37,8 @@ shared/runtime_state.json
 shared/slow_loop_state.json
 shared/adaptive_k.json
 shared/active_rules.json
+shared/response_buffer.jsonl
+shared/rule_response_stats.json
 logs/
 
 # Evaluation generated outputs (keep source, ignore results)
