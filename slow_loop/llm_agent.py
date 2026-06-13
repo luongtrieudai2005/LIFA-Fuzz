@@ -292,19 +292,24 @@ trigger a memory corruption vulnerability. Use the following priority guide:
 
 ## FIELD TYPE REFERENCE
 
-The `field_type` MUST be one of exactly 8 values:
+The `field_type` MUST be one of exactly 15 values:
 - `uint8`         — unsigned 8-bit integer
 - `uint16_le`     — unsigned 16-bit little-endian
 - `uint16_be`     — unsigned 16-bit big-endian
 - `uint32_le`     — unsigned 32-bit little-endian
 - `uint32_be`     — unsigned 32-bit big-endian
+- `int8`          — signed 8-bit integer
+- `int16_le`      — signed 16-bit little-endian
+- `int16_be`      — signed 16-bit big-endian
+- `int32_le`      — signed 32-bit little-endian
+- `int32_be`      — signed 32-bit big-endian
 - `bytes`         — raw unstructured bytes (payloads, unknown regions, padding)
 - `enum`          — discrete set of values (opcodes, command types, flags)
 - `string`        — null-terminated or length-delimited text
+- `bool`          — single-byte boolean (0x00=false, any other value=true)
+- `reserved`      — padding / unused bytes
 
-NOTE: For signed fields, use the unsigned type of the same width.
-NOTE: For boolean fields, use `enum` with `possible_values: ["00", "01"]`.
-NOTE: For padding/reserved regions, use `bytes` with `is_constant: true`.
+NOTE: For padding/reserved regions, use `reserved` with `is_constant: true`.
 
 ## MUTATION STRATEGY REFERENCE
 
@@ -473,32 +478,18 @@ IMPORTANT RULES:
 
 SYSTEM_PROMPT_FEEDBACK_APPEND = """\
 
-## RESPONSE FEEDBACK GUIDELINES
+## RESPONSE FEEDBACK (STRUCTURED JSON)
 
-A "RESPONSE FEEDBACK" block provides REAL server response statistics from
-your previously generated rules. This is the most valuable signal for
-improving your grammar.
+A "RESPONSE FEEDBACK" block contains REAL server response statistics from
+your previously generated rules, as structured JSON. Read the `field_stats`
+array (per-strategy accepted/rejected/timeout/crash counts and `accept_rate`)
+and the `guidance_rules` for interpretation.
 
-Follow these rules:
-
-1. **High rejection rate (>70%)** → Your field offsets or types are likely WRONG.
-   The server rejects packets because the mutated bytes are not at the expected
-   protocol field locations. Try DIFFERENT offsets or field boundaries.
-
-2. **High timeout rate (>30%)** → The server may be crashing or hanging.
-   This could indicate a real vulnerability, OR your packets are malformed.
-   Check if length fields are causing buffer overflows.
-
-3. **Normal exits** → Your rules are causing the server to shut down.
-   This is NOT a crash — it's the server closing the connection gracefully.
-   Reduce the aggressiveness of boundary values.
-
-4. **Low rejection, high acceptance** → Your grammar is ACCURATE.
-   Keep these fields and focus on deepening coverage.
-
-5. **CRITICAL**: Use this feedback to CORRECT your previous grammar.
-   Do NOT repeat the same mistakes. If boundary_values on offset X has
-   95% rejection, either the offset is wrong or the field type is wrong.
+High rejection (>70%) on a strategy → the field offsets/types for that
+strategy are likely WRONG. Try different boundaries. High timeout (>30%) →
+server may be crashing. Low rejection + high acceptance → grammar is
+accurate for those fields; deepen coverage instead. Use this feedback to
+CORRECT your previous grammar — do not repeat rejected offsets.
 """
 
 
@@ -576,6 +567,11 @@ class LLMAgent:
         self._total_inferences: int = 0
         self._total_tokens_used: int = 0
         self._session_tokens_used: int = 0
+        # Prompt caching: input tokens served from the provider's cache
+        # (OpenAI-compatible cached_tokens). The system prompt + few-shot
+        # examples are a large stable prefix reused across inferences, so a
+        # high cache-hit ratio means real input cost is well below nominal.
+        self._cached_tokens_used: int = 0
         self._last_response: str = ""
         self._last_error: str = ""
 
@@ -610,6 +606,7 @@ class LLMAgent:
         math_hint: Optional[str] = None,
         previous_grammar_summary: Optional[dict[str, Any]] = None,
         response_feedback: Optional[str] = None,
+        _fresh: bool = False,
     ) -> ProtocolGrammar:
         """Analyze traffic and infer protocol grammar.
 
@@ -710,8 +707,12 @@ class LLMAgent:
         # return the last known good grammar instead of attempting
         # another call.  This prevents crash-loops in the Slow Loop
         # during transient API outages.
+        # _fresh (self-consistency): bypass — every sample must be a REAL
+        # inference, otherwise the vote is corrupted by duplicate cached
+        # grammars and self-consistency loses all meaning.
         if (
-            self._consecutive_failures >= 3
+            not _fresh
+            and self._consecutive_failures >= 3
             and self._last_known_good_grammar is not None
         ):
             logger.warning(
@@ -725,13 +726,13 @@ class LLMAgent:
             response_text = await self.call_llm(prompt)
         except RuntimeError:
             # call_llm() exhausted all retries — fallback immediately
-            if self._last_known_good_grammar is not None:
+            if not _fresh and self._last_known_good_grammar is not None:
                 logger.warning(
                     "LLM call failed — returning cached grammar as fallback"
                 )
                 self._total_inferences += 1
                 return self._last_known_good_grammar
-            # No cache available — propagate to caller (orchestrator)
+            # No cache available, or _fresh mode — propagate to caller.
             raise
 
         self._last_response = response_text
@@ -742,7 +743,7 @@ class LLMAgent:
             # API call succeeded but response was malformed.
             # Do NOT increment _consecutive_failures — that tracks API
             # failures, not parse errors.  Return cached grammar if available.
-            if self._last_known_good_grammar is not None:
+            if not _fresh and self._last_known_good_grammar is not None:
                 logger.warning(
                     "LLM response parse failed — returning cached grammar"
                 )
@@ -750,9 +751,13 @@ class LLMAgent:
                 return self._last_known_good_grammar
             raise
 
-        # Cache successful grammar for fallback + persist to disk
+        # Cache successful grammar for fallback + persist to disk.
+        # _fresh (self-consistency): skip cache write + dashboard log so N
+        # intermediate samples don't churn disk / overwrite the dashboard N
+        # times. The final voted grammar is what matters for offline RQ1.
         self._last_known_good_grammar = grammar
-        self._save_cache()
+        if not _fresh:
+            self._save_cache()
         self._consecutive_failures = 0
 
         self._total_inferences += 1
@@ -764,9 +769,193 @@ class LLMAgent:
         )
 
         # Write the prompt + response to shared file for the Web Dashboard
-        self._log_inference(prompt, response_text, grammar)
+        if not _fresh:
+            self._log_inference(prompt, response_text, grammar)
 
         return grammar
+
+    # -----------------------------------------------------------------
+    # Self-Consistency (offline / RQ1 accuracy only)
+    # -----------------------------------------------------------------
+
+    async def infer_protocol_self_consistent(
+        self,
+        traffic_input: Union[list[TrafficRecord], dict[str, Any]],
+        math_hint: Optional[str] = None,
+        previous_grammar_summary: Optional[dict[str, Any]] = None,
+        response_feedback: Optional[str] = None,
+        n_samples: int = 5,
+        vote_temp: float = 0.7,
+    ) -> ProtocolGrammar:
+        """Infer grammar via self-consistency: N samples + majority vote.
+
+        Generates ``n_samples`` independent inferences at a higher temperature
+        (so the reasoning paths are genuinely diverse — self-consistency needs
+        diversity; at the default low temperature the samples would be near-
+        identical and voting would be meaningless), then keeps the fields that
+        appear in a majority of samples.
+
+        Literature: Wang et al., "Self-Consistency Improves Chain of Thought
+        Reasoning" (ICLR 2023) — +17.9% on GSM8K. Particularly effective for
+        high-stakes structured extraction where a single wrong offset ruins a
+        rule.
+
+        OFFLINE ONLY. Do NOT call this on the hot fuzzing path — it costs
+        N× latency and tokens. It is intended for RQ1 grammar-accuracy
+        evaluation, where the F1 vs ground-truth is the metric that matters
+        and a few extra inferences are cheap.
+
+        Note on concurrency: ``self.temperature`` is temporarily raised for
+        the sampling loop and restored in a ``finally``. Because it is an
+        instance attribute, concurrent ``infer_protocol`` calls on the same
+        agent would race — keep self-consistency calls isolated (offline,
+        sequential).
+
+        Args:
+            traffic_input: Same as ``infer_protocol``.
+            math_hint:     Optional heatmap hint (forwarded to each sample).
+            previous_grammar_summary: Optional previous grammar (forwarded).
+            response_feedback: Optional response stats (forwarded).
+            n_samples:     Number of independent inferences. 3-5 is a good
+                           accuracy/cost trade-off.
+            vote_temp:     Sampling temperature for diversity. Must be higher
+                           than the default 0.2 to produce diverse paths.
+
+        Returns:
+            A ``ProtocolGrammar`` whose fields are the majority-voted set.
+
+        Raises:
+            RuntimeError: If every sample failed.
+        """
+        grammars: list[ProtocolGrammar] = []
+        original_temp = self.temperature
+        self.temperature = vote_temp
+        try:
+            for i in range(n_samples):
+                try:
+                    # _fresh=True: bypass the cache-fallback paths inside
+                    # infer_protocol so each sample is a genuinely independent
+                    # inference. Without this, a single transient failure
+                    # returns the cached grammar and the vote gets dominated
+                    # by duplicate cache objects.
+                    g = await self.infer_protocol(
+                        traffic_input,
+                        math_hint=math_hint,
+                        previous_grammar_summary=previous_grammar_summary,
+                        response_feedback=response_feedback,
+                        _fresh=True,
+                    )
+                    grammars.append(g)
+                except (RuntimeError, ValueError) as e:
+                    logger.debug(f"Self-consistency sample {i + 1}/{n_samples} failed: {e}")
+                    continue
+        finally:
+            self.temperature = original_temp
+
+        if not grammars:
+            raise RuntimeError(
+                f"All {n_samples} self-consistency samples failed"
+            )
+
+        voted = self._vote_grammars(grammars)
+        logger.info(
+            f"Self-consistency: {len(grammars)}/{n_samples} samples succeeded, "
+            f"{len(voted.fields)} fields survived majority vote "
+            f"(threshold >{len(grammars) / 2:.1f} samples)"
+        )
+        return voted
+
+    @staticmethod
+    def _vote_grammars(
+        grammars: list[ProtocolGrammar],
+    ) -> ProtocolGrammar:
+        """Majority-vote a set of grammars into one, field by field.
+
+        Votes on field *position* — ``(offset_start, normalized_length)`` —
+        because the offset is what drives the RQ1 precision/recall metric
+        (a ±1-byte offset shift is the dominant source of F1 loss). A field
+        position is kept iff it appears in strictly more than half the samples.
+
+        Two robustness measures over a naive (offset, end, type) signature:
+
+        1. **Variable-length collapse.** A payload field may be reported as
+           ``offset_end = -1`` in some samples but as a resolved large value
+           in others. Normalizing ``offset_end <= 0`` (or absurdly large) to
+           a ``-1`` length sentinel keeps the same logical field in one group
+           instead of splintering it — otherwise a field 100% of samples agree
+           on could be dropped purely because of end-offset formatting.
+
+        2. **Type drift collapse.** The same offset may be typed ``bytes`` in
+           one sample and ``string`` in another. The vote keeps the field if
+           its *position* wins, then resolves ``field_type`` (and other
+           per-field attrs) by majority within the winning group — so a type
+           disagreement no longer causes the field to be dropped.
+
+        Metadata (protocol_name, magic_bytes, sizes, confidence, reasoning)
+        is taken from the base grammar that shares the most winning fields,
+        so the returned object still carries useful protocol-level context.
+
+        Args:
+            grammars: Non-empty list of inferred grammars.
+
+        Returns:
+            A grammar whose ``fields`` is the majority-voted set.
+
+        Raises:
+            ValueError: If ``grammars`` is empty (the caller is expected to
+                short-circuit, but we guard defensively since this is a
+                public static method).
+        """
+        if not grammars:
+            raise ValueError("_vote_grammars requires at least one grammar")
+        if len(grammars) == 1:
+            return grammars[0]
+
+        from collections import Counter
+
+        # Variable-length threshold: an end offset that is -1, non-positive,
+        # or extends >4KB past the start is treated as "variable/rest-of-packet".
+        _VARIABLE_MIN_EXTENT = 4096
+
+        def _norm_key(f: Any) -> tuple[int, int]:
+            extent = f.offset_end - f.offset_start if f.offset_end > 0 else -1
+            if extent < 0 or extent > _VARIABLE_MIN_EXTENT:
+                extent = -1  # collapse all variable-length variants together
+            return (f.offset_start, extent)
+
+        # Count position consensus + collect candidate fields per position.
+        pos_counter: Counter[tuple[int, int]] = Counter()
+        pos_fields: dict[tuple[int, int], list[Any]] = {}
+        for g in grammars:
+            for f in g.fields:
+                key = _norm_key(f)
+                pos_counter[key] += 1
+                pos_fields.setdefault(key, []).append(f)
+
+        threshold = len(grammars) / 2
+        winning_keys = {key for key, cnt in pos_counter.items() if cnt > threshold}
+
+        # For each winning position, resolve field_type (and pick a
+        # representative field) by majority among the samples at that position.
+        winning_fields: list[Any] = []
+        for key in winning_keys:
+            candidates = pos_fields[key]
+            type_counter = Counter(f.field_type.value for f in candidates)
+            majority_type = type_counter.most_common(1)[0][0]
+            rep = next(f for f in candidates if f.field_type.value == majority_type)
+            winning_fields.append(rep)
+
+        # Stable ordering by offset for a deterministic output.
+        winning_fields.sort(key=lambda f: f.offset_start)
+
+        # Pick the base grammar that agrees with the most winning positions, so
+        # protocol-level metadata (name, magic, sizes) is as representative
+        # as possible.
+        def _agrees(g: ProtocolGrammar) -> int:
+            return sum(1 for f in g.fields if _norm_key(f) in winning_keys)
+
+        base = max(grammars, key=_agrees)
+        return base.model_copy(update={"fields": winning_fields})
 
     # -----------------------------------------------------------------
     # Fallback & Reset
@@ -874,6 +1063,7 @@ class LLMAgent:
             "total_inferences": self._total_inferences,
             "total_tokens_used": self._total_tokens_used,
             "session_tokens_used": self._session_tokens_used,
+            "cached_tokens_used": self._cached_tokens_used,
             "session_budget_tokens": self.session_budget_tokens,
             "cost_per_inference": self.cost_per_inference,
             "total_cost_usd": round(self.total_cost_usd, 4),
@@ -888,6 +1078,15 @@ class LLMAgent:
             "last_error": self._last_error,
         }
 
+    @property
+    def cached_tokens_used(self) -> int:
+        """Cumulative input tokens served from the provider's prompt cache.
+
+        Exposed for telemetry/dashboard so the real (cache-discounted) LLM
+        input cost can be reported alongside the nominal token count.
+        """
+        return self._cached_tokens_used
+
     # -----------------------------------------------------------------
     # Prompt Construction
     # -----------------------------------------------------------------
@@ -898,6 +1097,7 @@ class LLMAgent:
         math_hint: Optional[str] = None,
         previous_grammar_summary: Optional[dict[str, Any]] = None,
         response_feedback: Optional[str] = None,
+        max_samples: Optional[int] = None,
     ) -> str:
         """Construct the user prompt from traffic samples.
 
@@ -922,6 +1122,10 @@ class LLMAgent:
                 previous inference cycle (enables incremental mode).
             response_feedback: Optional response stats from the mutator
                 (enables closed-loop grammar refinement).
+            max_samples: Optional cap on the number of traffic samples included
+                in the prompt. If None, auto-detect: 4 in incremental mode
+                (previous grammar present) or 10 on first inference. Caps the
+                dominant token cost of the prompt.
 
         Returns:
             The formatted user message string.
@@ -933,6 +1137,22 @@ class LLMAgent:
         clean_samples = [s for s in samples if not s.is_mutated]
         if not clean_samples:
             return "No clean (non-mutated) traffic samples available for analysis."
+
+        # Adaptive sample count — the traffic samples dominate prompt token cost.
+        #   - First inference (no previous grammar): send up to ~10 samples so the
+        #     LLM has enough material to derive structure from scratch.
+        #   - Incremental (previous grammar present): the LLM only needs to UPDATE,
+        #     so ~4 new samples suffice — large token saving across a campaign.
+        # Take evenly-spaced samples across the timeline rather than the first N,
+        # to avoid biasing toward the start of the traffic log.
+        if max_samples is None:
+            max_samples = 4 if previous_grammar_summary else 10
+        # Defensive clamp: max_samples <= 0 would either divide by zero
+        # (== 0) or produce a nonsensical slice (negative). Force at least 1.
+        max_samples = max(1, int(max_samples))
+        if len(clean_samples) > max_samples:
+            step = max(1, len(clean_samples) // max_samples)
+            clean_samples = clean_samples[::step][:max_samples]
 
         parts: list[str] = []
         for idx, sample in enumerate(clean_samples):
@@ -1218,6 +1438,19 @@ class LLMAgent:
                     )
                     self.cost_per_inference = round(input_cost + output_cost, 6)
                     self.total_cost_usd += self.cost_per_inference
+
+                    # Prompt caching (OpenAI-compatible): track cached input
+                    # tokens so we can report the real (discounted) input cost.
+                    # litellm exposes it as usage.prompt_tokens_details.cached_tokens.
+                    # Different providers (Anthropic) use different shapes, so
+                    # probe defensively.
+                    cached = _extract_cached_tokens(response.usage)
+                    if cached:
+                        self._cached_tokens_used += cached
+                        logger.debug(
+                            f"Cache hit: {cached} cached input tokens "
+                            f"(cumulative {self._cached_tokens_used})"
+                        )
 
                     logger.debug(
                         f"Token usage: prompt={response.usage.prompt_tokens}, "
@@ -1647,6 +1880,52 @@ def _format_hex_xxd(hex_str: str, bytes_per_row: int = 16) -> str:
             f"  {i:04x}:  {hex_line:<{bytes_per_row * 3}}  |{ascii_line}|"
         )
     return "\n".join(lines)
+
+
+def _extract_cached_tokens(usage: Any) -> int:
+    """Extract the count of input tokens served from the provider's cache.
+
+    Different providers expose this under different shapes:
+      - OpenAI / OpenAI-compatible (incl. Z.ai GLM via litellm):
+        ``usage.prompt_tokens_details.cached_tokens``
+      - Anthropic: ``usage.cache_read_input_tokens`` (cache_creation separately)
+      - litellm normalized: sometimes ``usage.prompt_tokens_details`` as a dict.
+
+    Probes each defensively; returns 0 when no cache field is present (the
+    provider does not support caching, or this was a cold/first request).
+
+    Args:
+        usage: The ``response.usage`` object from litellm.
+
+    Returns:
+        Number of cached input tokens (0 if none / unsupported).
+    """
+    if usage is None:
+        return 0
+
+    # Shape 1: prompt_tokens_details.cached_tokens (OpenAI-compatible)
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details is not None:
+        cached = getattr(details, "cached_tokens", None)
+        if cached is None and isinstance(details, dict):
+            cached = details.get("cached_tokens")
+        if cached:
+            return int(cached)
+
+    # Shape 2: Anthropic cache_read_input_tokens
+    cache_read = getattr(usage, "cache_read_input_tokens", None)
+    if cache_read:
+        return int(cache_read)
+
+    # Shape 3: dict-style usage (some litellm versions)
+    if isinstance(usage, dict):
+        pd = usage.get("prompt_tokens_details")
+        if isinstance(pd, dict) and pd.get("cached_tokens"):
+            return int(pd["cached_tokens"])
+        if usage.get("cache_read_input_tokens"):
+            return int(usage["cache_read_input_tokens"])
+
+    return 0
 
 
 def estimate_tokens(text: str) -> int:

@@ -990,15 +990,23 @@ class RulesOrchestrator:
         return raw
 
     def _build_response_feedback(self) -> Optional[str]:
-        """Build response feedback text from mutator's rule response stats.
+        """Build response feedback as structured JSON for the LLM.
 
         Collects per-rule-type accepted/rejected/timeout/crash counts and
-        formats them as a text block for the LLM.  This creates a
-        closed-loop feedback cycle: the LLM sees how its rules performed
-        and can adjust offsets, types, and strategies accordingly.
+        formats them as JSON. This creates a closed-loop feedback cycle: the
+        LLM sees how its rules performed and can adjust offsets, types, and
+        strategies accordingly.
+
+        CRITICAL: the output is prefixed with a ``## RESPONSE FEEDBACK`` header
+        because ``LLMAgent.call_llm()`` checks ``"RESPONSE FEEDBACK" in prompt``
+        (uppercase + space) to decide whether to append
+        ``SYSTEM_PROMPT_FEEDBACK_APPEND`` (the guidance instructions). Plain JSON
+        with a ``"response_feedback"`` key would NOT match that marker, silently
+        disabling the guidance. The header keeps the marker working while the
+        body is now compact JSON instead of a wide text table.
 
         Returns:
-            Formatted feedback string, or None if no data available.
+            ``"## RESPONSE FEEDBACK\\n\\n<json>"``, or None if no data available.
         """
         # Read response stats from shared file written by mutator
         try:
@@ -1017,29 +1025,7 @@ class RulesOrchestrator:
         has_previous = self._previous_grammar_summary is not None
         total_rules = len(self._previous_grammar_summary.get("fields", [])) if has_previous else 0
 
-        lines = [
-            "## RESPONSE FEEDBACK FROM PREVIOUS RULES",
-            "",
-        ]
-        if has_previous:
-            lines.append(
-                f"Your previous grammar generated rules for {total_rules} fields. "
-                f"Here is how the server responded to mutations:",
-            )
-        else:
-            lines.append(
-                "The fuzzer has been running. Here are the server response "
-                "statistics by mutation strategy:",
-            )
-
-        lines.append("")
-        lines.append(
-            "  Strategy         | Accepted | Rejected | Timeout | Crash | Total"
-        )
-        lines.append(
-            "------------------+----------+----------+---------+-------+------"
-        )
-
+        field_stats = []
         grand_total = 0
         grand_accepted = 0
         for strategy, counts in data.items():
@@ -1052,47 +1038,37 @@ class RulesOrchestrator:
                 continue
             grand_total += total
             grand_accepted += accepted
-            lines.append(
-                f"  {strategy:<17s} | {accepted:>8,} | {rejected:>8,} | "
-                f"{timeout:>7,} | {crash:>5,} | {total:>5,}"
-            )
+            field_stats.append({
+                "strategy": strategy,
+                "accepted": accepted,
+                "rejected": rejected,
+                "timeout": timeout,
+                "crash": crash,
+                "total": total,
+                "accept_rate": round(accepted / total, 3) if total > 0 else 0.0,
+            })
 
         if grand_total == 0:
             return None
 
-        lines.append("")
-        acceptance_rate = grand_accepted / grand_total * 100
-        lines.append(
-            f"Overall acceptance rate: {acceptance_rate:.1f}% "
-            f"({grand_accepted:,}/{grand_total:,})"
-        )
-
-        # Analysis guidance
-        lines.append("")
-        lines.append("ANALYSIS GUIDANCE:")
-        if acceptance_rate < 30:
-            lines.append(
-                "- VERY LOW acceptance rate — most field offsets are likely WRONG"
-            )
-            lines.append(
-                "  Re-examine byte boundaries carefully and try different offsets"
-            )
-        elif acceptance_rate < 60:
-            lines.append(
-                "- Moderate acceptance rate — some fields are correct, others wrong"
-            )
-            lines.append(
-                "  Focus on strategies with HIGH rejection to fix incorrect fields"
-            )
-        else:
-            lines.append(
-                "- Good acceptance rate — your grammar is mostly accurate"
-            )
-            lines.append(
-                "  Focus on deepening coverage of correctly identified fields"
-            )
-
-        return "\n".join(lines)
+        feedback = {
+            "type": "response_feedback",
+            "version": 2,
+            "total_rules": total_rules if has_previous else None,
+            "field_stats": field_stats,
+            "overall": {
+                "total_sends": grand_total,
+                "accepted": grand_accepted,
+                "acceptance_rate": round(grand_accepted / grand_total, 3),
+            },
+            "guidance_rules": [
+                "High rejection (>70%) on a field → offset or type likely WRONG",
+                "High acceptance on BOUNDARY_VALUES → grammar is accurate",
+                "High timeout (>30%) → server may be crashing",
+            ],
+        }
+        # Marker header (see docstring) + compact JSON body.
+        return "## RESPONSE FEEDBACK\n\n" + _json.dumps(feedback, indent=2)
 
     def _convert_field_rules(
         self, field_rules: list[FieldRule]

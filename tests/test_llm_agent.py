@@ -17,7 +17,13 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from slow_loop.llm_agent import LLMAgent, _hex_to_ascii
-from shared.schemas import Direction, TrafficRecord, ProtocolGrammar
+from shared.schemas import (
+    Direction,
+    TrafficRecord,
+    ProtocolGrammar,
+    InferredField,
+    FieldType,
+)
 
 
 # =============================================================================
@@ -750,3 +756,193 @@ class TestLLMFallback:
 
         assert agent._last_known_good_grammar is None
         assert agent._consecutive_failures == 0
+
+
+# =============================================================================
+# Regression tests for prompt-optimization changes (Steps 1/3/4/9/10)
+# =============================================================================
+
+@pytest.fixture
+def _llm_agent():
+    """A REAL-mode LLMAgent without making any network calls."""
+    return LLMAgent(provider="openai", model="glm-5-turbo", api_key="dummy")
+
+
+def _records(n):
+    return [
+        TrafficRecord(direction=Direction.CLIENT_TO_SERVER, raw_data=bytes([i % 256]) * 8)
+        for i in range(n)
+    ]
+
+
+def test_build_prompt_max_samples_zero_does_not_crash(_llm_agent):
+    """Step 3 regression: max_samples=0 must not raise ZeroDivisionError."""
+    prompt = _llm_agent.build_prompt(_records(5), max_samples=0)
+    # Clamped to 1 → at least the header is present, exactly 1 packet.
+    assert "Packet" in prompt
+
+
+def test_build_prompt_max_samples_negative_clamped(_llm_agent):
+    """Step 3 regression: negative max_samples must not mis-slice."""
+    prompt = _llm_agent.build_prompt(_records(5), max_samples=-3)
+    # Clamped to >=1 → deterministic, no crash, no garbage slice.
+    assert isinstance(prompt, str)
+    assert prompt.count("Packet") >= 1
+
+
+def test_build_prompt_explicit_max_samples_respected(_llm_agent):
+    prompt = _llm_agent.build_prompt(_records(20), max_samples=3)
+    assert prompt.count("Packet") == 3
+
+
+def test_extract_cached_tokens_provider_shapes():
+    from types import SimpleNamespace
+    from slow_loop.llm_agent import _extract_cached_tokens
+    # OpenAI-compatible shape
+    assert _extract_cached_tokens(
+        SimpleNamespace(prompt_tokens_details=SimpleNamespace(cached_tokens=500))
+    ) == 500
+    # dict shape
+    assert _extract_cached_tokens(
+        {"prompt_tokens_details": {"cached_tokens": 300}}
+    ) == 300
+    # Anthropic shape
+    assert _extract_cached_tokens(
+        SimpleNamespace(cache_read_input_tokens=200)
+    ) == 200
+    # no cache field
+    assert _extract_cached_tokens(SimpleNamespace(prompt_tokens=100)) == 0
+    assert _extract_cached_tokens(None) == 0
+
+
+def test_vote_grammars_empty_raises():
+    """Step 9 regression: _vote_grammars([]) must raise, not ValueError-from-max."""
+    with pytest.raises(ValueError):
+        LLMAgent._vote_grammars([])
+
+
+def test_vote_grammars_single_grammar_returned():
+    g = ProtocolGrammar(protocol_name="t", magic_bytes="", fields=[], confidence=0.9)
+    assert LLMAgent._vote_grammars([g]) is g
+
+
+def test_vote_grammars_majority_keeps_shared_drops_minority():
+    """3 grammars: magic appears in all (wins), length in 1 (dropped)."""
+    def fld(o, e, t=FieldType.BYTES, name="f"):
+        return InferredField(
+            name=name, offset_start=o, offset_end=e, field_type=t,
+            mutation_strategy="random_bytes", is_constant=False, possible_values=[],
+        )
+    def gmk(fields):
+        return ProtocolGrammar(protocol_name="t", magic_bytes="", fields=fields, confidence=0.9)
+    g1 = gmk([fld(0, 4, name="magic"), fld(4, 6, FieldType.UINT16_LE, name="len")])
+    g2 = gmk([fld(0, 4, name="magic")])
+    g3 = gmk([fld(0, 4, name="magic")])
+    voted = LLMAgent._vote_grammars([g1, g2, g3])
+    assert len(voted.fields) == 1
+    assert voted.fields[0].offset_start == 0
+
+
+# =============================================================================
+# Deep-audit regression: self-consistency freshness + vote robustness
+# =============================================================================
+
+@pytest.mark.asyncio
+async def test_fresh_bypasses_consecutive_failure_shortcircuit(_llm_agent):
+    """If _consecutive_failures >= 3, _fresh=True must still call the LLM
+    (not return the cached grammar). Simulate by mocking call_llm."""
+    _llm_agent._consecutive_failures = 5
+    _llm_agent._last_known_good_grammar = ProtocolGrammar(
+        protocol_name="CACHED", magic_bytes="", fields=[], confidence=0.5
+    )
+    fresh_grammar = ProtocolGrammar(
+        protocol_name="FRESH", magic_bytes="", fields=[], confidence=0.9
+    )
+    with patch.object(_llm_agent, "call_llm", new=AsyncMock(return_value='{"stub":1}')), \
+         patch.object(_llm_agent, "parse_response", return_value=fresh_grammar), \
+         patch.object(_llm_agent, "_build_prompt_from_input", return_value="p"):
+        result = await _llm_agent.infer_protocol({}, _fresh=True)
+    assert result.protocol_name == "FRESH", "_fresh must bypass the cache short-circuit"
+
+
+@pytest.mark.asyncio
+async def test_non_fresh_returns_cache_on_call_failure(_llm_agent):
+    """Without _fresh, a call_llm RuntimeError returns the cached grammar."""
+    cached = ProtocolGrammar(
+        protocol_name="CACHED", magic_bytes="", fields=[], confidence=0.5
+    )
+    _llm_agent._last_known_good_grammar = cached
+    with patch.object(_llm_agent, "call_llm", new=AsyncMock(side_effect=RuntimeError("boom"))), \
+         patch.object(_llm_agent, "_build_prompt_from_input", return_value="p"):
+        result = await _llm_agent.infer_protocol({})
+    assert result is cached
+
+
+@pytest.mark.asyncio
+async def test_fresh_raises_on_call_failure(_llm_agent):
+    """With _fresh, a call_llm failure must propagate (no cache return)."""
+    _llm_agent._last_known_good_grammar = ProtocolGrammar(
+        protocol_name="CACHED", magic_bytes="", fields=[], confidence=0.5
+    )
+    with patch.object(_llm_agent, "call_llm", new=AsyncMock(side_effect=RuntimeError("boom"))), \
+         patch.object(_llm_agent, "_build_prompt_from_input", return_value="p"):
+        with pytest.raises(RuntimeError):
+            await _llm_agent.infer_protocol({}, _fresh=True)
+
+
+@pytest.mark.asyncio
+async def test_fresh_skips_cache_save(_llm_agent):
+    """_fresh must not write the cache (avoid N× churn in self-consistency)."""
+    fresh_grammar = ProtocolGrammar(
+        protocol_name="FRESH", magic_bytes="", fields=[], confidence=0.9
+    )
+    with patch.object(_llm_agent, "call_llm", new=AsyncMock(return_value='{}')), \
+         patch.object(_llm_agent, "parse_response", return_value=fresh_grammar), \
+         patch.object(_llm_agent, "_build_prompt_from_input", return_value="p"), \
+         patch.object(_llm_agent, "_save_cache") as save_mock, \
+         patch.object(_llm_agent, "_log_inference") as log_mock:
+        await _llm_agent.infer_protocol({}, _fresh=True)
+    save_mock.assert_not_called()
+    log_mock.assert_not_called()
+
+
+def test_vote_collapses_variable_length_variants():
+    """Same payload field reported as offset_end=-1 in one sample and a large
+    resolved value in another must vote TOGETHER, not splinter and get dropped."""
+    def fld(o, e, t=FieldType.BYTES, name="f"):
+        return InferredField(
+            name=name, offset_start=o, offset_end=e, field_type=t,
+            mutation_strategy="random_bytes", is_constant=False, possible_values=[],
+        )
+    def gmk(fields):
+        return ProtocolGrammar(protocol_name="t", magic_bytes="", fields=fields, confidence=0.9)
+    # 3 samples: payload at offset 7 — one variable (-1), two resolved (1023 / 5000)
+    gs = [
+        gmk([fld(7, -1, name="payload")]),
+        gmk([fld(7, 1023, name="payload")]),
+        gmk([fld(7, 5000, name="payload")]),
+    ]
+    voted = LLMAgent._vote_grammars(gs)
+    assert len(voted.fields) == 1, "variable-length variants must collapse to 1 field"
+    assert voted.fields[0].offset_start == 7
+
+
+def test_vote_collapses_type_drift():
+    """Same offset/length but type bytes vs string must keep the field
+    (position wins) and resolve type by majority."""
+    def fld(o, e, t, name="f"):
+        return InferredField(
+            name=name, offset_start=o, offset_end=e, field_type=t,
+            mutation_strategy="random_bytes", is_constant=False, possible_values=[],
+        )
+    def gmk(fields):
+        return ProtocolGrammar(protocol_name="t", magic_bytes="", fields=fields, confidence=0.9)
+    # 3 samples: offset 0:4, types bytes/string/string → majority string
+    gs = [
+        gmk([fld(0, 4, FieldType.BYTES)]),
+        gmk([fld(0, 4, FieldType.STRING)]),
+        gmk([fld(0, 4, FieldType.STRING)]),
+    ]
+    voted = LLMAgent._vote_grammars(gs)
+    assert len(voted.fields) == 1
+    assert voted.fields[0].field_type == FieldType.STRING
