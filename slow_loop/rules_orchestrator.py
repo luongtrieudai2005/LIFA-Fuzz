@@ -1116,18 +1116,27 @@ class RulesOrchestrator:
                 continue
             end = fr.offset + fr.length if fr.length > 0 else 65535
 
-            # STATIC fields: set preserve_bytes + mutation_strategy_override
-            # so the mutator's get_static_fields() picks them up and
-            # get_mutable_fields() excludes them (magic bytes preserved).
+            # STATIC fields: exclude from mutation via mutation_strategy_override
+            # (get_mutable_fields() skips STATIC). preserve_bytes is ONLY set
+            # for the offset-0 STATIC field (the magic header), because
+            # ActiveRuleSet.get_static_fields() treats preserve_bytes as a
+            # packet prefix anchored at offset 0 — the same contract that
+            # rule_generator uses when it carries grammar.magic_bytes on every
+            # rule. Setting preserve_bytes for a non-zero STATIC field violates
+            # that contract: get_static_fields() would either drop it silently,
+            # or — if it is longer than the real magic — overwrite the magic at
+            # offset 0 (corrupting the header every mutated packet sends).
+            # Non-zero STATIC fields are already protected from mutation and
+            # pass through the seed unchanged, so they need no preserve_bytes.
             preserve = b""
             strategy_override = None
             if fr.mutation_strategy == MutationStrategy.STATIC:
-                if fr.static_value:
+                strategy_override = MutationStrategy.STATIC
+                if fr.offset == 0 and fr.static_value:
                     try:
                         preserve = bytes.fromhex(fr.static_value)
                     except ValueError:
                         pass
-                strategy_override = MutationStrategy.STATIC
 
             rule = SemanticRule(
                 rule_type=self._strategy_to_rule_type(fr.mutation_strategy),
