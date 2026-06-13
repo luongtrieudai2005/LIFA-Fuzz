@@ -31,6 +31,11 @@ TRAFFIC_LOG = DATA_DIR / "shared" / "raw_traffic.jsonl"
 RULES_FILE = DATA_DIR / "shared" / "active_rules.json"
 CRASHES_DIR = DATA_DIR / "crashes"
 LLM_LOG = DATA_DIR / "shared" / "llm_last_inference.json"
+# Defined up-front: read_traffic_stats() (below) and the pipeline/evaluation
+# readers all reference it. Previously it was defined ~150 lines after its
+# first use, which only worked by accident via module-global late binding
+# and would NameError if any reader ran during import.
+RUNTIME_STATE = DATA_DIR / "shared" / "runtime_state.json"
 
 # EPS history buffer size (stored in Streamlit session_state)
 EPS_HISTORY_LEN = 120  # ~10 min at 5s refresh
@@ -243,9 +248,6 @@ def read_llm_insights() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-RUNTIME_STATE = DATA_DIR / "shared" / "runtime_state.json"
-
-
 def read_pipeline_status() -> dict[str, Any]:
     """Read the pipeline runtime state file.
 
@@ -299,12 +301,19 @@ def infer_pipeline_status(stats: dict) -> str:
 def compute_eps(stats: dict, prev_stats: dict, elapsed_s: float) -> float:
     """Compute current EPS (injections per second).
 
-    FIX: clamp to [0, 100000] to prevent negative EPS on counter reset
-    and infinite EPS on near-zero elapsed time.
+    Returns 0.0 on the first refresh (no previous sample to delta against).
+    Previously, an empty ``prev_stats`` made the delta equal the entire
+    accumulated injection count, so the very first chart point spiked to the
+    100k clamp — a wildly misleading headline number for a pipeline that had
+    been fuzzing for minutes before the dashboard opened.
     """
     if elapsed_s < 0.1:  # Minimum 100ms to avoid spike
         return 0.0
-    new_injected = stats["total_injected"] - prev_stats.get("total_injected", 0)
+    # No prior sample → we cannot compute a rate; emit 0 and let the next
+    # cycle establish a real delta.
+    if "total_injected" not in prev_stats:
+        return 0.0
+    new_injected = stats["total_injected"] - prev_stats["total_injected"]
     if new_injected < 0:
         return 0.0  # Counter reset — don't show negative
     eps = new_injected / elapsed_s

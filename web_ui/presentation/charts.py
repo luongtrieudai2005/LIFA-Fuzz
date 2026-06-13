@@ -101,16 +101,23 @@ def build_traffic_breakdown(stats: dict[str, Any]) -> go.Figure:
     total_c2s = stats.get("client_packets", 0)
     total_s2c = stats.get("server_packets", 0)
 
-    # Build categories — prioritize response breakdown when available
+    # FIX: the response outcomes (Accepted/Rejected/Timeout/Crash) and the
+    # traffic-direction counts (C2S/S2C) are TWO DIFFERENT populations — the
+    # former are outcomes of injected mutations, the latter are raw captured
+    # packets from the log. Mixing them in one pie made every percent
+    # meaningless (e.g. a 90% acceptance rate showed as ~53% because 1000
+    # outcomes were diluted with 700 direction packets). When we have response
+    # data, show ONLY the mutation-outcome distribution so each percent is a
+    # real acceptance/rejection rate.
     has_response_data = accepted + rejected + timeout + crash > 0
 
     if has_response_data:
-        labels = ["✓ Accepted", "✗ Rejected", "⏱ Timeout", "💥 Crash",
-                  "C2S Normal", "S2C Response"]
-        values = [accepted, rejected, timeout, crash, total_c2s, total_s2c]
-        colors = ["#5fb86e", "#e74c3c", "#d4963a", "#9b59b6", _CYAN, _GREEN]
+        labels = ["✓ Accepted", "✗ Rejected", "⏱ Timeout", "💥 Crash"]
+        values = [accepted, rejected, timeout, crash]
+        colors = ["#5fb86e", "#e74c3c", "#d4963a", "#9b59b6"]
     else:
-        # Fallback: no response data yet
+        # Fallback: no response data yet — direction breakdown is coherent
+        # here because all three slices are traffic-log populations.
         mutated = max(
             stats.get("mutated_packets", 0),
             stats.get("total_injected", 0),
