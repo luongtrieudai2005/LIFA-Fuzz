@@ -1,1 +1,0 @@
-{"dumb": {"accepted": 717, "rejected": 0, "timeout": 0, "crash": 0}, "epsilon_explore": {"accepted": 18672, "rejected": 0, "timeout": 33, "crash": 0}, "bit_flip": {"accepted": 62092, "rejected": 0, "timeout": 103, "crash": 0}, "boundary_values": {"accepted": 11336, "rejected": 0, "timeout": 5, "crash": 0}, "unknown": {"accepted": 1166, "rejected": 0, "timeout": 0, "crash": 0}}
