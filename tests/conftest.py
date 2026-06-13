@@ -12,7 +12,27 @@ Provides reusable fixtures for:
 
 import pytest
 import asyncio
+import os
+import resource
 from pathlib import Path
+
+
+# ── Suppress core dumps from crashing test targets ──────────────────────
+# Several tests deliberately crash the dummy vulnerable_server (ASAN build).
+# With the kernel's default core_pattern=core, each crash writes core.<pid>
+# into the project root. ASAN already prints a richer report, so we drop
+# RLIMIT_CORE to 0 (inherited by spawned targets) and set
+# ASAN_OPTIONS=disable_coredump=1. Applied at import time so every test —
+# and every target it spawns — is covered.
+try:
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+except (ValueError, OSError):
+    pass
+_existing_asan = os.environ.get("ASAN_OPTIONS", "")
+if "disable_coredump" not in _existing_asan:
+    os.environ["ASAN_OPTIONS"] = ":".join(
+        p for p in (_existing_asan, "disable_coredump=1") if p
+    )
 
 from shared.schemas import (
     ActiveRuleSet,

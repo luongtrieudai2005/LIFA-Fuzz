@@ -78,6 +78,30 @@ def _load_llm_agent_config(config_path: str = "config.yaml") -> dict[str, Any]:
     except Exception:
         return {}
 
+
+def _apply_core_suppression() -> None:
+    """Prevent host-side core dumps from ASAN target crashes.
+
+    Sets ``RLIMIT_CORE`` to 0 for this process (inherited by every spawned
+    child target) and merges ``disable_coredump=1`` into ``ASAN_OPTIONS``.
+    Both are no-ops on systems where core dumps are already off, and never
+    silence ASAN's own textual report — only the redundant raw ``core.<pid>``
+    files that would otherwise litter the project root.
+    """
+    try:
+        import resource
+
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ValueError, OSError, ImportError):
+        # Some sandboxes/CI forbid lowering rlimit — best effort only.
+        pass
+
+    existing = os.environ.get("ASAN_OPTIONS", "")
+    if "disable_coredump" not in existing:
+        os.environ["ASAN_OPTIONS"] = ":".join(
+            p for p in (existing, "disable_coredump=1") if p
+        )
+
 BASELINE_CONFIGS = {
     "A": {
         "label": "baseline_A_random",
@@ -1466,6 +1490,16 @@ Examples:
 
 if __name__ == "__main__":
     load_dotenv(override=False)
+
+    # ── Suppress core dumps (eliminate clutter at the source) ──────────
+    # ASAN targets (LightFTP, dummy vulnerable_server) abort() on crash and
+    # the kernel writes core.<pid> into the crashing process's CWD = project
+    # root. ASAN already prints a richer report than a raw core, so we (1)
+    # drop the host RLIMIT_CORE to 0 and (2) set ASAN_OPTIONS=disable_coredump=1
+    # so any ASAN-instrumented child the runner spawns never dumps a core.
+    # Existing/stray cores are cleaned by ``scripts/cleanup.py --cores-only``.
+    _apply_core_suppression()
+
     # Ensure CWD is project root — all relative paths (sandbox/,
     # shared/, etc.) depend on this. Running from evaluation/ breaks them.
     os.chdir(str(_project_root))

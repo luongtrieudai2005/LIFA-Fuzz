@@ -56,6 +56,102 @@ SHARED_STATE_FILES = [
 ]
 
 
+# Core-dump file patterns produced by crashing ASAN targets.
+# The kernel writes ``core.<pid>`` (core_pattern=core) into the crashing
+# process's CWD, which for host-side test targets is the project root and
+# for Firecracker campaigns ends up copied into archive dirs. ASAN already
+# emits a richer report, so these raw cores are pure clutter.
+CORE_PATTERNS: tuple[str, ...] = ("core", "core.[0-9]*", "*.core", "core.*")
+
+# Directories we never sweep for cores (generated/vendored, not ours).
+_CORE_EXCLUDE_DIRS: frozenset[str] = frozenset({
+    ".venv", "venv", ".git", "__pycache__", ".pytest_cache",
+    ".idea", ".vscode", "node_modules",
+})
+
+
+def _iter_core_files(
+    root: Path,
+    *,
+    exclude_dirs: frozenset[str] = _CORE_EXCLUDE_DIRS,
+    skip_archive: bool = True,
+) -> list[Path]:
+    """Recursively find core-dump files under ``root``.
+
+    Walks the whole tree but prunes vendored/generated dirs. When
+    ``skip_archive`` is True, ``evaluation/archive`` is also pruned so we
+    don't re-move already-archived campaign cores into a new archive
+    (nested archive churn).
+
+    Args:
+        root:          Directory to scan.
+        exclude_dirs:  Directory basenames to skip at any depth.
+        skip_archive:  Also skip ``evaluation/archive``.
+
+    Returns:
+        Sorted list of core-file Paths.
+    """
+    hits: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Prune excluded dirs in-place so os.walk doesn't descend into them
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in exclude_dirs
+            and not (skip_archive and Path(dirpath, d) == EVAL_DIR / "archive")
+        ]
+        for fname in filenames:
+            # Match core / core.<pid> / *.core without fnmatch overhead
+            is_core = (
+                fname == "core"
+                or fname.startswith("core.")
+                or fname.endswith(".core")
+            )
+            if is_core:
+                hits.append(Path(dirpath, fname))
+    return sorted(hits)
+
+
+def purge_core_dumps(
+    root: Path = PROJECT_ROOT,
+    *,
+    skip_archive: bool = True,
+) -> int:
+    """Delete every core-dump file under ``root`` (recursive).
+
+    This is the "triet tieu tan goc" safety net: even with ASAN
+    ``disable_coredump=1`` and ``ulimit -c 0`` set at process start, a
+    stray core can still land on disk (e.g. a target spawned before the
+    limits took effect, or an external process). Running this as part of
+    the standard prep step guarantees a clean tree before each campaign.
+
+    Args:
+        root:          Root directory to sweep.
+        skip_archive:  Leave ``evaluation/archive`` untouched (preserve
+                       historic campaign cores) when True.
+
+    Returns:
+        Number of core files deleted.
+    """
+    cores = _iter_core_files(root, skip_archive=skip_archive)
+    if not cores:
+        print("  ℹ No core dumps found — tree is clean.")
+        return 0
+
+    total_bytes = 0
+    for cf in cores:
+        try:
+            total_bytes += cf.stat().st_size
+            cf.unlink()
+        except OSError as exc:
+            print(f"  ⚠ Could not delete {cf}: {exc}")
+
+    print(
+        f"  🗑️ Purged {len(cores)} core dump(s) "
+        f"({total_bytes / 1048576:.1f} MB) from working tree"
+    )
+    return len(cores)
+
+
 # =============================================================================
 # 1. Archival
 # =============================================================================
@@ -72,7 +168,11 @@ def archive_previous_results(
         - evaluation/plots/     → archive/<target>_<driver>_<ts>/plots/
         - evaluation/*.log      → archive/<target>_<driver>_<ts>/logs/
         - crashes/              → archive/<target>_<driver>_<ts>/crashes/
-        - core.* (project root) → archive/<target>_<driver>_<ts>/core_dumps/
+
+    Core dumps are NOT archived here — they are purged (deleted) by
+    ``purge_core_dumps()`` in ``full_cleanup``, since for ASAN targets the
+    ASAN report is strictly richer than a raw core and the user opted to
+    eliminate cores entirely.
 
     Args:
         target: Target name (lifa, lighttpd) for archive folder naming.
@@ -86,10 +186,8 @@ def archive_previous_results(
     has_plots = PLOTS_DIR.exists() and any(PLOTS_DIR.iterdir())
     has_logs = bool(list(EVAL_DIR.glob("*.log")))
     has_crashes = CRASHES_DIR.exists() and any(CRASHES_DIR.iterdir())
-    core_files = list(PROJECT_ROOT.glob("core.*"))
-    has_cores = len(core_files) > 0
 
-    if not any([has_results, has_plots, has_logs, has_crashes, has_cores]):
+    if not any([has_results, has_plots, has_logs, has_crashes]):
         print("  ℹ Nothing to archive — workspace is clean.")
         return None
 
@@ -131,14 +229,6 @@ def archive_previous_results(
         shutil.move(str(CRASHES_DIR), str(dest))
         print(f"     ✓ crashes/")
         CRASHES_DIR.mkdir(parents=True, exist_ok=True)
-
-    # 1e. Core dumps (project root)
-    if core_files:
-        core_dest = archive_path / "core_dumps"
-        core_dest.mkdir(parents=True, exist_ok=True)
-        for cf in core_files:
-            shutil.move(str(cf), str(core_dest / cf.name))
-        print(f"     ✓ {len(core_files)} core dump(s)")
 
     print(f"  📦 Archive complete.")
     return archive_path
@@ -245,16 +335,23 @@ def full_cleanup(
     target: str = "unknown",
     driver: str = "unknown",
 ) -> None:
-    """Run the complete cleanup pipeline: archive → orphans → shared state."""
+    """Run the complete cleanup pipeline: archive → purge cores → orphans → shared state.
+
+    This is the standard **prep step before each campaign**: it guarantees a
+    clean workspace (no stale results, no stray cores, no orphaned VMs, no
+    leftover shared state) so the next run starts from a known-good baseline.
+    Run it via ``python3 scripts/cleanup.py --force``.
+    """
     print("\n" + "=" * 50)
     print("  LIFA-Fuzz Cleanup Pipeline")
     print("=" * 50)
 
     archive_previous_results(target=target, driver=driver)
+    purge_core_dumps()
     cleanup_orphaned_resources()
     cleanup_shared_state()
 
-    print("\n  ✅ Full cleanup complete.\n")
+    print("\n  ✅ Full cleanup complete — workspace ready for next run.\n")
 
 
 # =============================================================================
@@ -279,6 +376,10 @@ Examples:
         help="Only archive results (don't kill processes)",
     )
     parser.add_argument(
+        "--cores-only", action="store_true",
+        help="Only purge stray core dumps recursively (quick clean)",
+    )
+    parser.add_argument(
         "--force", action="store_true",
         help="Skip confirmation prompt",
     )
@@ -292,7 +393,14 @@ Examples:
     )
     args = parser.parse_args()
 
-    # Confirmation
+    # --cores-only is a safe, targeted action (deletes only stray core dumps,
+    # leaves results/crashes/state untouched) — no confirmation needed.
+    if args.cores_only:
+        purge_core_dumps()
+        return
+
+    # Confirmation for the heavier archive/full flows (they move results and
+    # kill processes).
     if not args.force:
         print("This will archive old results and clean up resources.")
         resp = input("Continue? [y/N] ").strip().lower()
