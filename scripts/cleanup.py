@@ -16,6 +16,9 @@ Usage:
     # Only archive results (don't touch running processes)
     python3 scripts/cleanup.py --archive-only
 
+    # Wipe ALL archived campaigns (frees disk, discards history)
+    python3 scripts/cleanup.py --clear-archive
+
     # Skip confirmation prompt
     python3 scripts/cleanup.py --force
 
@@ -234,6 +237,75 @@ def archive_previous_results(
     return archive_path
 
 
+def clear_archive(*, force: bool = False) -> int:
+    """Delete every archived campaign under ``evaluation/archive``.
+
+    This is the missing counterpart to ``archive_previous_results()``: the
+    archival step only ever *adds* timestamped folders, so without a pruning
+    step the archive grows without bound. ``clear_archive`` wipes the whole
+    archive directory (preserving the empty directory itself so the next
+    archival still works) — useful when the accumulated history is no longer
+    needed and the disk footprint matters.
+
+    Core dumps archived inside campaign folders are deleted along with
+    everything else; this intentionally overrides the ``skip_archive``
+    protection that ``purge_core_dumps()`` applies to live sweeps, because
+    here the caller has explicitly asked to discard archived history.
+
+    Safety mirrors the rest of ``cleanup.py``'s destructive flows:
+    - Prints the list of folders to delete and their total size, then asks
+      ``[y/N]`` — unless ``force=True`` (set by ``--force``).
+    - A no-op when the archive is already empty.
+
+    Args:
+        force: Skip the interactive confirmation prompt.
+
+    Returns:
+        Number of archived campaign folders deleted.
+    """
+    if not ARCHIVE_DIR.exists():
+        print("  ℹ Archive directory does not exist — nothing to clear.")
+        return 0
+
+    # Each archived campaign is a directory <target>_<driver>_<ts>.
+    campaigns = sorted(
+        (p for p in ARCHIVE_DIR.iterdir() if p.is_dir()),
+        key=lambda p: p.name,
+    )
+    if not campaigns:
+        print("  ℹ Archive is empty — nothing to clear.")
+        return 0
+
+    # Compute total size per campaign for the confirmation summary.
+    def _dir_size(path: Path) -> int:
+        return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+
+    total_bytes = sum(_dir_size(c) for c in campaigns)
+
+    print(f"  🗑️ Clearing archive: {len(campaigns)} campaign(s) "
+          f"({total_bytes / 1048576:.1f} MB) under "
+          f"{ARCHIVE_DIR.relative_to(PROJECT_ROOT)}")
+    for c in campaigns:
+        print(f"     • {c.name}")
+
+    if not force:
+        resp = input("  Delete ALL of the above? This cannot be undone. [y/N] ").strip().lower()
+        if resp != "y":
+            print("  Aborted — archive left untouched.")
+            return 0
+
+    deleted = 0
+    for c in campaigns:
+        try:
+            shutil.rmtree(c)
+            deleted += 1
+        except OSError as exc:
+            print(f"  ⚠ Could not delete {c.name}: {exc}")
+
+    print(f"  🗑️ Cleared {deleted}/{len(campaigns)} campaign(s) from archive.")
+    return deleted
+
+
 # =============================================================================
 # 2. Orphaned Resource Cleanup
 # =============================================================================
@@ -367,6 +439,8 @@ def main() -> None:
 Examples:
   python3 scripts/cleanup.py                           # full cleanup
   python3 scripts/cleanup.py --archive-only            # only archive
+  python3 scripts/cleanup.py --clear-archive           # wipe all archives
+  python3 scripts/cleanup.py --clear-archive --force   # wipe, no prompt
   python3 scripts/cleanup.py --force                   # skip confirmation
   python3 scripts/cleanup.py --target lifa --driver firecracker
         """,
@@ -374,6 +448,11 @@ Examples:
     parser.add_argument(
         "--archive-only", action="store_true",
         help="Only archive results (don't kill processes)",
+    )
+    parser.add_argument(
+        "--clear-archive", action="store_true",
+        help="Wipe ALL archived campaigns under evaluation/archive/ "
+             "(discards history, frees disk). Confirms unless --force.",
     )
     parser.add_argument(
         "--cores-only", action="store_true",
@@ -397,6 +476,13 @@ Examples:
     # leaves results/crashes/state untouched) — no confirmation needed.
     if args.cores_only:
         purge_core_dumps()
+        return
+
+    # --clear-archive discards ALL archived campaign history. It carries its
+    # own confirmation prompt (inside clear_archive) unless --force is given,
+    # because unlike archival it is strictly destructive and unrecoverable.
+    if args.clear_archive:
+        clear_archive(force=args.force)
         return
 
     # Confirmation for the heavier archive/full flows (they move results and
