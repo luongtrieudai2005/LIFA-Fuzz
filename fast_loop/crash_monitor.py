@@ -222,40 +222,55 @@ class CrashMonitor:
         classification: Optional[dict] = None,
         serial_output: str = "",
     ) -> CrashRecord:
-        """Handle a crash event.
+        """Handle a target-down event (actionable crash OR normal exit).
 
-        Full pipeline:
+        Actionability is decided by ``classification["is_actionable"]`` —
+        for a normal exit (exit 0, e.g. a max-cmds / connection-limit
+        shutdown) the classification carries ``is_actionable=False``.
+
+        For a normal exit:
+        1. Build the CrashRecord (returned to caller).
+        2. Restart the target (if auto_reset).
+        3. Return — NO counter increment, NO ERROR log, NO artifact,
+           NO CrashManager recording.
+
+        For an actionable crash:
         1. Resolve the signal name from the exit code.
-        2. Create a CrashRecord with the offending packet.
+        2. Increment the crash counter and log at ERROR.
         3. Pause the Interceptor and MutationEngine immediately.
         4. Save the crash record to the corpus directory.
-        5. Reset the target via sandbox.reset_state().
-        6. Wait for the target to come back alive.
+        5. Record through CrashManager for deduplication.
+        6. Reset the target via sandbox.reset_state().
         7. Resume the Interceptor and MutationEngine.
 
         Args:
             exit_code: Container exit code (e.g., 139 for SIGSEGV).
             classification: Optional crash classification dict from
-                ``_classify_crash()`` with keys: type, confidence, detail.
+                ``_classify_crash()`` with keys: type, confidence, detail,
+                is_actionable.
             serial_output: Optional serial console output from the VM
                 (contains kernel panic / ASAN messages).
 
         Returns:
             The created CrashRecord.
         """
-        self._crash_count += 1
+        # 1. Determine actionability FIRST. A normal exit (exit 0 = clean
+        #    shutdown, max-cmds limit, connection limit) is classified
+        #    is_actionable=False. Such events must NOT increment the crash
+        #    counter, must NOT log at ERROR, and must NOT save artifacts —
+        #    they are target behaviour, not vulnerabilities. Previously this
+        #    check ran AFTER _crash_count had been incremented and "Crash #N"
+        #    / "Crash artifact" had been logged at ERROR, inflating the crash
+        #    count and spamming logs with false crashes (e.g. every LightFTP
+        #    max-cmds exit printed "Crash #6" at ERROR).
+        is_actionable = True
+        if classification:
+            is_actionable = classification.get("is_actionable", True)
 
-        # 1. Resolve signal
+        # 2. Resolve signal + offending packet (needed for the returned record
+        #    regardless of actionability).
         signal = self._resolve_signal(exit_code)
-        signal_str = signal.value if signal else f"unknown (exit {exit_code})"
-        logger.error(
-            f"Crash #{self._crash_count}: {signal_str} "
-            f"(exit_code={exit_code})"
-        )
 
-        # 2. Get offending packet from mutator's tracking
-        # H5 fix: prefer the public API (register_offending_packet) first,
-        # then fall back to the crash window, then to private fields.
         offending_packet = b""
         rule_id = None
 
@@ -277,7 +292,7 @@ class CrashMonitor:
             offending_packet = self.mutator._last_injected_packet
             rule_id = self.mutator._last_injected_rule_id
 
-        # 3. Create CrashRecord
+        # 3. Create CrashRecord (returned to caller in every branch)
         record = CrashRecord(
             exit_code=exit_code,
             signal=signal,
@@ -285,40 +300,48 @@ class CrashMonitor:
             mutation_rule_id=rule_id,
             stack_trace=serial_output[-2000:] if serial_output else None,
         )
+
+        # 4. Non-actionable exit: restart the target but do NOT treat it as a
+        #    crash — no counter increment, no ERROR log, no artifact, no
+        #    CrashManager recording.
+        if not is_actionable:
+            cls_type = classification["type"] if classification else "normal_exit"
+            cls_detail = classification.get("detail", "") if classification else ""
+            logger.info(
+                f"Target exited normally (exit_code={exit_code}, "
+                f"type={cls_type}) — not a crash; restarting target "
+                f"without recording. ({cls_detail})"
+            )
+            if self.auto_reset:
+                await self.restart_target()
+            return record
+
+        # ── Actionable crash below ───────────────────────────────────
+        self._crash_count += 1
+        signal_str = signal.value if signal else f"unknown (exit {exit_code})"
+        logger.error(
+            f"Crash #{self._crash_count}: {signal_str} "
+            f"(exit_code={exit_code})"
+        )
         logger.error(
             f"Crash artifact: packet={record.offending_packet_hex[:64]}, "
             f"rule_id={rule_id}"
         )
-
-        # 3b. Attach classification metadata for downstream consumers
-        is_actionable = True
         if classification:
-            is_actionable = classification.get("is_actionable", True)
             logger.warning(
                 f"Crash classification: {classification['type']} "
                 f"(confidence={classification['confidence']:.0%}, "
                 f"detail={classification.get('detail', '')})"
             )
 
-        # 3c. Non-actionable exits (e.g., exit code 0): skip artifact
-        #     saving and CrashManager recording — just restart the target.
-        if not is_actionable:
-            logger.info(
-                "Normal server exit (not actionable) — "
-                "skipping CrashManager recording and artifact saving"
-            )
-            if self.auto_reset:
-                await self.restart_target()
-            return record
-
-        # 4. Pause traffic IMMEDIATELY
+        # 5. Pause traffic IMMEDIATELY
         await self.pause_interceptor()
 
-        # 5. Save crash artifact to disk
+        # 6. Save crash artifact to disk
         crash_path = self.save_crash_record(record)
         logger.error(f"Crash PoC saved to: {crash_path}")
 
-        # 5b. Record through CrashManager for deduplication
+        # 7. Record through CrashManager for deduplication
         # Use classification type as crash_type for richer reporting
         crash_type_str = (
             classification["type"] if classification else f"exit_{exit_code}"
