@@ -428,38 +428,38 @@ Bridge the **mathematical pre-processing layer** (`DifferentialAnalyzer`) with t
 Raw Client Packets
         │
         ▼
-┌─────────────────────────┐
-│  DifferentialAnalyzer    │  ← Pure math, <1ms, stateless
-│  (Shannon H, Pearson r,  │
-│   Kendall τ per offset)  │
-│                           │
-│  Output: HeatmapResult   │
-│    ├─ to_llm_hint()      │──▶ Injected into LLM prompt
-│    └─ to_field_rules()   │──▶ Bootstrap rules if LLM fails
-└─────────────────────────┘
+┌──────────────────────────┐
+│ DifferentialAnalyzer     │  ← Pure math, <1ms, stateless
+│(Shannon H,  Pearson r,   │
+│  Kendall τ per offset)   │
+│                          │
+│ Output: HeatmapResult    │
+│  ├─ to_llm_hint()        │──▶ Injected into LLM prompt
+│  └─ to_field_rules()     │──▶ Bootstrap rules if LLM fails
+└──────────────────────────┘
         │
         ▼ math_hint parameter
-┌─────────────────────────┐
-│  LLMAgent                │  ← Neural layer, ~60s per inference
-│  infer_protocol(         │
-│    traffic_input,        │
-│    math_hint=heatmap     │  ← Fusion: math + neural
-│  )                       │
-│                           │
-│  Output: ProtocolGrammar │
-└─────────────────────────┘
+┌──────────────────────────┐
+│ LLM Agent                │  ← Neural layer, ~60s per inference
+│ infer_protocol(          │
+│   traffic_input,         │
+│   math_hint=heatmap      │  ← Fusion: math + neural
+│ )                        │
+│                          │
+│ Output: ProtocolGrammar  │
+└──────────────────────────┘
         │
         ▼
-┌─────────────────────────┐
-│  RulesOrchestrator       │
-│                           │
-│  If LLM succeeds:        │
-│    grammar → SemanticRules│
-│                           │
-│  If LLM fails:           │
-│    heatmap.to_field_rules│──▶ Bootstrap SemanticRules
-│    (fuzzer never starves)│
-└─────────────────────────┘
+┌──────────────────────────┐
+│ RulesOrchestrator        │
+│                          │
+│ If LLM succeeds:         │
+│   grammar → SemanticRules│
+│                          │
+│ If LLM fails:            │
+│   heatmap.to_field_rules │──▶ Bootstrap SemanticRules
+│   (fuzzer never starves) │
+└──────────────────────────┘
 ```
 
 ### Key Components

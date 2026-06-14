@@ -38,11 +38,10 @@ graph TB
         MONITOR["Crash Monitor<br/>Detects panics/segfaults"]
         FAST_RULES["Active Rule Set<br/>Current mutation strategy"]
         TRAFFIC_LOG["Traffic Log Buffer<br/>Raw + mutated traffic"]
-        MITM -->|"Raw packets"| TRAFFIC_LOG
+        MITM       -->|"Raw packets"|       TRAFFIC_LOG
         FAST_RULES --> ENGINE
-        ENGINE -->|"Mutated packets"| MITM
-        MONITOR -.->|"Crash alerts"| MITM
-        TRAFFIC_LOG -->|"Batch send"| PARSER
+        ENGINE     -->|"Mutated packets"|   MITM
+        MONITOR    -.->|"Crash alerts"|     MITM
     end
 
     subgraph "Block 3: Neural-Mathematical Fusion"
@@ -52,15 +51,17 @@ graph TB
         LLM["LLM Agent<br/>Infers protocol grammar"]
         SLOW_RULES["RulesOrchestrator<br/>Dedup + fusion + fallback"]
         RULEGEN["Rule Generator<br/>Outputs SemanticRules"]
-        PARSER -->|"Parsed traffic"| DIFF
-        DIFF --> HEATMAP
-        HEATMAP -->|"math_hint"| LLM
-        HEATMAP -->|"Bootstrap fallback"| SLOW_RULES
-        PARSER -->|"Raw samples"| LLM
-        LLM -->|"Inferred grammar"| SLOW_RULES
+        PARSER     -->|"Parsed traffic"|    DIFF
+        DIFF       --> HEATMAP
+        HEATMAP    -->|"math_hint"|         LLM
+        HEATMAP    -->|"Bootstrap fallback"| SLOW_RULES
+        PARSER     -->|"Raw samples"|       LLM
+        LLM        -->|"Inferred grammar"|  SLOW_RULES
         SLOW_RULES --> RULEGEN
-        RULEGEN -->|"New/updated rules"| FAST_RULES
+        RULEGEN    -->|"New/updated rules"| FAST_RULES
     end
+
+    TRAFFIC_LOG -->|"Batch send"| PARSER
 
     subgraph "Evaluation Framework"
         TELEMETRY["TelemetryCollector<br/>Real-time 10s JSONL snapshots"]
@@ -68,14 +69,14 @@ graph TB
         RUNNER["EvaluationRunner<br/>3 Baselines (A/B/C)"]
         PLOTS["PlotGenerator<br/>Paper-ready PNGs"]
         TELEMETRY --> RUNNER
-        RQ1 --> PLOTS
-        RUNNER --> PLOTS
+        RQ1       --> PLOTS
+        RUNNER    --> PLOTS
     end
 
-    CLIENT -->|"All traffic"| MITM
-    MITM -->|"Forward / mutated"| SERVER
-    SERVER -->|"Responses"| MITM
-    MITM -->|"Forward responses"| CLIENT
+    CLIENT    -->|"All traffic"|       MITM
+    MITM      -->|"Forward / mutated"| SERVER
+    SERVER    -->|"Responses"|         MITM
+    MITM      -->|"Forward responses"| CLIENT
 
     style SERVER fill:#f9f,stroke:#333
     style LLM fill:#ff9,stroke:#333
@@ -248,32 +249,32 @@ The key innovation of LIFA-Fuzz is fusing a **mathematical pre-processing layer*
 Raw Client Packets
         │
         ▼
-┌─────────────────────────┐
-│  DifferentialAnalyzer    │  ← Pure math, <1ms, stateless
-│  (Shannon H, Pearson r,  │
-│   Kendall τ per offset)  │
-│                           │
-│  Output: HeatmapResult   │
-│    ├─ to_llm_hint()      │──▶ Injected into LLM prompt
-│    └─ to_field_rules()   │──▶ Bootstrap rules if LLM fails
-└─────────────────────────┘
+┌──────────────────────────┐
+│ DifferentialAnalyzer     │  ← Pure math, <1ms, stateless
+│(Shannon H,  Pearson r,   │
+│  Kendall τ per offset)   │
+│                          │
+│ Output: HeatmapResult    │
+│  ├─ to_llm_hint()        │──▶ Injected into LLM prompt
+│  └─ to_field_rules()     │──▶ Bootstrap rules if LLM fails
+└──────────────────────────┘
+        │
+        ▼ math_hint parameter
+┌──────────────────────────┐
+│ LLM Agent                │  ← Neural layer, ~60s per inference
+│ infer_protocol(          │
+│   traffic_input,         │
+│   math_hint=heatmap      │  ← Fusion: math + neural
+│ )                        │
+└──────────────────────────┘
         │
         ▼
-┌─────────────────────────┐
-│  LLM Agent               │  ← Neural layer, ~60s per inference
-│  infer_protocol(         │
-│    traffic_input,        │
-│    math_hint=heatmap     │  ← Fusion: math + neural
-│  )                       │
-└─────────────────────────┘
-        │
-        ▼
-┌─────────────────────────┐
-│  RulesOrchestrator       │
-│                           │
-│  LLM success → Grammar   │
-│  LLM failure → Bootstrap │──▶ Fuzzer never starves
-└─────────────────────────┘
+┌──────────────────────────┐
+│ RulesOrchestrator        │
+│                          │
+│ LLM success → Grammar    │
+│ LLM failure → Bootstrap  │──▶ Fuzzer never starves
+└──────────────────────────┘
 ```
 
 ### Crash Isolation (Precision Mode)
