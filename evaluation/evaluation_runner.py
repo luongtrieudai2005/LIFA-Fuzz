@@ -143,6 +143,7 @@ async def run_single_baseline(
     target: str = "lifa",
     total_baselines: int = 3,
     baseline_index: int = 0,
+    coverage: bool = False,
 ) -> dict[str, Any]:
     """Run LIFA-Fuzz under one baseline configuration for a fixed duration.
 
@@ -293,9 +294,25 @@ async def run_single_baseline(
         else:
             # Firecracker: select rootfs + kernel_args by target
             fc_cfg = FIRECRACKER_TARGET_CONFIGS[target]
+            if coverage and target == "lightftp":
+                # Coverage mode: use the gcov-instrumented rootfs + a cov_duration
+                # kernel arg so /init's watchdog SIGTERMs ffp (→ __gcov_dump+sync)
+                # right after the campaign, before stop().
+                rootfs = "sandbox/firecracker_env/rootfs_lightftp_coverage.ext4"
+                # Reset from pristine so each baseline starts with NO .gcda (gcov
+                # counters are additive — see scripts/run_coverage_campaign.py).
+                pristine = "sandbox/firecracker_env/rootfs_lightftp_coverage_pristine.ext4"
+                if Path(pristine).exists():
+                    import shutil as _sh
+                    print(f"  [coverage] resetting rootfs from pristine master")
+                    _sh.copyfile(pristine, rootfs)
+                kernel_args = fc_cfg["kernel_args"] + f" cov_duration={duration_s + 5}"
+            else:
+                rootfs = fc_cfg["rootfs_path"]
+                kernel_args = fc_cfg["kernel_args"]
             sandbox = driver_cls(
-                rootfs_path=fc_cfg["rootfs_path"],
-                kernel_args=fc_cfg["kernel_args"],
+                rootfs_path=rootfs,
+                kernel_args=kernel_args,
                 target_port=fc_cfg["target_port"],
                 target_name=target,  # Pass target name for driver-level defaults
             )
@@ -447,7 +464,10 @@ async def run_single_baseline(
             mutator=mutator,
             poll_interval_ms=500,
             crash_corpus_dir=str(crashes_dir),
-            auto_reset=True,
+            # Coverage mode: disable snapshot-restore (auto_reset) — a snapshot
+            # load discards gcov counters, so coverage would only reflect the
+            # post-last-reset segment. In coverage mode we let crashes stand.
+            auto_reset=not coverage,
             restart_delay_s=2.0,
             crash_manager=crash_manager,  # FIX: wire crash_manager so telemetry reports crashes
             # Phase 1: confirm each crash by replaying the frozen attribution
@@ -888,11 +908,63 @@ async def _collect_gcov_coverage(
               "Install with: sudo apt install lcov")
         return {}
 
-    # Firecracker VMs have no mechanism to extract .gcda files.
-    # Coverage collection requires docker cp, which only works with containers.
+    # Firecracker: extract .gcda from the gcov-instrumented rootfs via debugfs,
+    # then run lcov inside a gcc-12 (bookworm) container (the .gcda is gcc-12
+    # 'B22*' format; host gcov-11/15 refuse it). Only the coverage rootfs has
+    # /opt/cov — the production rootfs has no gcov instrumentation.
     if sandbox_driver == "firecracker":
-        print("  ℹ Coverage collection skipped — not available for Firecracker driver")
-        return {}
+        import shutil as _sh
+        rootfs = "sandbox/firecracker_env/rootfs_lightftp_coverage.ext4"
+        if not _sh.which("debugfs") or not Path(rootfs).exists():
+            print("  ℹ Firecracker coverage needs debugfs + the coverage rootfs — skipping")
+            return {}
+        coverage_dir = baseline_dir / "coverage"
+        work = coverage_dir / "gcov_work"
+        work.mkdir(parents=True, exist_ok=True)
+        build_dst = work / "build"
+        build_dst.mkdir(parents=True, exist_ok=True)
+        try:
+            # Dump .gcno + source, then .gcda, place .gcda next to .gcno.
+            for sub in ("Source/Release", "Source"):
+                sp.run(["debugfs", "-R", f"rdump /opt/lightftp-build/{sub} {build_dst}",
+                        rootfs], capture_output=True, timeout=60)
+                if any(build_dst.rglob("*.gcno")):
+                    break
+            cov_dst = work / "cov"
+            cov_dst.mkdir(parents=True, exist_ok=True)
+            sp.run(["debugfs", "-R", f"rdump /opt/cov {cov_dst}", rootfs],
+                   capture_output=True, timeout=60)
+            gcda = list(cov_dst.rglob("*.gcda"))
+            gcno = list(build_dst.rglob("*.gcno"))
+            rel = gcno[0].parent if gcno else build_dst
+            for g in gcda:
+                (rel / g.name).write_bytes(g.read_bytes())
+            if not gcda:
+                print("  ℹ Firecracker: no .gcda flushed (timer didn't fire?) — skipping")
+                return {}
+            info = work / "coverage.info"
+            r = sp.run(
+                ["docker", "run", "--rm", "-v", f"{work}:/work", "lifa-lcov",
+                 "lcov", "--capture", "--directory", "/work/build",
+                 "--output-file", "/work/coverage.info",
+                 "--rc", "lcov_branch_coverage=1", "--ignore-errors", "source"],
+                capture_output=True, text=True, timeout=180,
+            )
+            if r.returncode != 0 or not info.exists():
+                print(f"  ⚠ Firecracker lcov failed: {r.stderr[:160]}")
+                return {}
+            data = TelemetryCollector.parse_lcov(str(info))
+            data["lcov_path"] = str(info)
+            data["gcov_tool"] = "gcov-12 (bookworm container)"
+            data["gcda_count"] = len(gcda)
+            print(f"  ✓ Firecracker coverage: {data['line_coverage_pct']:.1f}% lines "
+                  f"({data['lines_hit']}/{data['lines_total']}), "
+                  f"{data['branch_coverage_pct']:.1f}% branches "
+                  f"({data['branches_hit']}/{data['branches_total']})")
+            return data
+        except Exception as e:
+            print(f"  ⚠ Firecracker coverage extraction failed: {e}")
+            return {}
 
     coverage_dir = baseline_dir / "coverage"
     coverage_dir.mkdir(parents=True, exist_ok=True)
@@ -960,8 +1032,81 @@ async def _collect_gcov_coverage(
                 print(f"  ⚠ Coverage collection failed: {e}")
                 return {}
 
-        # For non-lighttpd targets, use original docker cp approach
-        if target != "lighttpd":
+        # Collect coverage for lightftp target (gcov-instrumented build,
+        # built via Dockerfile.lightftp-coverage which keeps /tmp/LightFTP).
+        if target == "lightftp":
+            try:
+                import shutil
+                # gcov tool must be compatible with the gcc that built fftp
+                # (builder is bookworm = gcc-12). Host may lack gcov-12, so try
+                # candidates in order of preference; first available wins.
+                _GCOV_CANDIDATES = ["gcov-12", "gcov-11", "gcov-15", "gcov"]
+                gcov_tool = next(
+                    (g for g in _GCOV_CANDIDATES if shutil.which(g)), None
+                )
+                if gcov_tool is None:
+                    print("  ⚠ No gcov tool found on host — skipping lightftp coverage")
+                    return {}
+
+                # Step 1: SIGINT (signal 2) to flush gcov .gcda files.
+                # fftp is PID 1 (exec'd by /init).
+                sp.run(
+                    ["docker", "exec", container_name, "kill", "-2", "1"],
+                    capture_output=True, timeout=10,
+                )
+                await asyncio.sleep(2)  # Wait for gcov flush
+                print(f"  ✓ Sent SIGINT to fftp (PID 1) — gcov buffers flushed")
+
+                # Step 2: Copy .gcda+.gcno (object dir) and source from container.
+                # fftp writes .gcda to the absolute build path baked in at
+                # compile time: /tmp/LightFTP/Source/Release/*.gcda
+                for src in [
+                    f"{container_name}:/tmp/LightFTP/Source/Release/.",
+                    f"{container_name}:/tmp/LightFTP/Source/.",
+                ]:
+                    sp.run(
+                        ["docker", "cp", src, str(work_dir)],
+                        capture_output=True, timeout=30,
+                    )
+                gcda_files = list(work_dir.rglob("*.gcda"))
+                if not gcda_files:
+                    print("  ℹ No .gcda files found after SIGINT — ensure the "
+                          "runtime image keeps /tmp/LightFTP (coverage variant)")
+                    return {}
+                print(f"  ✓ Copied {len(gcda_files)} .gcda files from container")
+
+                # Step 3: Run lcov on HOST with a compatible gcov tool.
+                info_path = coverage_dir / "coverage.info"
+                lcov_result = sp.run(
+                    ["lcov", "--capture",
+                     "--directory", str(work_dir),
+                     "--output-file", str(info_path),
+                     "--gcov-tool", gcov_tool,
+                     "--rc", "lcov_branch_coverage=1",
+                     "--ignore-errors", "source,mismatch"],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if lcov_result.returncode == 0:
+                    print(f"  ✓ lcov --capture succeeded ({gcov_tool})")
+                    coverage_data = TelemetryCollector.parse_lcov(str(info_path))
+                    coverage_data["lcov_path"] = str(info_path)
+                    coverage_data["gcov_tool"] = gcov_tool
+                    print(
+                        f"  ✓ Coverage: {coverage_data['line_coverage_pct']:.1f}% lines "
+                        f"({coverage_data['lines_hit']}/{coverage_data['lines_total']}), "
+                        f"{coverage_data['branch_coverage_pct']:.1f}% branches "
+                        f"({coverage_data['branches_hit']}/{coverage_data['branches_total']})"
+                    )
+                    return coverage_data
+                else:
+                    print(f"  ⚠ lcov failed ({gcov_tool}): {lcov_result.stderr[:200]}")
+                    return {}
+            except Exception as e:
+                print(f"  ⚠ lightftp coverage collection failed: {e}")
+                return {}
+
+        # For other targets, use original docker cp approach
+        if target not in ("lighttpd", "lightftp"):
             gcda_search_paths = [
                 f"{container_name}:/app/.",
             ]
@@ -1376,6 +1521,13 @@ Examples:
         help="Duration per baseline in seconds (default: 300)",
     )
     parser.add_argument(
+        "--coverage", action="store_true",
+        help="Coverage mode: use the gcov-instrumented LightFTP rootfs, "
+             "disable snapshot auto-reset (so gcov counters accumulate over "
+             "the whole run), and extract real line/branch coverage post-run. "
+             "Only for --driver firecracker --target lightftp.",
+    )
+    parser.add_argument(
         "--baseline", default="all",
         help="Which baseline(s) to run: A, B, C, all, or comma-separated "
              "like B,C (default: all). Runs in the given order.",
@@ -1464,6 +1616,7 @@ Examples:
                     target=args.target,
                     total_baselines=len(baselines),
                     baseline_index=i,
+                    coverage=getattr(args, "coverage", False),
                 ),
                 timeout=_baseline_hard_timeout,
             )

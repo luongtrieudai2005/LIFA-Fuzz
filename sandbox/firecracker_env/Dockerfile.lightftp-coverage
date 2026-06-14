@@ -1,0 +1,87 @@
+# Dockerfile.lightftp-coverage — LightFTP built with gcov instrumentation
+# (ASAN + -fprofile-arcs -ftest-coverage), retaining build artifacts so the
+# host can run `lcov --capture` after a fuzzing run.
+#
+# This is the COVERAGE variant. It keeps the /tmp/LightFTP build tree in the
+# runtime image (.gcno + .o + source), because gcov writes .gcda at runtime to
+# the ABSOLUTE object path baked into the binary at compile time
+# (/tmp/LightFTP/Source/Release/*.gcda). lcov on the host then needs .gcno +
+# .gcda + source to produce coverage.info.
+#
+# Build (same tag the runner expects):
+#   docker build -f sandbox/firecracker_env/Dockerfile.lightftp-coverage \
+#       -t lifa-fuzz-server:latest sandbox/firecracker_env
+#
+# Do NOT use this image for headline (RQ2/RQ3) Firecracker runs — it is larger
+# and slightly slower (gcov bookkeeping). Use Dockerfile.lightftp-all-in-one
+# (ASAN-only) for those. Coverage is measured in a separate Docker campaign.
+
+FROM debian:bookworm-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc make git libssl-dev libc6-dev libgnutls28-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# gcov_flush.c: constructor that installs a SIGTERM/SIGINT handler calling
+# __gcov_dump() — forces .gcda flush on signal, since LightFTP's main loop
+# never calls exit() on its own.
+COPY gcov_flush.c /tmp/gcov_flush.c
+
+# Clone and compile LightFTP with ASAN + gcov coverage instrumentation.
+# -fprofile-arcs -ftest-coverage are compatible with -fsanitize=address.
+# gcov_flush.o is compiled and linked in so the flush handler is active.
+RUN cd /tmp && \
+    git clone https://github.com/hfiref0x/LightFTP.git && \
+    cd LightFTP && \
+    git checkout 5980ea1 && \
+    cd Source/Release && \
+    gcc -fsanitize=address -static-libasan -fprofile-arcs -ftest-coverage -g -O2 -c ../*.c -I.. && \
+    gcc -fsanitize=address -static-libasan -fprofile-arcs -ftest-coverage -g -O2 -c /tmp/gcov_flush.c -o gcov_flush.o && \
+    gcc -fsanitize=address -static-libasan -fprofile-arcs -ftest-coverage -g -O2 -o fftp *.o gcov_flush.o -lpthread -lgnutls && \
+    cp fftp /usr/local/bin/fftp && \
+    chmod +x /usr/local/bin/fftp
+
+# Runtime image
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    iproute2 libssl3 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy compiled fftp from builder
+COPY --from=builder /usr/local/bin/fftp /usr/local/bin/fftp
+
+# CRITICAL (coverage-only): retain the build tree in a NON-shadowed location.
+# /init mounts a tmpfs over /tmp at runtime, which would hide /tmp/LightFTP
+# and leave gcov nowhere to write .gcda. Store at /opt; /init recreates it
+# onto the tmpfs after mount so the baked absolute path
+# /tmp/LightFTP/Source/Release/*.gcda is writable, with .gcno + source
+# co-located for the host's lcov --capture.
+COPY --from=builder /tmp/LightFTP /opt/lightftp-build
+
+# Write ffp.conf — WORKING format (matches build_rootfs_lightftp.sh): the
+# [ftpconfig] section + interface=0.0.0.0 (else fftp binds 127.0.0.1 and is
+# unreachable), plus an [admin] user so the fuzzer can log in.
+RUN mkdir -p /tmp/ftp_root && \
+    printf '[ftpconfig]\nport=21\ninterface=0.0.0.0\nexternal_ip=172.16.0.2\nlocal_mask=255.255.255.0\nminport=1024\nmaxport=65535\nmaxusers=100\n\n[admin]\npswd=*\naccs=admin\nroot=/tmp/ftp_root\n' > /etc/fftp.conf
+
+# Create /init script — starts fftp directly (no SSH needed!)
+RUN printf '#!/bin/sh\n\
+mount -t proc proc /proc\n\
+mount -t sysfs sysfs /sys\n\
+mount -t devtmpfs devtmpfs /dev\n\
+mount -t tmpfs tmpfs /tmp\n\
+mkdir -p /dev/pts\n\
+mount -t devpts devpts /dev/pts\n\
+cp -a /opt/lightftp-build /tmp/LightFTP\n\
+mkdir -p /tmp/ftp_root\n\
+ip link set lo up\n\
+ip addr add 172.16.0.2/24 dev eth0\n\
+ip link set eth0 up\n\
+ip route add default via 172.16.0.1\n\
+echo "LIFA-Fuzz: LightFTP ready on 172.16.0.2:21 (ASAN + gcov enabled)"\n\
+export ASAN_OPTIONS=disable_coredump=1:abort_on_error=1:halt_on_error=0\n\
+exec /usr/local/bin/fftp /etc/fftp.conf\n' > /init && chmod +x /init
+
+# Run /init in Docker (Firecracker uses kernel_args init=/init instead).
+CMD ["/init"]
