@@ -138,7 +138,11 @@ class BinaryMutator:
             Optional field layout from DifferentialAnalyzer. ``STATIC``
             regions are never modified.
         strategies : list[str] | None
-            Allowlist of strategy names. Defaults to ``ALL_STRATEGIES``.
+            Allowlist of strategy names. Defaults to ``BINARY_ONLY_STRATEGIES``
+            (the 15 generic operators). Protocol-specific operators (e.g. the
+            4 FTP token strategies) are ONLY used when a ProtocolModule
+            supplies them via ``strategies=`` — the core never injects
+            protocol knowledge by default (black-box thesis).
 
         Returns
         -------
@@ -155,7 +159,11 @@ class BinaryMutator:
         if not mutable:
             return data
 
-        allowed = strategies if strategies is not None else ALL_STRATEGIES
+        # Default to the GENERIC binary operators only. The 4 FTP strategies
+        # (ftp_token_inject/replace/arg/crlf) are protocol knowledge — they
+        # must NEVER be selected unless a ProtocolModule explicitly offers
+        # them, otherwise the core leaks FTP knowledge into non-FTP targets.
+        allowed = strategies if strategies is not None else BINARY_ONLY_STRATEGIES
         strategy = self._rng.choice(allowed)
         self._apply_strategy(data, strategy, sr, mutable)
         return data

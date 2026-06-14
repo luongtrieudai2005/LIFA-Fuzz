@@ -48,6 +48,11 @@ sandbox:
 # Fast Loop (Block 2)
 # -----------------------------------------------------------------------------
 fast_loop:
+  # ProtocolModule: "null" (DEFAULT — pure black-box core, no protocol
+  # knowledge; the thesis) or a disclosed case-study module ("ftp"). Resolved
+  # via shared/protocol_module.py registry. See docs refactor plan.
+  protocol_module: "null"
+
   # Interceptor settings
   interceptor:
     host: "0.0.0.0"

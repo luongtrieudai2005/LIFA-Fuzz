@@ -73,7 +73,7 @@ from shared.logger import get_logger
 # When no SemanticRules are available, MutationEngine delegates to this instead
 # of the old single-bit-flip _dumb_mutate(), ensuring Baseline A is a fair
 # comparison against B (math-only) and C (full fusion).
-from fast_loop.binary_mutator import BinaryMutator
+from fast_loop.binary_mutator import BinaryMutator, BINARY_ONLY_STRATEGIES
 
 # StateTransitionGraph: Step 3 — State-Coverage Expansion.
 # Tracks unique (prev_code, command, new_code) edges to reward the fuzzer
@@ -509,6 +509,10 @@ class MutationEngine:
         budget_per_field:     int   = 0,
         # P3-A: warm-up phase
         warmup_seconds:       float = 30.0,
+        # ProtocolModule: "null" (default, pure black-box core) or a registered
+        # case-study module name (e.g. "ftp"). Resolved via shared registry —
+        # the core never hardcodes a protocol.
+        protocol_module:      str   = "null",
     ) -> None:
         self.target_host         = target_host
         self.target_port         = target_port
@@ -573,11 +577,20 @@ class MutationEngine:
 
         # Step 3: State Transition Graph — tracks unique protocol state edges.
         # Lock-free: only accessed from the single asyncio hot loop.
+        # NOTE: kept for backward-compat property access; the active tracker is
+        # now module-owned (self._module.state_tracker()). NullModule ⇒ None.
         self._stg: StateTransitionGraph = StateTransitionGraph()
 
-        # FTP protocol detection: auto-detect from target port (21 = FTP).
-        # When active: enforce CRLF packet delimiter, use FTP token mutations.
-        self._is_ftp_target: bool = (target_port == 21)
+        # ProtocolModule seam (replaces the old `_is_ftp_target = port==21`
+        # hardcode). Default NullModule = pure black-box (no protocol
+        # knowledge). A case-study target passes protocol_module="ftp" (config)
+        # → FTPModule adds FTP status-code/CRLF/STG/token-injection knowledge
+        # as a DISCLOSED extension. The core never assumes a protocol.
+        from shared.protocol_module import get_protocol_module
+        self._module = get_protocol_module(protocol_module)
+        self._state_tracker = self._module.state_tracker()  # None for Null
+        # Backward-compat: crash_monitor/tests may read self._is_ftp_target.
+        self._is_ftp_target: bool = (self._module.name == "ftp")
 
         # P1-A: revert pending flag — deterministic mode revert
         self._revert_pending: bool = False
@@ -659,7 +672,12 @@ class MutationEngine:
         Step 3: Extended with STG metrics for CSV telemetry and dashboard.
         """
         s = self._stats
-        stg = self._stg.stats
+        # State metrics come from the module's tracker (FTPModule → FTP STG;
+        # NullModule → None → all zeros, i.e. no protocol-state concept).
+        stg = self._state_tracker.stats if self._state_tracker is not None else {
+            "unique_states": 0, "unique_edges": 0, "unique_paths": 0,
+            "total_edge_records": 0, "novel_seed_count": 0,
+        }
         return {
             "total_mutations": s.total_sent,
             "total_packets": s.total_sent,
@@ -1112,16 +1130,9 @@ class MutationEngine:
                 "ts": round(time.time(), 3),
             }
 
-            # FTP status code extraction: 3 ASCII digits followed by space/hyphen
-            # Validate range 100-599 per RFC 959 to avoid false positives from
-            # binary data that happens to start with 3 ASCII digits.
-            if len(response) >= 4 and response[:3].isdigit():
-                try:
-                    code_val = int(response[:3])
-                    if 100 <= code_val <= 599 and response[3:4] in (b" ", b"-"):
-                        entry["ftp_status_code"] = f"{code_val:03d}"
-                except ValueError:
-                    pass
+            # Protocol-specific sample extras (e.g. FTP status code) via the
+            # module. NullModule ⇒ empty dict ⇒ pure black-box (no parsing).
+            entry.update(self._module.response_sample_extra(response))
 
             line = json.dumps(entry) + "\n"
             with open(path, "a") as f:
@@ -1155,12 +1166,8 @@ class MutationEngine:
     def _classify_response(self, resp: bytes, payload: bytes) -> PacketStatus:
         """Classify server response by protocol-specific status codes.
 
-        For FTP: uses 3-digit status codes (RFC 959):
-          - 2xx/3xx = ACCEPTED (server processed the command)
-          - 4xx/5xx = REJECTED (server refused/errored)
-
-        For non-FTP or unrecognized responses: defaults to ACCEPTED
-        (got bytes back = server is alive and responded).
+        For FTP (via FTPModule): uses 3-digit status codes (RFC 959).
+        For the black-box core (NullModule): any non-empty reply ⇒ ACCEPTED.
 
         Args:
             resp:    Raw response bytes from the server.
@@ -1169,17 +1176,7 @@ class MutationEngine:
         Returns:
             Appropriate PacketStatus enum value.
         """
-        if not resp:
-            return PacketStatus.REJECTED
-        if self._is_ftp_target and len(resp) >= 3:
-            try:
-                code = int(resp[:3])
-                if 200 <= code < 400:
-                    return PacketStatus.ACCEPTED
-                elif 400 <= code < 600:
-                    return PacketStatus.REJECTED
-            except ValueError:
-                pass
+        return self._module.classify(resp, payload)
         # Default: got bytes back = accepted
         return PacketStatus.ACCEPTED
 
@@ -1354,7 +1351,8 @@ class MutationEngine:
             freq = self._seed_freq.get(seq.sequence_id, 0)
             energy = 1.0 / (freq + 1)
             # STATE_NOVELTY boost: 5× acceptance for seeds that found new edges
-            if self._stg.is_novel_seed(seq.sequence_id):
+            # (module-owned tracker; NullModule has no tracker → no boost).
+            if self._state_tracker is not None and self._state_tracker.is_novel_seed(seq.sequence_id):
                 energy *= StateTransitionGraph.NOVELTY_ENERGY_MULTIPLIER
             if random.random() < min(energy, 1.0):
                 return seq
@@ -1456,11 +1454,14 @@ class MutationEngine:
             wide state-space coverage and prevent mode collapse.
         """
         # ── ε-greedy: exploration vs exploitation ──────────────────────
+        # Operators = generic 15 + module-supplied (FTPModule adds 4 FTP
+        # strategies; NullModule adds none → pure black-box havoc, no FTP leak).
+        _exploration_ops = BINARY_ONLY_STRATEGIES + self._module.binary_operators()
         _EPSILON = 0.2
         if random.random() < _EPSILON:
             # EXPLORATION: bypass LLM rules, pure random/havoc mutation
             buf = bytearray(seed.raw_bytes)
-            self._binary_mutator.mutate(buf)
+            self._binary_mutator.mutate(buf, strategies=_exploration_ops)
             result = bytes(buf)
             self._last_injected_rule_id = "epsilon_explore"
             self._current_rule_type = "epsilon_explore"
@@ -1487,11 +1488,10 @@ class MutationEngine:
                 log.info("No rule set — entering DUMB mode (BinaryMutator)")
 
             buf = bytearray(seed.raw_bytes)
-            # BinaryMutator: 14 strategies (bit_flip, interesting values,
-            # arithmetic, block operations) — AFL-class random fuzzing.
-            # Replaces the old single-bit-flip _dumb_mutate() so that
-            # Baseline A is a fair comparison against B and C.
-            self._binary_mutator.mutate(buf)  # in-place, no alloc
+            # BinaryMutator: generic 15 strategies + module operators (FTP for
+            # the case study; none for the black-box NullModule). AFL-class
+            # random fuzzing — Baseline A baseline against B and C.
+            self._binary_mutator.mutate(buf, strategies=_exploration_ops)
             result = bytes(buf)
             # Clear rule attribution — no rule produced this mutation
             self._last_injected_rule_id = None
@@ -1569,35 +1569,13 @@ class MutationEngine:
     # -------------------------------------------------------------------
 
     def _ensure_ftp_crlf(self, payload: bytes) -> bytes:
-        """Enforce CRLF (\\r\\n) packet termination for FTP targets.
+        """Apply protocol framing via the ProtocolModule.
 
-        FTP protocol requires every command to be terminated with CRLF (RFC 959).
-        If the target is an FTP server (port 21) and the payload doesn't end
-        with CRLF, append it. If it ends with bare LF, upgrade to CRLF.
-
-        Handles edge cases:
-            - Already ends with CRLF → pass through unchanged
-            - Ends with bare LF → upgrade to CRLF
-            - Ends with bare CR → append LF
-            - No terminator → append CRLF
+        Kept as a thin wrapper for the many call sites; the actual framing
+        (CRLF for FTP, identity for the black-box NullModule) lives in
+        ``self._module.ensure_framing()``.
         """
-        if not self._is_ftp_target or not payload:
-            return payload
-
-        # Check if already properly terminated with CRLF
-        if payload.endswith(b"\r\n"):
-            return payload
-
-        # Bare LF → upgrade to CRLF
-        if payload.endswith(b"\n"):
-            return payload[:-1] + b"\r\n"
-
-        # Bare CR → append LF
-        if payload.endswith(b"\r"):
-            return payload + b"\n"
-
-        # No terminator → append CRLF
-        return payload + b"\r\n"
+        return self._module.ensure_framing(payload)
 
     # -------------------------------------------------------------------
     # Network Send
@@ -1629,11 +1607,12 @@ class MutationEngine:
                 if resp:
                     status = self._classify_response(resp, payload)
                     self._record_response_sample(resp)
-                    # Step 3: STG tracking for single-packet send (piggyback).
-                    if self._is_ftp_target:
-                        new_code = self._extract_ftp_code(resp)
-                        cmd = StateTransitionGraph.extract_ftp_command(payload)
-                        self._stg.record_edge("220", cmd, new_code, seed_id)
+                    # State-transition tracking — module-owned (FTPModule →
+                    # FTP STG; NullModule → None, skipped = pure black-box).
+                    if self._state_tracker is not None:
+                        new_code = self._module.extract_state_code(resp)
+                        cmd = self._module.extract_command(payload)
+                        self._state_tracker.record_edge("220", cmd, new_code, seed_id)
                 else:
                     status = PacketStatus.REJECTED
             except asyncio.TimeoutError:
@@ -1816,12 +1795,11 @@ class MutationEngine:
                     resp = await asyncio.wait_for(
                         reader.read(4096), timeout=self.recv_timeout
                     )
-                    # Step 3: capture prefix response for STG (already read,
-                    # previously discarded — zero extra cost).
-                    if resp and self._is_ftp_target:
-                        new_code = self._extract_ftp_code(resp)
-                        cmd = StateTransitionGraph.extract_ftp_command(pkt_bytes)
-                        self._stg.record_edge(
+                    # State-transition tracking for prefix packets — module-owned.
+                    if resp and self._state_tracker is not None:
+                        new_code = self._module.extract_state_code(resp)
+                        cmd = self._module.extract_command(pkt_bytes)
+                        self._state_tracker.record_edge(
                             prev_code, cmd, new_code, target.sequence_id
                         )
                         prev_code = new_code
@@ -1840,13 +1818,13 @@ class MutationEngine:
                 if resp:
                     status = self._classify_response(resp, mutated_payload)
                     self._record_response_sample(resp)
-                    # Step 3: STG tracking for mutated target (piggyback).
-                    if self._is_ftp_target:
-                        new_code = self._extract_ftp_code(resp)
-                        cmd = StateTransitionGraph.extract_ftp_command(
+                    # State-transition tracking for mutated target — module-owned.
+                    if self._state_tracker is not None:
+                        new_code = self._module.extract_state_code(resp)
+                        cmd = self._module.extract_command(
                             mutated_payload
                         )
-                        is_novel = self._stg.record_edge(
+                        is_novel = self._state_tracker.record_edge(
                             prev_code, cmd, new_code, target.sequence_id
                         )
                         if is_novel:
