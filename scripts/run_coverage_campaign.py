@@ -32,6 +32,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 COVERAGE_ROOTFS = _ROOT / "sandbox/firecracker_env/rootfs_lightftp_coverage.ext4"
+PRISTINE_ROOTFS = _ROOT / "sandbox/firecracker_env/rootfs_lightftp_coverage_pristine.ext4"
 RESULTS_DIR = _ROOT / "evaluation/results/coverage"
 
 # Mutator/math/LLM config per baseline (mirrors evaluation_runner BASELINE_CONFIGS).
@@ -111,6 +112,23 @@ def extract_and_lcov(baseline: str, work: Path) -> dict:
     return data
 
 
+def _assert_rootfs_clean() -> None:
+    """Fail fast if the working rootfs carries stale .gcda (would contaminate
+    the measurement — gcov counters are additive across runs)."""
+    if not shutil.which("debugfs"):
+        return  # can't check; trust the pristine reset
+    r = subprocess.run(
+        ["debugfs", "-R", "ls /opt/cov/tmp/LightFTP/Source/Release",
+         str(COVERAGE_ROOTFS)],
+        capture_output=True, text=True, timeout=15,
+    )
+    if ".gcda" in r.stdout:
+        raise RuntimeError(
+            f"STALE .gcda found in {COVERAGE_ROOTFS} — coverage would be "
+            f"contaminated. Rebuild pristine or reset before run. Aborting."
+        )
+
+
 async def run_baseline(baseline: str, duration: int) -> dict:
     """Boot coverage VM, fuzz `duration`s via the full pipeline, extract."""
     cfg = BASELINES[baseline]
@@ -119,6 +137,17 @@ async def run_baseline(baseline: str, duration: int) -> dict:
     if work.exists():
         shutil.rmtree(work)
     work.mkdir(parents=True, exist_ok=True)
+
+    # CRITICAL: reset the coverage rootfs from the pristine master before each
+    # baseline. gcov .gcda counters are ADDITIVE — without a reset, baseline N
+    # inherits N-1's coverage and every comparison is contaminated (later
+    # baselines always >= earlier). The pristine master has no /opt/cov/*.gcda.
+    if PRISTINE_ROOTFS.exists():
+        print(f"  resetting rootfs from pristine master (clears stale .gcda)")
+        shutil.copyfile(PRISTINE_ROOTFS, COVERAGE_ROOTFS)
+    else:
+        print(f"  ⚠ no pristine rootfs — verifying current rootfs is clean...")
+    _assert_rootfs_clean()
 
     # Import lazily so the script can run --help without heavy deps.
     from sandbox.firecracker_driver import FirecrackerSandbox
