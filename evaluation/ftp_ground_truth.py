@@ -78,7 +78,9 @@ FTP_COMMANDS_4LETTER = [
 ]
 # 3-letter commands (command offset becomes [0,3); still matches GT
 # [0,4) via the ±1 start-tolerance in the evaluator).
-FTP_COMMANDS_3LETTER = ["CWD", "CDUP"[:3], "SMNT"[:3], "RMD", "MKD", "PWD", "SYST"[:3], "REIN"[:3]]
+# 3-letter FTP control commands (RFC 959). (CDUP, SMNT, SYST, REIN are 4
+# letters — they belong in FTP_COMMANDS_4LETTER, not sliced here.)
+FTP_COMMANDS_3LETTER = ["CWD", "RMD", "MKD", "PWD"]
 
 
 FTP_GROUND_TRUTH: list[FTPGroundTruthField] = [

@@ -160,7 +160,10 @@ async def run_baseline(baseline: str, duration: int) -> dict:
         vm_ip="172.16.0.2",
         kernel_args=(
             "console=ttyS0 reboot=k panic=1 pci=off"
-            f" root=/dev/vda rw init=/init cov_duration={duration + 5}"
+            # cov_duration is measured from VM BOOT, but fuzzing starts
+            # T_start seconds later (boot + snapshot). Margin must cover the
+            # slowest plausible boot so the timer never fires mid-fuzz.
+            f" root=/dev/vda rw init=/init cov_duration={duration + 20}"
             " ip=172.16.0.2::172.16.0.1:255.255.255.0::eth0:off"
         ),
     )
@@ -168,9 +171,9 @@ async def run_baseline(baseline: str, duration: int) -> dict:
         await sb.start()
         # Drive the fuzzer for `duration`s.
         await fuzz_against_vm(cfg["mode"], duration)
-        # Let the /init timer (duration+5s) fire → flush+sync+halt.
-        print(f"  waiting {duration + 8}s for /init timer flush...")
-        await asyncio.sleep(duration + 8)
+        # Let the /init timer fire → flush+sync+halt, then margin for sync.
+        print(f"  waiting {duration + 25}s for /init timer flush...")
+        await asyncio.sleep(duration + 25)
     finally:
         await sb.stop()
 

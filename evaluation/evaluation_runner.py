@@ -300,13 +300,25 @@ async def run_single_baseline(
                 # right after the campaign, before stop().
                 rootfs = "sandbox/firecracker_env/rootfs_lightftp_coverage.ext4"
                 # Reset from pristine so each baseline starts with NO .gcda (gcov
-                # counters are additive — see scripts/run_coverage_campaign.py).
+                # counters are ADDITIVE — without a reset, baseline N inherits
+                # N-1's coverage and every comparison is contaminated). Pristine
+                # is REQUIRED — fail hard if missing rather than silently run on
+                # a stale (contaminated) rootfs.
                 pristine = "sandbox/firecracker_env/rootfs_lightftp_coverage_pristine.ext4"
-                if Path(pristine).exists():
-                    import shutil as _sh
-                    print(f"  [coverage] resetting rootfs from pristine master")
-                    _sh.copyfile(pristine, rootfs)
-                kernel_args = fc_cfg["kernel_args"] + f" cov_duration={duration_s + 5}"
+                if not Path(pristine).exists():
+                    raise RuntimeError(
+                        f"[coverage] pristine rootfs missing: {pristine}. "
+                        f"Run scripts/build_rootfs_lightftp_coverage.sh then "
+                        f"`cp rootfs_lightftp_coverage.ext4 rootfs_lightftp_coverage_pristine.ext4`. "
+                        f"Aborting — running without it would contaminate the measurement."
+                    )
+                import shutil as _sh
+                print(f"  [coverage] resetting rootfs from pristine master")
+                _sh.copyfile(pristine, rootfs)
+                # cov_duration measured from VM boot; fuzz starts T_start
+                # later (boot+snapshot). +20 covers slow boots so the timer
+                # never fires mid-fuzz (would truncate coverage).
+                kernel_args = fc_cfg["kernel_args"] + f" cov_duration={duration_s + 20}"
             else:
                 rootfs = fc_cfg["rootfs_path"]
                 kernel_args = fc_cfg["kernel_args"]

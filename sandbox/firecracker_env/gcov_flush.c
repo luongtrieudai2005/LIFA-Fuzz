@@ -25,15 +25,20 @@ static void _gcov_on_signal(int sig) {
                       * Without this, the guest panics on PID-1 exit (panic=1)
                       * before the kernel syncs, and .gcda never reaches the
                       * host's ext4 file. */
-    /* For crash signals (SIGABRT/SIGSEGV), re-raise with default disposition
-     * after flushing so the process actually terminates (and, for ASAN, the
-     * abort completes) — no infinite loop if flush itself faults. */
+    /* For crash signals (SIGABRT/SIGSEGV) we have already flushed .gcda above
+     * — that is the coverage goal. We then _exit(0). NOTE: the raise() below
+     * is effectively a no-op for termination — the signal is blocked during
+     * its own handler (default sa_mask) and _exit(0) wins. So a crash shows
+     * up as a clean exit(0) from the OS's view. That is FINE for coverage
+     * mode (we only care that .gcda was flushed; crashes aren't counted there).
+     * It would be WRONG for the production fuzzer — but this handler is only
+     * linked into the coverage build, never production. */
     if (sig == SIGABRT || sig == SIGSEGV) {
         struct sigaction dfl;
         memset(&dfl, 0, sizeof(dfl));
         dfl.sa_handler = SIG_DFL;
         sigaction(sig, &dfl, NULL);
-        raise(sig);
+        raise(sig);  /* pending (blocked); _exit below terminates first */
     }
     _exit(0);
 }
