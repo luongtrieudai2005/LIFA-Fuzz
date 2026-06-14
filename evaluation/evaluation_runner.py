@@ -767,14 +767,14 @@ async def run_single_baseline(
 
         try:
             if client_proc is not None:
-                await client_proc.stop()
-        except Exception:
+                await asyncio.wait_for(client_proc.stop(), timeout=5.0)
+        except (Exception, asyncio.TimeoutError):
             pass
 
         try:
             if interceptor is not None:
-                await interceptor.stop()
-        except Exception:
+                await asyncio.wait_for(interceptor.stop(), timeout=5.0)
+        except (Exception, asyncio.TimeoutError):
             pass
 
         # Collect gcov coverage BEFORE sandbox.stop() removes the container
@@ -798,7 +798,12 @@ async def run_single_baseline(
 
         try:
             if sandbox is not None:
-                await sandbox.stop()
+                # Bounded: a VM/container that won't tear down must not hold
+                # the whole campaign hostage (it would prevent the next
+                # baseline from ever starting).
+                await asyncio.wait_for(sandbox.stop(), timeout=15.0)
+        except asyncio.TimeoutError:
+            print("  ⚠ sandbox.stop() timed out after 15s — forcing orphan cleanup")
         except Exception:
             pass
 
@@ -1454,6 +1459,14 @@ Examples:
         # Wait between baselines for cleanup
         if bid != baselines[-1]:
             print("\n  Waiting 10s for cleanup...")
+            # Kill any orphaned VMs / containers / TAP devices / sockets /
+            # port-8001 bindings left behind by this baseline. Without this,
+            # baseline B's sandbox.start() or interceptor can conflict on the
+            # TAP device (tap-lifa0), the Firecracker socket, or port 8001 —
+            # which manifests as the run hanging after A finishes instead of
+            # advancing to B. cleanup_orphaned_resources() is otherwise only
+            # called once at campaign start, so it must be repeated here.
+            cleanup_orphaned_resources()
             await asyncio.sleep(10)
 
     # Write comparison
