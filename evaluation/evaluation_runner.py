@@ -1164,18 +1164,10 @@ async def _run_math_only_loop(
                     f"  [math-only] Pushed {len(rules)} rules to mutator "
                     f"(first 3: {[r.target_field_name for r in rules[:3]]})"
                 )
-
-                # Write rules to file for mutator file poller (backup path)
-                # MUST match the path read by MutationEngine._load_rules_path_from_config()
-                rules_path = Path(mutator._rules_file)
-                rules_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp = rules_path.with_suffix(".tmp")
-                with open(tmp, "w") as f:
-                    json.dump(
-                        [r.model_dump(mode="json") for r in rules],
-                        f, indent=2, default=str,
-                    )
-                tmp.rename(rules_path)
+                # No file write — direct push is authoritative in-process.
+                # Writing the file would make _poll_rules_file() re-push with
+                # default metadata (protocol_name="inferred", confidence=0%)
+                # and overwrite this good push.
 
         except asyncio.CancelledError:
             break
@@ -1230,17 +1222,15 @@ async def _run_fusion_loop(
                         rules=rules,
                     )
                     await mutator.update_rule_set(rule_set)
-
-                    # Also write to file for mutator file poller (backup)
-                    rules_path = Path(mutator._rules_file)
-                    rules_path.parent.mkdir(parents=True, exist_ok=True)
-                    tmp = rules_path.with_suffix(".tmp")
-                    with open(tmp, "w") as f:
-                        json.dump(
-                            [r.model_dump(mode="json") for r in rules],
-                            f, indent=2, default=str,
-                        )
-                    tmp.rename(rules_path)
+                    # NOTE: we deliberately do NOT also write to the rules
+                    # file here. The direct update_rule_set() above is the
+                    # source of truth in this in-process eval loop. Writing
+                    # the file too would make the mutator's _poll_rules_file()
+                    # re-read it and re-push an ActiveRuleSet rebuilt with
+                    # default metadata (protocol_name="inferred",
+                    # confidence=0%), overwriting this good push — visible
+                    # as the rule set oscillating FTP→inferred, confidence
+                    # dropping to 0%.
 
             elif result is not None and result.get("status") == "bootstrap":
                 rules = result.get("rules", [])
@@ -1251,21 +1241,8 @@ async def _run_fusion_loop(
                         rules=rules,
                     )
                     await mutator.update_rule_set(rule_set)
-
-                    # Write bootstrap rules to file (backup path for
-                    # mutator file poller — same as success path above).
-                    try:
-                        rules_path = Path(mutator._rules_file)
-                        rules_path.parent.mkdir(parents=True, exist_ok=True)
-                        tmp = rules_path.with_suffix(".tmp")
-                        with open(tmp, "w") as f:
-                            json.dump(
-                                [r.model_dump(mode="json") for r in rules],
-                                f, indent=2, default=str,
-                            )
-                        tmp.rename(rules_path)
-                    except Exception:
-                        pass  # File write is backup-only, not critical
+                    # No file write here either — same reason as the success
+                    # branch above (direct push is authoritative in-process).
 
         except asyncio.CancelledError:
             break

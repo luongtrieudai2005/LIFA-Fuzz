@@ -166,6 +166,14 @@ class RuleGenerator:
                 logger.debug(f"Skipping constant field '{field.name}'")
                 continue
 
+            # _validate_field_types() marks overlapping fields as SKIP. Without
+            # this guard those SKIP fields would still generate rules here,
+            # making the overlap detection dead code — overlapping fields
+            # would produce conflicting rules whose mutations corrupt each other.
+            if field.mutation_strategy == MutationStrategy.SKIP:
+                logger.debug(f"Skipping SKIP field '{field.name}' (overlap-resolved)")
+                continue
+
             # Guard: drop fields with invalid byte ranges instead of letting
             # them crash SemanticRule construction (offset_start has ge=0).
             # LLMs often describe trailer/checksum/CRLF fields with negative
@@ -438,6 +446,17 @@ class RuleGenerator:
 
         if field.field_type == FieldType.BOOL:
             return self._generate_bool_rules(field, priority, magic_bytes)
+
+        if field.field_type == FieldType.RESERVED:
+            # Padding / unused bytes — must NOT be mutated. Mutating them only
+            # risks server rejection (or, for length-prefixed protocols, length
+            # mismatch) without any chance of reaching vulnerable logic. The
+            # prompt tells the LLM to pair RESERVED with is_constant=true
+            # (which is filtered above), but if it forgets, treat it as static.
+            logger.debug(
+                f"RESERVED field '{field.name}' — not mutating (padding/unused)"
+            )
+            return []
 
         # Unknown field type — conservative bit-flip
         logger.debug(f"Unknown field type '{field.field_type}' for '{field.name}'")
