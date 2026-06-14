@@ -298,45 +298,69 @@ Các chiến dịch được chạy ở nhiều độ dài khác nhau (từ 2 ph
 
 Phần này báo cáo các kết quả đo được từ các chiến dịch thực nghiệm đã chạy. Cần nhấn mạnh đây là **kết quả sơ bộ**: số liệu RQ1 thu được ở chế độ MOCK (chưa gọi LLM thực), và phép so sánh RQ3 trên ba baseline chưa cho ra kết luận định lượng ổn định. Các con số dưới đây được trích xuất trực tiếp từ `evaluation/results/` và `evaluation/archive/`.
 
-**RQ1 — Độ chính xác suy diễn ngữ pháp.** Ở chế độ MOCK, pipeline đạt Precision = 1.00, Recall = 0.75, **F1 = 0.857**, với độ chính xác offset = 1.00 (mọi trường suy diễn khớp offset ground truth trong dung sai ±1 byte). Tuy nhiên độ chính xác về *kiểu trường* và *strategy* thấp hơn (0.33 và 0.67 tương ứng): analyzer gộp hai trường opcode và length kế nhau thành một trường length duy nhất, dẫn đến thiếu 1 trường (Recall = 0.75). Mức F1 > 0.85 khớp với kỳ vọng cho giao thức đơn giản, song phải ghi rõ hai điểm: (i) đây là chế độ MOCK, chưa phản ánh chất lượng suy diễn của LLM thực; và (ii) ground truth là giao thức do chính tác giả thiết kế (xem hạn chế Section 6.4). Vì vậy F1 này chủ yếu kiểm chứng cơ chế khớp offset, chưa phải đánh giá khả năng tổng quát hóa.
+**RQ1 — Độ chính xác suy diễn ngữ pháp.** Ở chế độ MOCK, pipeline đạt Precision = 1.00, Recall = 0.75, **F1 = 0.857**, với độ chính xác offset = 1.00 (mọi trường suy diễn khớp offset ground truth trong dung sai ±1 byte). Tuy nhiên độ chính xác về *kiểu trường* và *strategy* thấp hơn (0.33 và 0.67 tương ứng): analyzer gộp hai trường opcode và length kế nhau thành một trường length duy nhất, dẫn đến thiếu 1 trường (Recall = 0.75). Mức F1 > 0.85 khớp với kỳ vọng cho giao thức đơn giản, song phải ghi rõ hai điểm: (i) đây là chế độ MOCK, chưa phản ánh chất lượng suy diễn của LLM thực; và (ii) ground truth là giao thức do chính tác giả thiết kế (xem hạn chế Section 6.5). Vì vậy F1 này chủ yếu kiểm chứng cơ chế khớp offset, chưa phải đánh giá khả năng tổng quát hóa.
 
 **RQ2 — Throughput.** Bảng 2 tóm tắt EPS đo được trong một chiến dịch 2 giờ (7200 giây) trên LightFTP/Firecracker.
 
 *Bảng 2: Throughput thực đo (chiến dịch 7200 giây, target LightFTP trên Firecracker MicroVM).*
 
-| Baseline | EPS trung bình | EPS tối đa | Số mutation | Coverage (proxy) | Token LLM |
+| Baseline | EPS trung bình | EPS tối đa | Số mutation | Độ rộng mutation† | Token LLM |
 |---|---|---|---|---|---|
 | A — Pure Random | 414 | 614 | 2.984.330 | 13.426 | 0 |
 | B — Math-Only | 400 | 630 | 2.883.137 | 8.842 | 0 |
 | C — Full Fusion | 141 | 557 | 1.012.859 | 7.689 | 55.000 (110 lần inference) |
 
+> *† Cột "Độ rộng mutation" (trước đây gắn nhãn "Coverage (proxy)") đếm số cặp (offset byte, giá trị) duy nhất bị đột biến — tức **độ rộng** của không gian đột biến, **không phải** độ phủ code path nhị phân. Random fuzzing (A) đột biến rộng nhất nên số này cao nhất một cách cơ học; con số này không phản ánh "tốt hơn". Độ phủ giao thức thật được báo cáo riêng qua số transition trạng thái (STG edges) ở Bảng 2b và được thảo luận làm headline finding ở Mục 6.1.*
+
 Hai baseline không dùng LLM (A và B) duy trì ~400 EPS, xác nhận kiến trúc bất đồng bộ giữ được throughput cao khi LLM không nằm trên đường nóng. Tuy nhiên **Baseline C thấp hơn nhiều so với kỳ vọng**: EPS trung bình chỉ đạt ~141 (giảm khoảng 65% so với A/B), chứ không phải "dưới 15%" như giả định ban đầu. Nguyên nhân là overhead của LLM inference (110 lần gọi, ~55.000 token) cộng với việc áp dụng rule set phức tạp hơn bị lan ra đường nóng nhiều hơn thiết kế mong muốn. Đây là kết quả bất lợi nhưng quan trọng: để Full Fusion giữ throughput gần với A/B, cần cách ly triệt để hơn giữa LLM và hot loop (ví dụ cache grammar, áp dụng rule hoàn toàn offline). Bộ điều khiển EWMA đã được tích hợp và điều phối sampling, nhưng do thiếu trace thích nghi sạch, báo cáo này chưa lượng hóa được đường cong $k(t)$ và để ngỏ việc benchmark định lượng EWMA cho tương lai.
 
-**RQ3 — Khả năng phát hiện crash.** Pipeline đã xác nhận khả năng phát hiện crash ASAN thực (SIGABRT, exit code 134) trên LightFTP trong một số phiên — các crash artifact (PoC + báo cáo JSON) được ghi vào `./crashes/`. Tuy nhiên trong các phép so sánh A/B/C đã chạy, **số unique crash ghi nhận không ổn định**: chiến dịch 2 giờ ở Bảng 2 ghi 0 crash trên cả ba baseline, trong khi một chiến dịch A-random dài hơn (90 phút) ghi tới 266 unique crash. Sự không nhất quán này cho thấy bộ đếm crash hiện tại còn phụ thuộc nhiều vào điều kiện phiên (trạng thái target, thời điểm, cơ chế ASAN reporting) và chưa đủ kiểm soát để rút ra kết luận định lượng "baseline nào phát hiện crash nhanh và đa dạng hơn". Do đó **RQ3 chưa kết luận** ở thời điểm báo cáo; cần một phép so sánh có kiểm soát chặt (cùng target snapshot, cùng seed, cùng độ dài, lặp lại nhiều lần) trước khi trả lời định lượng. Việc này cũng là động lực cho Baseline D (ablation, Section 6.4) trong các đợt chạy tiếp theo.
+**Độ phủ trạng thái giao thức (state coverage).** Vì Bảng 2 không có độ phủ giao thức thật (chỉ có độ rộng mutation), bảng dưới đây báo cáo số transition trạng thái giao thức (STG edges) quan sát được — bộ ba `(prev_code, command, new_code)` — đây là chỉ số protocol-coverage đáng tin cậy nhất hiện có. Dữ liệu trích từ `logs/state_coverage_stats_{A,B,C}.csv` của các chiến dịch mở rộng.
+
+*Bảng 2b: Độ phủ trạng thái giao thức (chiến dịch mở rộng trên LightFTP/Firecracker).*
+
+| Baseline | Thời lượng (phút) | Executions | STG edges (unique) | edges / 1000 exec |
+|---|---|---|---|---|
+| A — Pure Random | 326 | 1.438.799 | 3.752 | 2,61 |
+| B — Math-Only | 819 | 1.422.891 | **5.563** | **3,91** |
+| C — Full Fusion | 1.154 | 1.356.229 | 2.217 | 1,63 |
+
+Để khống chế khác biệt về thời lượng chiến dịch, ta dùng **hiệu suất discovery chuẩn hóa** (edges / 1000 executions). Kết quả rõ ràng và phản trực giác: **B (Math-Only) khám phá state transition nhiều nhất (3,91 edges/1k exec), gấp ~2,4 lần C (Full Fusion, 1,63)**. Cụ thể tại ~500.000 executions: B tìm 4.616 edges so với chỉ 1.440 của C — B hơn 3,2 lần. Random (A) nằm giữa (2,61). **Baseline dùng LLM (C) lại khám phá ít transition trạng thái nhất** — đây là phát hiện trọng tâm được phân tích cơ chế ở Mục 6.1. Lưu ý thêm: cả ba baseline đều không vượt qua trạng thái FTP đầu tiên (chỉ quan sát status code `220`, xem Mục 6.5), nên các "edge" tại đây là transition nội bộ trong trạng thái chưa xác thực.
+
+**RQ3 — Khả năng phát hiện crash.** Pipeline đã xác nhận khả năng phát hiện crash ASAN thực (SIGABRT, exit code 134) trên LightFTP trong một số phiên — các crash artifact (PoC + báo cáo JSON) được ghi vào `./crashes/`. Tuy nhiên trong các phép so sánh A/B/C đã chạy, **số unique crash ghi nhận không ổn định**: chiến dịch 2 giờ ở Bảng 2 ghi 0 crash trên cả ba baseline, trong khi một chiến dịch A-random dài hơn (90 phút) ghi tới 266 unique crash. Sự không nhất quán này cho thấy bộ đếm crash hiện tại còn phụ thuộc nhiều vào điều kiện phiên (trạng thái target, thời điểm, cơ chế ASAN reporting) và chưa đủ kiểm soát để rút ra kết luận định lượng "baseline nào phát hiện crash nhanh và đa dạng hơn". Do đó **RQ3 chưa kết luận** ở thời điểm báo cáo; cần một phép so sánh có kiểm soát chặt (cùng target snapshot, cùng seed, cùng độ dài, lặp lại nhiều lần) trước khi trả lời định lượng.
 
 \newpage
 
 # Chương 6: Thảo luận
 
-## 6.1. Hiệu quả của Neural-Mathematical Fusion
+## 6.1. Finding trọng tâm: LLM tăng độ chính xác ngữ pháp nhưng giảm độ phủ trạng thái giao thức
+
+Kết quả bất lợi quan trọng nhất — và cũng là phát hiện có giá trị khoa học nhất — của các chiến dịch thực nghiệm là: **baseline dùng LLM (Full Fusion, C) khám phá ít transition trạng thái giao thức (STG edges) hơn hẳn baseline chỉ dùng toán học (Math-Only, B)**. Cụ thể, hiệu suất discovery chuẩn hóa theo số execution là B (3,91) > A (2,61) > C (1,63) edges/1000 exec — C kém B khoảng 2,4 lần (Bảng 2b). Đây là kết quả **phản trực giác**: ta xây dựng pipeline Full Fusion với kỳ vọng LLM sẽ dẫn dắt fuzzer thông minh hơn, nhưng thực tế LLM lại **thu hẹp** không gian khám phá trạng thái.
+
+**Cơ chế.** Nguyên nhân nằm ở cách LLM gán MutationStrategy cho từng trường. Khi LLM suy luận rằng một số offset là magic/constant, nó gán `STATIC` → fuzzer bỏ qua hoàn toàn. Các trường còn lại được gán tập trung vào `BOUNDARY_VALUES` (trường length — nguồn bug phổ biến) và `DICTIONARY` (opcode). Hệ quả là fuzzer sinh ra **ít loại command FTP khác nhau** hơn: nó xoay quanh một tập nhỏ các giá trị boundary/dictionary thay vì bắn đa dạng command như B (math-only, ít kìm nén hơn) hay A (random, bắn mọi offset). Vì State Transition Graph đếm bộ ba `(prev_code, command, new_code)`, ít command khác nhau đồng nghĩa với ít transition khám phá được. B (Math-Only) lại càng ít thu hẹp command hơn → vô tình chạm nhiều transition hơn.
+
+**Ý nghĩa — trade-off giữa độ chính xác và độ phủ trạng thái.** Đây là một **trade-off chưa được báo cáo trong các công trình LLM-for-fuzzing** (như SemFuzz [22] hay các khảo sát [20]). Hướng dẫn của LLM tăng độ chính xác ngữ pháp (RQ1: offset khớp ground truth) nhưng, khi áp dụng lên fuzzer black-box có trạng thái, lại **tự hạn chế độ đa dạng trạng thái** cần thiết để kích hoạt code path sâu. LLM "hiểu đúng" giao thức nhưng "thận trọng quá" — bỏ qua các đột biến "ngớ ngẩn" mà thực ra lại là đầu dò trạng thái hiệu quả. Điều này gợi ra rằng **giá trị của LLM không nằm ở gán strategy chặt, mà ở đặt tên ngữ nghĩa** (cho mục đích triage và báo cáo), trong khi quyết định đột biến nên giữ độ đa dạng (ví dụ một tầng ε-exploration bắt buộc để bù lại command diversity bị mất).
+
+**Không nên diễn giải C kém hơn B ở đây.** Bảng 2b đo *state coverage*, không đo *code coverage nhị phân thật* (hệ thống hiện không có feedback coverage nhị phân — xem hạn chế Mục 6.5). Rõ ràng ta cần: (i) đo code coverage nhị phân thực (qua ASAN/coverage reporting trong MicroVM) để xác nhận liệu C có thực sự chạm ít code path hơn hay chỉ ít state transition hơn; và (ii) kiểm tra liệu việc giữ command diversity (ε-exploration) có khôi phục được state coverage của C mà vẫn giữ lợi thế ngữ pháp. Đây là hai thí nghiệm ưu tiên cho đợt đánh giá tiếp theo.
+
+## 6.2. Hiệu quả của Neural-Mathematical Fusion
 
 Kết quả thực nghiệm cho thấy sự phân công lao động giữa math layer và LLM là hợp lý. DifferentialAnalyzer xử lý trong dưới 1 ms những gì LLM có thể mất hàng nghìn token để phát hiện: byte nào constant, byte nào có tương quan với packet length, byte nào có entropy cao. LLM được giải phóng để tập trung vào tác vụ mà thống kê đơn thuần không giải quyết được — chẳng hạn, xác định rằng một trường enum 1-byte với các giá trị `0x01`, `0x02`, `0x03` tương ứng với các lệnh READ, WRITE, DELETE. Thông tin này không thể suy ra từ entropy hay tương quan, nhưng LLM có thể dự đoán dựa trên kiến thức về các giao thức phổ biến.
 
 Tuy nhiên, fusion có một điểm yếu: khi giao thức quá đơn giản (chỉ có 2–3 trường), sự phân tách giữa math và LLM không tạo ra lợi ích đáng kể. DifferentialAnalyzer tự nó đã đủ để sinh rules bootstrap chất lượng cao. Lúc này, chi phí gọi LLM ($0.01–0.05 mỗi lần) khó bù đắp bằng giá trị incremental. Ngược lại, khi giao thức phức tạp (10+ trường, nested structure, state machine), LLM contribution trở nên rõ rệt hơn.
 
-## 6.2. Fast-Slow Loop và file-based IPC
+## 6.3. Fast-Slow Loop và file-based IPC
 
 Lựa chọn file-based IPC (JSON/JSONL) thay vì Redis hay message queue có vẻ kém "mạnh mẽ" (less "enterprise"), nhưng lại phù hợp cho use case này vì ba lý do. Thứ nhất, traffic log đã phải ghi ra file anyway (cho replay và debugging), nên không thêm overhead mới. Thứ hai, atomic rename-swap cung cấp consistency guarantee đủ mạnh cho single-writer/single-reader pattern. Thứ ba, không có dependency ngoài — hệ thống chạy trên bất kỳ máy nào có Python, không cần setup Redis hay configure port.
 
 Hạn chế của cách tiếp cận này là latency: thời gian từ khi Slow Loop ghi rule mới đến khi Fast Loop đọc được phụ thuộc vào poll interval (2 giây). Trong fuzzing, độ trễ này hoàn toàn chấp nhận được — rule update mỗi 1–2 phút là đủ, không cần real-time. Tuy nhiên, nếu mở rộng sang distributed fuzzing (nhiều Fast Loop instance), file-based IPC sẽ không scale, và cần chuyển sang shared storage (NFS, S3) hoặc message queue.
 
-## 6.3. EWMA Controller và trade-off throughput-observability
+## 6.4. EWMA Controller và trade-off throughput-observability
 
 EWMA controller thể hiện hành vi mong muốn: coverage tăng → recv() thường xuyên → fuzzer "nhìn thấy" nhiều hơn; coverage bão hòa → recv() thưa thớt → throughput tối đa. Công thức liên tục tránh được hiện tượng chattering — một vấn đề thực sự quan sát được khi thử luật AIMD step function, nơi $k$ nhảy liên tục giữa 1 và $K_{\max}$ tạo ra micro-burst trong EPS.
 
 Một hạn chế của EWMA hiện tại là dependence vào proxy metric. Slow Loop không có quyền truy cập trực tiếp vào server response — nó chỉ nhìn thấy số lượng unique hex prefix trong response buffer và số field group từ DifferentialAnalyzer. Đây là proxy không hoàn hảo cho "coverage thực sự" (số code path được kích hoạt trong binary). Nếu tích hợp được ASAN/UBSan coverage reporting (qua shared filesystem giữa host và VM), metric coverage sẽ chính xác hơn đáng kể.
 
-## 6.4. Hạn chế
+## 6.5. Hạn chế
 
 Hệ thống có một số hạn chế cần ghi nhận:
 
@@ -344,11 +368,15 @@ Thứ nhất, LLM inference không deterministic. Cùng một traffic input, hai
 
 Thứ hai, phương pháp đánh giá hiện tại (RQ1) sử dụng ground truth cho giao thức LIFA đơn giản (4 trường) — một giao thức do chính tác giả thiết kế. Điều này dẫn đến *vấn đề đánh giá vòng (evaluation leak)*: hệ thống được đánh giá trên chính bài toán mà nó có thể đã được vô ý tối ưu để giải. Mục tiêu của đề tài là fuzzing giao thức độc quyền *không biết trước*, nhưng RQ1 lại đánh giá trên giao thức *đã biết hoàn toàn*. Hơn nữa, kết quả RQ1 hiện có (F1 = 0.857) được đo ở chế độ MOCK (không gọi LLM thực), nên chỉ phản ánh khả năng khớp offset/cấu trúc trên một ví dụ đơn giản chứ chưa chứng minh khả năng tổng quát hóa với LLM thực. Việc mở rộng RQ1 lên giao thức thực với ground truth độc lập (ví dụ parser lệnh USER/PASS của FTP theo RFC 959, với target LightFTP đã có sẵn) là cần thiết để khắc phục hạn chế này.
 
-Thứ ba, chi phí LLM, dù đã giảm 70% nhờ math layer, vẫn không nhỏ. Một chiến dịch fuzzing 1 giờ với inference mỗi 30 giây tiêu tốn khoảng $1–3. Điều này chấp nhận được cho nghiên cứu nhưng cần xem xét cho chiến dịch dài ngày.
+Thứ ba, chi phí LLM. Toán học tiền xử lý được thiết kế để giảm token tiêu thụ (ước tính sơ bộ, chưa có phép đo before/after chính thức), song chi phí vẫn không nhỏ. Một chiến dịch fuzzing 1 giờ với inference mỗi 30 giây tiêu tốn khoảng $1–3. Điều này chấp nhận được cho nghiên cứu nhưng cần xem xét cho chiến dịch dài ngày.
 
 Thứ tư, Firecracker yêu cầu KVM, không chạy được trên môi trường không có hardware virtualization (như một số cloud VM lồng nhau). DockerSandbox phục vụ như fallback nhưng với reset time chậm hơn đáng kể.
 
-Thứ năm, báo cáo chưa thực hiện *ablation study* đầy đủ để bóc tách đóng góp riêng của từng thành phần. Việc so sánh ba baseline A/B/C mới chỉ trả lời được câu hỏi "toán học + LLM tốt hơn random hay không", chứ chưa chứng minh đóng góp tương đối của bộ điều khiển EWMA, WeightedScheduler, và cơ chế one-at-a-time isolation. Để khắc phục, cần bổ sung ít nhất Baseline D = Full Fusion với $k$ cố định (= $K_{\max}$, tắt EWMA) và so sánh với Baseline C: hiệu số giữa C và D sẽ cô lập đóng góp của bộ điều khiển EWMA. Đây là hướng đánh giá bổ sung quan trọng trước khi kết luận về giá trị của từng component.
+Thứ năm, **hệ thống không có feedback độ phủ code nhị phân thật** (code coverage). Chỉ số `unique_code_branches` trong telemetry thực chất đếm số cặp (offset byte, giá trị) bị đột biến — là *độ rộng mutation*, không phải số branch nhị phân được kích hoạt. Tên trường dễ gây hiểu lầm. Hệ quả là việc so sánh A/B/C đến nay chỉ dựa trên proxy ở tầng giao thức (số transition trạng thái) và không thể trả lời "baseline nào chạm nhiều code path nhị phân hơn". Tích hợp ASAN/coverage reporting (qua shared filesystem giữa host và MicroVM) là điều kiện cần cho mọi kết luận định lượng về độ phủ trong tương lai.
+
+Thứ sáu, **không baseline nào vượt qua trạng thái FTP đầu tiên**. Trong mọi chiến dịch, chỉ status code `220` (banner chào) được quan sát; `unique_states` gần như luôn bằng 1. Nghĩa là fuzzer chưa bao giờ thiết lập phiên đã xác thực (USER → PASS → 230) trước khi gửi lệnh đột biến, nên các "state transition" được đếm thực ra là transition nội bộ trong trạng thái chưa xác thực, và các code path sâu (nơi crash thực sự tồn tại) hiếm khi được kích hoạt. Đây là nguyên nhân sâu của việc RQ3 không ổn định, và là động lực cho direction fuzzing theo trạng thái trong tương lai.
+
+Thứ bảy, báo cáo chưa thực hiện *ablation study* đầy đủ để bóc tách đóng góp riêng của từng thành phần kỹ thuật (EWMA controller, WeightedScheduler, one-at-a-time isolation). Phép so sánh A/B/C chỉ trả lời được câu hỏi tổng quát "toán học + LLM khác random ra sao", chứ chưa cô lập được đóng góp của từng cơ chế scheduling. Cơ chế scheduling trong báo cáo này được trình bày dưới góc *engineering design* (giải vấn đề thực tế) chứ không phải đóng góp thuật toán cần ablate bắt buộc; việc ablate từng thành phần là hướng đánh giá bổ sung nếu cần khẳng định giá trị độc lập của từng cơ chế.
 
 \newpage
 

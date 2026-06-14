@@ -1,187 +1,190 @@
-# LIFA-Fuzz — Adaptive Scheduling: Paper-Scope Design
+# LIFA-Fuzz — Hướng đánh giá sau thực nghiệm (v4.0)
 
-**Phiên bản:** v3.0 (tinh giản từ v2.0 — loại over-engineering cho paper)
-**Cơ sở:** EcoFuzz/VAMAB (USENIX Sec'20) · Woo et al. (CCS'13)
-**Nguyên tắc phiên bản này:** paper mạnh ở đóng góp rõ + ablation nghiêm ngặt, KHÔNG ở
-phức tạp thuật toán không bóc tách được. v2.0 port gần như nguyên vẹn EcoFuzz (SPEM +
-AAPS + 3-state machine) → over-engineering: cơ chế khó ablate, rủi ro bị review là
-"EcoFuzz-variant". v3.0 giữ **1 cơ chế mới** (ablate được thành Baseline D), phần phức
-tạp đẩy sang Future Work.
+**Phiên bản:** v4.0 (thay thế v3.0 — *Adversarial Bandit / VAMAB*)
+**Trạng thái:** định hướng đánh giá, rút từ dữ liệu thực nghiệm thật
+**Cơ sở:** kết quả A/B/C đo được trên LightFTP/Firecracker (`logs/state_coverage_stats_{A,B,C}.csv`)
 
-> **Quyết định biên giới:** đóng góp chính của paper là **LLM grammar inference +
-> math fusion** (RQ1/RQ2). Adaptive scheduling là đóng góp **phụ**, **không** làm
-> lu mờ luận điểm chính. v3.0 giữ scheduling ở mức tối thiểu đủ minh chứng.
-
----
-
-## 1. Vấn đề & vì sao v1.0 sai (giữ — giá trị Related Work)
-
-LIFA-Fuzz fire-and-forget (recv mỗi k-send) → không có reward mỗi execution.
-v1.0 (bản upgrade gốc) giải sai 2 chỗ:
-
-1. **Reward mỗi recv** (+5/−0.5) — fire-and-forget chỉ recv mỗi k-send (k biến thiên
-   theo EWMA, tới ~200) → đại đa số send không có reward.
-2. **Reward +5 cho crash** — Woo et al. (CCS'13) + EcoFuzz §7.1 cảnh báo thẳng:
-   *"focusing on crashes re-triggers the same crash"*. Crash là **anti-pattern**;
-   reward phải là **novelty**.
-
-→ Literature: scheduling black-box fuzzing nên mô hình là **bandit** (Woo), reward =
-**coverage novelty** (EcoFuzz), reward-probability **ước lượng từ tần suất quan sát**
-(không cần reward mỗi execution). Đây là cơ sở đúng — nhưng **không** bắt buộc port
-toàn bộ cơ chế EcoFuzz.
+> **Khác biệt so với v3.0.** v3.0 đề xuất bổ sung một cơ chế *adaptive scheduling* kiểu
+> bandit (novelty-weighted selection + plateau ε-decay, ablate thành Baseline D) dựa trên
+> literature Woo/EcoFuzz. Sau khi phân tích dữ liệu thực (xem §1), hướng đó bị **loại bỏ**
+> vì lý do thực dụng: không cần thiết cho paper, chi phí/nhiễu cao, và reward đề xuất trùng
+> vùng proxy mà baseline B đã dẫn đầu. v4.0 giữ nguyên đóng góp đã code xong, frame lại thành
+> *engineering design*, và dồn effort vào hai việc thật sự còn thiếu: đo code coverage nhị
+> phân và gọi LLM thật cho RQ1.
 
 ---
 
-## 2. Cơ sở lý thuyết (gọn — đủ cite, không exegesis)
+## 0. TL;DR
 
-- **Bandit framing** (Woo et al., CCS'13; EcoFuzz, USENIX'20): arm = mutation
-  strategy, reward = sự kiện novelty. Reward ước lượng từ **tần suất quan sát lấy mẫu**
-  — không cần reward mỗi execution → tương thích fire-and-forget.
-- **Reward = novelty, không crash** (EcoFuzz §7.1): crash-over-focus anti-pattern.
-- **Reward của LIFA-Fuzz = novelty rate trực tiếp** (KHÔNG phải proxy self-transition
-  của EcoFuzz SPEM). Ta định nghĩa:
-
-  $$\text{reward}(\text{strategy } s) = \text{novelty rate}(s) = \frac{\#\text{ new response-class do } s \text{ khám phá (gần đây)}}{\#\text{ trial của } s \text{ (gần đây)}}$$
-
-  (EWMA-smoothed trên một cửa sổ trial). Đây **sạch hơn** proxy `1−f_ii` của EcoFuzz
-  (vốn = P(path *khác*, gồm cả known-different)): novelty rate đo *chính xác* tỷ lệ
-  khám phá class mới. Cite EcoFuzz cho *ý* "ước lượng reward từ tần suất quan sát",
-  nhưng định nghĩa reward là của ta. EcoFuzz's `√i` (discovery-order index AFL) không
-  áp dụng — LIFA không có queue tăng trưởng kiểu AFL.
-
-**Tham chiếu paper (Related Work):** cite EcoFuzz (VAMAB/SPEM), Woo (black-box MAB),
-AFLFast (Markov-chain transition probability). Đây là đủ — **không** port AAPS hay
-3-state machine của EcoFuzz (xem §6 Future Work).
+- **Bỏ Baseline D (novelty-bandit).** Lý do thực dụng (xem §1.3): không cần thiết cho paper,
+  chi phí/nhiễu cao cho một đóng góp phụ, và reward đề xuất trùng vùng proxy mà B đã dẫn đầu
+  nên kỳ vọng cải thiện biên nhỏ. Dữ liệu C<B (C: 1,63 vs B: 3,91 edges/1000 exec) cho thấy
+  hướng cần làm là *hiểu* trade-off và *đo đúng*, không phải thêm cơ chế.
+- **Scheduling = engineering design, không phải contribution thuật toán.** WeightedScheduler,
+  EWMA sampling, two-mode crash isolation, State Transition Graph đã code xong và giải vấn đề
+  thực tế (xem §2). Trình bày dưới góc kỹ thuật có cite protocol-RE, không cần ablate, không
+  cần bandit.
+- **Crash confirmation (đã implement) = đóng góp về độ tin cậy thực nghiệm**, không phải
+  đóng góp thuật toán (xem §3).
+- **Hai ưu tiên nghiên cứu thật** còn lại (xem §4): (1) đo code coverage nhị phân, (2) gọi
+  LLM thật cho RQ1 trên protocol có ground-truth độc lập.
 
 ---
 
-## 3. Đóng góp paper-scope: novelty-weighted selection + plateau ε-decay
+## 1. Vì sao bỏ Baseline D (novelty-bandit) — lý do từ dữ liệu
 
-**ĐÚNG 1 cơ chế mới**, ablate được thành **Baseline D**.
+### 1.1 Kết quả thực nghiệm thật
 
-### 3.1 Novelty-weighted strategy selection
-- Arm = **MutationStrategy** (BOUNDARY_VALUES / DICTIONARY / RANDOM_BYTES / ...).
-  LIFA-Fuzz có **vài strategy** (≤ ~8), nên đây thực chất là **adaptive strategy
-  weighting** — trung thực gọi vậy, không "bandit" phóng đại.
-- Mỗi epoch (Slow Loop): cho mỗi strategy tính `novelty rate(s)` (xem §2). Strategy có
-  novelty rate cao được ưu tiên.
-- Selection = weighted by `novelty rate` (thay **static heuristic weights** của
-  `WeightedScheduler` hiện có — vốn gán BOUNDARY=4.0/DICTIONARY=3.0/RANDOM=1.0 cứng).
-- **Granularity limit (phải thừa nhận):** weight ở mức strategy-toàn-cục, không
-  phân biệt "BOUNDARY trên field A" vs "BOUNDARY trên field B". Future: per-(strategy,field).
+Từ `logs/state_coverage_stats_{A,B,C}.csv` (chiến dịch mở rộng trên LightFTP/Firecracker),
+metric đáng tin nhất hiện có là số transition trạng thái giao thức (STG edges = bộ ba
+`prev_code, command, new_code`):
 
-### 3.2 Plateau ε-decay (thay epsilon tĩnh + thay 3-state machine)
-- `ε` decay khi **không có novelty mới trong W epoch** (plateau). Reset về cao khi
-  **rule set đổi** (LLM/bootstrap đẩy rule mới → cần khám phá lại).
-- 1 scalar, cơ chế đơn giản, **ablate được** (so ε tĩnh).
+| Baseline | Executions | STG edges | **edges / 1000 exec** |
+|---|---|---|---|
+| A — Pure Random | 1.438.799 | 3.752 | 2,61 |
+| B — Math-Only | 1.422.891 | **5.563** | **3,91** |
+| C — Full Fusion | 1.356.229 | 2.217 | **1,63** |
 
-### 3.3 Novelty signal (2 tín hiệu, không 4)
-- **New response-class** (hash 8-byte đầu + length) — chưa từng thấy. (Mở rộng
-  `_record_response_sample` / `response_buffer` đã có.) Đây là reward **chính**.
-- **New crash-signature** (payload SHA256, đã có trong CrashManager) — đóng góp
-  novelty **CHỈ khi signature mới** (đã dedup). Lưu ý: đây KHÔNG mâu thuẫn với
-  anti-pattern "crash-as-reward" (§1) — anti-pattern là reward *mỗi* crash (trùng lặp
-  bị tính lại); đây đếm *signature mới* (dedup) như 1 loại response-class đặc biệt,
-  proportionate.
-- ~~State-edge (FTP-specific)~~ và ~~accepted-rate-delta (trùng EWMA proxy)~~ — bỏ,
-  tránh over-engineering.
+Chuẩn hóa theo số execution: **B (3,91) > A (2,61) > C (1,63)**. Baseline dùng LLM (C)
+khám phá state transition **kém nhất**, kém B khoảng 2,4 lần.
 
-### 3.4 Cadence (không phá EPS)
-- Novelty observer chỉ chạy trên **sampled recv** (mỗi k-send), piggyback
-  `response_buffer` đã có. **Không file I/O mỗi send.**
-- Bandit compute ở Slow Loop (per-epoch). Per-send cost ≈ 0.
+### 1.2 Cơ chế — vì sao C lại kém
+
+LLM gán `STATIC` cho magic/constant → fuzzer skip; các trường còn lại tập trung vào
+`BOUNDARY_VALUES` (length) và `DICTIONARY` (opcode). Hệ quả fuzzer sinh **ít loại command
+FTP khác nhau** → ít transition `(prev_code, cmd, new_code)`. B (math-only) ít thu hẹp
+command hơn → vô tình chạm nhiều transition hơn.
+
+> *Lưu ý: §1.1 là số đo trực tiếp từ CSV; §1.2 là **giả thuyết cơ chế** nhất quán với dữ liệu
+> nhưng chưa được kiểm chứng trực tiếp (chưa đếm command-diversity từng baseline). Việc xác
+> minh cơ chế — đếm số command FTP khác nhau mà mỗi baseline thực sự gửi — là một kiểm tra
+> nhỏ, đáng làm trước khi viết finding này vào paper.*
+
+### 1.3 Vì sao không làm bandit
+
+Lý do bỏ không phải "bandit sẽ bác bỏ đề tài" (đó là lập luận quá mạnh — bandit đo state
+coverage, đề tài RQ1 đo grammar inference, hai trục khác nhau). Lý do thật đơn giản hơn và
+thực dụng hơn:
+
+1. **Không cần thiết cho paper.** Câu chuyện scheduling của đề tài đứng vững ở mức
+   *engineering design* (§2) — giải vấn đề thực. Không có yêu cầu phải có thêm một thuật
+   toán scheduling để paper "đủ đóng góp".
+2. **Dữ liệu C<B chỉ ra hướng cần hiểu, không phải hướng cần thêm cơ chế.** LLM đang *đánh
+   đổi* state coverage lấy độ chính xác ngữ pháp. Việc đáng làm là hiểu trade-off này (đã
+   là finding §1.4) và đo đúng (§4.1), chứ không phải xếp thêm một tầng bandit lên trên.
+3. **Chi phí/nhiễu cao cho đóng góp phụ.** Novelty rate đòi hỏi gắn strategy vào từng
+   response (schema `response_buffer` phải thêm `rule_id` — hiện chưa có), chia sẻ
+   `response_buffer.jsonl` với EWMA controller vốn đọc-truncate, và định nghĩa lại vai trò
+   của ε. Toàn bộ chỉ để thử một đóng góp phụ, với xác suất thắng thấp (B đã dẫn đầu state
+   coverage → bandit ít khả năng vượt).
+4. **Tín hiệu reward trùng vùng với proxy đã đo.** Novelty rate ≈ "đã thấy response/state
+   mới", cùng họ với state coverage. Tối ưu cho nó gần như tối ưu cho thứ B đã giỏi — kỳ
+   vọng cải thiện biên nhỏ, không xứng công.
+
+### 1.4 Nhưng phát hiện C<B tự nó có giá trị
+
+Việc LLM "hiểu đúng giao thức nhưng thận trọng quá" — tăng độ chính xác ngữ pháp nhưng
+giảm độ phủ trạng thái — là một **trade-off chưa được báo cáo** trong LLM-for-fuzzing. Đây
+là *finding* có giá trị khi viết lên, không cần thêm cơ chế nào để khai thác. Lưu ý quan
+trọng để không diễn giải sai: Bảng 2b đo *state coverage*, **không** phải code coverage
+nhị phân (hệ thống chưa có — xem §4.1). C kém hơn B ở state coverage là đã xác nhận; C
+kém hơn B ở code path thật thì chưa đo được.
 
 ---
 
-## 4. Đánh giá (1 ablation sạch)
+## 2. Scheduling giữ nguyên — frame lại thành engineering design
 
-| Baseline | Scheduling | Ý nghĩa |
+Không đổi code. Chỉ đổi cách trình bày: từ "thuật toán" sang "giải pháp kỹ thuật có nền
+tảng".
+
+| Cơ chế (đã code) | Vấn đề thực tế giải | Nền tảng |
 |---|---|---|
-| **B** (Math-Only, có sẵn) | **static heuristic weights** (WeightedScheduler: BOUNDARY=4.0/DICTIONARY=3.0/RANDOM=1.0 cứng) | baseline scheduling hiện có |
-| **D** = B + novelty-weighted selection + plateau ε | **adaptive** (weights học từ novelty rate) | đóng góp §3 |
+| **WeightedScheduler** (`mutator.py:344-355`) — trọng số `BOUNDARY_VALUES=4.0`, `DICTIONARY=3.0`, `RANDOM_BYTES=1.0` | Trường length là nguồn buffer overflow phổ biến nhất → ưu tiên mutation vào đó | Protocol-RE: offset có tương quan tuyến tính với packet length thường là trường length (Duchêne et al. [1]) |
+| **EWMA adaptive sampling** (`ewma_controller.py`) — `k = ⌊K_max/(1+θ·λ_C)⌋` | Tension vật lý giữa throughput (fire-and-forget) và khả năng quan sát trạng thái (recv). Công thức liên tục tránh chattering của AIMD step | Điều khiển thích nghi chuẩn (EWMA smoothing) |
+| **Two-mode scheduling** (`mutator.py`) — RANDOM_SUBSET/WEIGHTED ↔ ONE_AT_A_TIME | Crash isolation: khi nhiều trường cùng đột biến, không biết trường nào gây crash | Engineering response cho triage, không phải thuật toán |
+| **State Transition Graph** (`state_transition_graph.py`) | Giao thức có trạng thái (FTP) cần đo độ phủ *transition*, không chỉ offset | Tương tự edge coverage của AFL nhưng ở tầng protocol |
 
-**So sánh D vs B = adaptive vs static-heuristic** (KHÔNG phải "vs random" — B đã
-weighted). **Metric chính:** novelty discovery rate (new response-class / epoch) +
-cumulative unique response-class. **Hypothesis:** D > B (adaptive weights khám phá
-đa dạng hơn heuristic cứng, với cùng số mutation). **Ablation** tách đóng góp scheduling
-khỏi đóng góp LLM (C). EPS của D phải ≈ B (per-epoch compute, kiểm chứng bất biến §3.4).
-
-> Nếu D không thắng B có ý nghĩa → đóng góp scheduling **không đứng vững**, bỏ ra
-> khỏi paper. Đây là điểm trung thực quan trọng — **chỉ giữ scheduling nếu ablation
-> thắng**.
+**Không ablate.** Đây là các quyết định kỹ thuật giải bài toán thực (length-field overflow,
+throughput-observability trade-off, crash triage). Chúng không cần "chứng minh đóng góp
+độc lập qua ablation" — giá trị nằm ở việc giải được vấn đề cụ thể. Trình bày thẳng như
+engineering, cite protocol-RE literature cho cơ sở, không dress-up thành bandit.
 
 ---
 
-## 5. Crash confirmation (Phase 1 — đã implement, giữ)
+## 3. Crash Confirmation — đã implement, là đóng góp về độ tin cậy
 
-Commit `c2f0691`: freeze attribution window + replay-confirm PoC trên snapshot sạch.
-Giải crash attribution limitation (empty PoC) → unique-crash count **tin cậy hơn**
-(nhưng không loại bỏ hoàn toàn nhiễu — xem Limitations). Đây là phần **đã xong**,
-không phải over-engineering — trực tiếp sửa bug đo lường.
+Commit `c2f0691`: pha post-crash confirmation (freeze attribution window → reset snapshot
+sạch → replay-confirm → ghi PoC với cờ `reproduced`). Schema đã có `reproduced: bool` +
+`confirmation_method` (`schemas.py:238-241`, `crash_manager.py:94-100`).
 
----
+**Frame:** đây là đóng góp về **độ tin cậy của kết quả thực nghiệm**, không phải đóng góp
+thuật toán. Nó giải một vấn đề đo lường thật (PoC ghi từ `window[-1]` thường không
+reproduce ở 400 EPS vì detection lag > window depth — xem `crash_attribution_plan.md §2`)
+bằng cách trả chi phí replay *chỉ khi có crash* (sự kiện hiếm), giữ nguyên EPS đường nóng.
 
-## 6. Future Work (đẩy phần phức tạp ra khỏi paper)
-
-Những thứ v2.0 từng đưa vào paper-scope nhưng **over-engineering** (cơ chế khó
-ablate / port EcoFuzz / rủi ro "EcoFuzz-variant") → **defer**:
-
-- **AAPS** (energy scheduling theo average-cost + regret, EcoFuzz §4.3) — port đầy
-  đủ; protocol fuzzing seed không grow kiểu AFL → cần justification riêng + ablation
-  riêng. Future.
-- **3-state machine** (initial/exploration/exploitation, EcoFuzz §3.2) — thay bằng
-  plateau ε-decay đơn giản (§3.2). Future: nếu cần scheduling tinh tế hơn.
-- **ASAN-stack dedup pipeline** đầy đủ (hash 3 dòng stack ASAN) — giữ payload SHA256
-  (đã có); ASAN-augment chỉ khi serial capture tin cậy. Future.
-- **Field isolation** (one-at-a-time trên crashing seed để cô lập field gây crash) —
-  experiment riêng; Phase 1 confirmation đã đủ cho PoC sound. Future.
-- **LLM self-correction** (inject strategy có `P_R` thấp vào prompt) — phụ thuộc §3
-  chạy được; nếu scheduling không vào paper thì cái này cũng defer.
-- **Self-consistency / prompt caching** (từ plan prompt-optimization) — chưa wire
-  vào eval; chỉ nếu RQ1 accuracy là headline.
-
-→ v3.0 **không implement** những thứ này trước paper. Cite literature + ghi future work.
+Khi viết báo cáo: mô tả cơ chế + metric `reproduced_crashes / unique_crashes`, nêu rõ nó
+làm RQ3 *tin cậy hơn* (không phải hoàn toàn sạch — vẫn phụ thuộc điều kiện phiên). Không
+coi đây là "thuật toán mới".
 
 ---
 
-## 6b. Limitations (paper phải thừa nhận)
+## 4. Hai ưu tiên nghiên cứu thật (đây là việc đáng làm)
 
-- **Sampling bias:** novelty rate ước lượng trên recv lấy mẫu (mỗi k-send, k biến
-  thiên tới ~200) → variance cao, có thể sai lệch (bias) nếu k lớn. Mitigate: EWMA
-  smoothing + đủ trial/arm.
-- **Coarse granularity:** weight ở mức strategy-toàn-cục, không phân biệt strategy
-  trên field nào (xem §3.1). Mắt reviewer: đây là giới hạn rõ, không che giấu.
-- **Per-epoch latency:** rule/weight update chậm (Slow Loop cadence ~1/min). Thay đổi
-  scheduling phản ứng chậm với chuyển dịch dynamic.
-- **Novelty proxy ≠ code coverage:** response-class mới không đồng nghĩa path mới
-  (mutation đổi state nội bộ nhưng response giống → miss). Proxy noisier grey-box.
-- **Single-target eval:** D vs B chứng minh trên LightFTP/LIFA; generalization sang
-  protocol khác cần thêm ( reviewer sẽ hỏi).
+### 4.1 Đo code coverage nhị phân thật
+
+**Vấn đề.** Hệ thống hiện *không có* feedback coverage nhị phân. Chỉ số
+`unique_code_branches` thực ra đếm cặp (offset, giá trị) bị đột biến — là độ rộng mutation,
+không phải branch nhị phân. Vì vậy mọi kết luận A/B/C đến nay chỉ dựa trên proxy ở tầng
+giao thức (STG edges). Không thể trả lời "C chạm ít code path hơn B thật không, hay chỉ ít
+state transition hơn".
+
+**Việc.** Hiện LightFTP chỉ biên dịch với `-fsanitize=address` (phát hiện memory error,
+**không** sinh code coverage). Để có coverage nhị phân, cần build lại LightFTP với
+`-fprofile-arcs -ftest-coverage` (gcc → `.gcov`/lcov) — đây là một cờ *khác* ASAN, không
+dùng chung. Telemetry đã có hàm parse lcov (`telemetry_collector.py:137-209`, chưa wire) và
+đọc kết quả qua shared filesystem giữa host và MicroVM. Khi có code coverage thật, Bảng 2b
+bổ sung được cột "code branches" và C<B được kiểm tra lại đúng nghĩa.
+
+**Tầm quan trọng.** Đây là điều kiện cần cho *mọi* kết luận định lượng về độ phủ. Không có
+nó, C<B chỉ là khẳng định về state coverage, không phải code coverage.
+
+### 4.2 Gọi LLM thật cho RQ1 trên protocol có ground-truth độc lập
+
+**Vấn đề.** RQ1 hiện chỉ đo ở chế độ MOCK (F1 = 0,857) trên giao thức LIFA do chính tác giả
+thiết kế → *evaluation leak*. Chưa bao giờ gọi LLM thật để đo khả năng suy diễn ngữ pháp —
+đây chính là claim headline của đề tài mà chưa verify.
+
+**Việc.** Chạy RQ1 ở REAL mode (GLM-5-Turbo) trên một protocol chuẩn với ground truth độc
+lập: parser lệnh FTP `USER`/`PASS`/`LIST` theo RFC 959, target LightFTP đã có. Dùng
+self-consistency (đã code, commit `aa65ed1`) để giảm variance LLM. Báo cáo F1 thật — kể cả
+nếu thấp.
+
+**Tầm quan trọng + rủi ro.** Nếu F1 thật thấp, phải báo cáo thấp — nhưng đó là việc phải
+làm, vì claim "LLM suy diễn grammar" chưa được kiểm tra thì đề tài chưa khép kín. Scope
+hẹp (một vài command FTP) để chi phí/token kiểm soát được.
 
 ---
 
-## 7. Non-goals
+## 5. Non-goals (KHÔNG làm — tránh scope creep)
 
-## 7. Non-goals
-
-- ❌ Không port AAPS / 3-state machine EcoFuzz (over-engineering, khó ablate).
-- ❌ Không đổi fire-and-forget → sync recv (giết RQ2).
-- ❌ Không dùng crash làm reward trực tiếp (anti-pattern Woo/EcoFuzz).
-- ❌ Không thêm per-send bookkeeping (per-epoch).
-- ❌ Không để scheduling lu mờ đóng góp chính (LLM grammar inference).
-
----
-
-## 8. Nguồn
-
-- EcoFuzz / VAMAB — Yue et al., USENIX Security 2020.
-  <https://www.usenix.org/system/files/sec20fall_yue_prepub_0.pdf>
-- Woo et al. — Scheduling Black-box Mutational Fuzzing, CCS 2013.
-  <https://users.ece.cmu.edu/~dbrumley/pdf/Woo%2520et%2520al._2013_Scheduling%2520Black-box%2520Mutational%2520Fuzzing(2).pdf>
-- AFLFast — Böhme et al., CGF as Markov Chain, IEEE TSE 2017.
+- ❌ **Không implement Baseline D (novelty-bandit).** Đã bác bỏ bằng dữ liệu (§1.3).
+- ❌ **Không port cơ chế EcoFuzz** (AAPS energy scheduling, 3-state machine). Over-engineering,
+  khó ablate, không khớp bài toán (protocol fuzzing không có seed queue kiểu AFL).
+- ❌ **Không dress-up scheduling thành đóng góp thuật toán.** Giữ ở engineering (§2).
+- ❌ **Không đổi fire-and-forget → sync recv.** Giết RQ2 (throughput).
+- ❌ **Không coi crash confirmation là thuật toán mới.** Nó là cải thiện độ tin cậy (§3).
 
 ---
 
-*v3.0: lõi = 1 cơ chế (novelty-weighted selection + plateau ε), 1 ablation (D vs B),
-trung thực (chỉ giữ nếu D thắng). Phần phức tạp → Future Work, cite literature. Không
-over-engineering, không lu moh đóng góp chính.*
+## 6. Nguồn
+
+- [1] Duchêne, F., et al. "Protocol Reverse Engineering Using Shannon Entropy." IEEE TIFS, 2018.
+      — cơ sở cho DifferentialAnalyzer (entropy per offset → phân loại field).
+- [2] Firecracker MicroVM — AWS. https://firecracker-microvm.github.io/
+      — sandbox isolation + snapshot/restore.
+
+---
+
+*v4.0: bỏ cơ chế không đứng vững trên dữ liệu thật, giữ engineering design đã code, dồn
+effort vào code coverage thật và RQ1 LLM thật. Khoa học hơn vì trung thực với dữ liệu, gọn
+hơn vì không nhồi lý thuyết.*
