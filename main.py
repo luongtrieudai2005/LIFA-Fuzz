@@ -556,16 +556,32 @@ async def run_pipeline(
         # ── 3. Client Subprocess ──────────────────────────────────
         from fast_loop.client_process import ClientSubprocess
 
-        # Select client script based on target protocol
-        # "lightftp" → FTP client, everything else → default LIFA binary client
+        # Target → (client script, protocol module) registry. The module is
+        # DISCLOSED case-study knowledge (e.g. "ftp" → FTPModule adds FTP
+        # operators/state/framing). Default "null" = pure black-box core
+        # (no protocol knowledge) — the thesis. Module names resolve via the
+        # shared registry (fast_loop.ftp_module registers "ftp" on import).
         fc_cfg = _cfg.get("sandbox", {}).get("firecracker", {})
         target_name = fc_cfg.get("target_name", "vulnerable_server")
-        if target_name == "lightftp":
-            client_script = "sandbox/client/ftp_client.py"
-            logger.info("Using FTP client for LightFTP target")
-        else:
-            client_script = "sandbox/client/client.py"
-            logger.info("Using default LIFA binary protocol client")
+        protocol_module = _cfg.get("fast_loop", {}).get(
+            "protocol_module", None
+        ) or _cfg.get("sandbox", {}).get("protocol_module", None)
+        # Auto-resolve module from target if not explicit (ftp target → ftp
+        # module); anything unknown → null (black-box).
+        if protocol_module is None:
+            protocol_module = "ftp" if target_name == "lightftp" else "null"
+        # Ensure the ftp module is importable/registered when selected.
+        if protocol_module == "ftp":
+            import fast_loop.ftp_module  # noqa: F401 (registers "ftp")
+        _TARGET_REGISTRY = {
+            "lightftp": "sandbox/client/ftp_client.py",
+            "lighttpd": "sandbox/client/http_client.py",
+        }
+        client_script = _TARGET_REGISTRY.get(target_name, "sandbox/client/client.py")
+        logger.info(
+            f"Target={target_name} client={client_script} module={protocol_module}"
+            f"{' (black-box core)' if protocol_module == 'null' else ' (case-study)'}"
+        )
 
         client_proc = ClientSubprocess(
             script_path=client_script,
@@ -590,6 +606,7 @@ async def run_pipeline(
             seed_queue=seed_queue,
             k=2,
             max_eps=1000,
+            protocol_module=protocol_module,
         )
 
         # ── 5. Crash Monitor ──────────────────────────────────────
