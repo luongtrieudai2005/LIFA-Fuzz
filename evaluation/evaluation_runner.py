@@ -450,6 +450,9 @@ async def run_single_baseline(
             auto_reset=True,
             restart_delay_s=2.0,
             crash_manager=crash_manager,  # FIX: wire crash_manager so telemetry reports crashes
+            # Phase 1: confirm each crash by replaying the frozen attribution
+            # window on a clean target, so PoC artifacts actually reproduce.
+            confirm_crashes=True,
         )
 
         watch_task = asyncio.create_task(

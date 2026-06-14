@@ -593,6 +593,14 @@ class MutationEngine:
         # crash monitor can see recent history, not just the last packet.
         self._crash_window: deque = deque(maxlen=100)
 
+        # Post-crash confirmation (Phase 1): when frozen, _send() stops
+        # appending to the crash_window. crash_monitor freezes it on crash
+        # detection so the candidate set isn't polluted by post-crash
+        # connection-refused sends, then replays the frozen set to find the
+        # packet that actually reproduces the crash. See
+        # docs/crash_attribution_plan.md. Hot-loop cost: one bool branch.
+        self._window_frozen: bool = False
+
         # Stats (initialized above with correct mode)
         self._mutation_signatures: set[str] = set()
         self._current_rule_type: Optional[str] = None  # for _track_rule_response
@@ -984,6 +992,29 @@ class MutationEngine:
         attribute crashes to the correct packet, not just the most recent.
         """
         return list(self._crash_window)
+
+    def freeze_crash_window(self) -> list[tuple]:
+        """Freeze the crash attribution window and snapshot its contents.
+
+        Post-crash confirmation (Phase 1): when the crash monitor detects a
+        down target, it freezes the window so subsequent connection-refused
+        sends don't pollute the candidate set, then replays the snapshot to
+        find the packet that actually reproduces the crash. Returns the
+        frozen candidate set (oldest → newest) as a list of
+        ``(timestamp, payload_bytes, rule_id)`` tuples. Idempotent: a second
+        freeze returns the same (already frozen) window.
+        """
+        self._window_frozen = True
+        return list(self._crash_window)
+
+    def unfreeze_crash_window(self) -> None:
+        """Resume appending to the crash attribution window after confirmation."""
+        self._window_frozen = False
+
+    @property
+    def window_frozen(self) -> bool:
+        """Whether the crash window is currently frozen (post-crash confirmation)."""
+        return self._window_frozen
 
     # -------------------------------------------------------------------
     # P2-C: Investigation Summary
@@ -1639,7 +1670,8 @@ class MutationEngine:
         # Backward compat — crash_monitor reads these
         self._last_injected_packet = payload
         # H3 fix: append to crash attribution window
-        self._crash_window.append((time.monotonic(), payload, self._last_injected_rule_id))
+        if not self._window_frozen:
+            self._crash_window.append((time.monotonic(), payload, self._last_injected_rule_id))
 
         # Feed result back to Interceptor for stuck detection
         if self.status_callback:
@@ -1726,7 +1758,8 @@ class MutationEngine:
         # Backward compat — crash_monitor reads these
         self._last_injected_packet = payload
         # H3 fix: append to crash attribution window
-        self._crash_window.append((time.monotonic(), payload, self._last_injected_rule_id))
+        if not self._window_frozen:
+            self._crash_window.append((time.monotonic(), payload, self._last_injected_rule_id))
 
         # Feed result back to Interceptor for stuck detection
         if self.status_callback:
@@ -1882,7 +1915,8 @@ class MutationEngine:
         # Backward compat — crash_monitor reads this (only mutated target)
         self._last_injected_packet = mutated_payload
         # H3 fix: append to crash attribution window
-        self._crash_window.append((time.monotonic(), mutated_payload, self._last_injected_rule_id))
+        if not self._window_frozen:
+            self._crash_window.append((time.monotonic(), mutated_payload, self._last_injected_rule_id))
 
         if self.status_callback:
             self.status_callback(target.sequence_id, status)

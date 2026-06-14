@@ -235,6 +235,10 @@ class CrashReport(BaseModel):
     crash_type: str = "unknown"
     poc_file_path: str = ""
     notes: str = ""
+    # Post-crash confirmation (Phase 1): whether this PoC was verified by
+    # replay on a clean target (deterministic) or only attributed.
+    reproduced: bool = False
+    confirmation_method: str = "window_last"
 
     model_config = {
         "json_schema_extra": {
@@ -779,6 +783,13 @@ class CrashRecord(BaseModel):
     stack_trace: Optional[str] = None
     poc_file_path: Optional[str] = None
     reproduction_command: Optional[str] = None
+    # Post-crash confirmation (Phase 1): whether the offending_packet was
+    # verified by replay on a clean target (reproduced=True) or only
+    # attributed from the window (reproduced=False). Mirrors CrashReport so
+    # the crash_monitor's own artifact (crashes/*.json) reflects the same
+    # confirmation status the CrashManager records.
+    reproduced: bool = False
+    confirmation_method: str = "window_last"
 
     model_config = {
         "json_schema_extra": {

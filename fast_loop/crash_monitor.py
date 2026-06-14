@@ -98,6 +98,7 @@ class CrashMonitor:
         crash_corpus_dir: str = "./crashes",
         auto_reset: bool = True,
         restart_delay_s: float = 2.0,
+        confirm_crashes: bool = False,
     ) -> None:
         self.sandbox = sandbox
         self.interceptor = interceptor
@@ -107,6 +108,18 @@ class CrashMonitor:
         self.crash_corpus_dir = Path(crash_corpus_dir)
         self.auto_reset = auto_reset
         self.restart_delay_s = restart_delay_s
+        # Post-crash confirmation (Phase 1): when True, on_crash freezes the
+        # mutator's attribution window and replays the candidate set on a
+        # clean target to find the packet that actually reproduces the crash.
+        # Opt-in (default False) so legacy tests/behaviour are unchanged.
+        # See docs/crash_attribution_plan.md.
+        self.confirm_crashes: bool = confirm_crashes
+        # Drain pause after pause_interceptor(): the mutator's run loop is
+        # sequential, so at most ONE _send is in-flight when we pause. It
+        # finishes within recv_timeout (≤0.5s). Sleeping this long before
+        # confirmation ensures that in-flight send can't land on the target
+        # during a candidate's liveness check and cause a false "reproduced".
+        self.confirm_drain_s: float = 0.5
 
         # Internal state
         self._running: bool = False
@@ -287,10 +300,11 @@ class CrashMonitor:
                 if crash_window:
                     _, offending_packet, rule_id = crash_window[-1]
 
-        # Tertiary: backward-compat private field access
+        # Tertiary: backward-compat private field access (defensive — a
+        # mutator stand-in or future implementation may not expose these).
         if not offending_packet and self.mutator is not None:
-            offending_packet = self.mutator._last_injected_packet
-            rule_id = self.mutator._last_injected_rule_id
+            offending_packet = getattr(self.mutator, "_last_injected_packet", b"") or b""
+            rule_id = getattr(self.mutator, "_last_injected_rule_id", None)
 
         # 3. Create CrashRecord (returned to caller in every branch)
         record = CrashRecord(
@@ -337,9 +351,87 @@ class CrashMonitor:
         # 5. Pause traffic IMMEDIATELY
         await self.pause_interceptor()
 
+        # 5b. Post-crash confirmation (Phase 1, opt-in). The legacy
+        #     attribution assumed crash_window[-1] was the culprit, but at
+        #     ~400 EPS the real culprit (up to ~200 sends before detection)
+        #     is usually evicted from the window and post-crash refused
+        #     sends pollute it. Confirmation freezes the window and replays
+        #     the candidate set on a clean target to find the packet that
+        #     actually reproduces the crash. Runs while the mutator is
+        #     paused, so the hot loop is unaffected; cost is paid only per
+        #     crash. See docs/crash_attribution_plan.md.
+        reproduced = False
+        confirmation_method = "window_last"
+        # Confirmation runs whenever enabled + a mutator is present. It must
+        # NOT be gated on `offending_packet`: that variable is exactly what
+        # attribution produces, and when attribution already failed (empty
+        # packet — the common real-world case for early/rapid crashes) is
+        # precisely when confirmation is most needed. freeze() returns the
+        # actual candidates; if the window is genuinely empty, _confirm_crash
+        # returns (b"", None, False) and we fall through to the legacy record.
+        if self.confirm_crashes and self.mutator is not None:
+            # Drain the (at most one) in-flight send so it cannot land on the
+            # target during a candidate's liveness check and cause a false
+            # "reproduced". recv_timeout is ≤0.5s in all configs.
+            await asyncio.sleep(self.confirm_drain_s)
+            freeze = getattr(self.mutator, "freeze_crash_window", None)
+            if freeze is not None:
+                try:
+                    candidates = freeze()
+                    if candidates:
+                        conf_payload, conf_rule, reproduced = (
+                            await self._confirm_crash(candidates)
+                        )
+                        if reproduced and conf_payload:
+                            offending_packet = conf_payload
+                            rule_id = conf_rule
+                            confirmation_method = "replay_confirmed"
+                            # Rebuild the record with the confirmed culprit.
+                            record = CrashRecord(
+                                exit_code=exit_code,
+                                signal=signal,
+                                offending_packet=offending_packet,
+                                mutation_rule_id=rule_id,
+                                stack_trace=(
+                                    serial_output[-2000:]
+                                    if serial_output else None
+                                ),
+                            )
+                        else:
+                            confirmation_method = "replay_unconfirmed"
+                except Exception as exc:
+                    # Failure isolation: confirmation must never break the
+                    # crash pipeline. Fall back to window[-1], flagged.
+                    logger.warning(
+                        f"confirm: confirmation phase errored ({exc}); "
+                        f"falling back to window[-1] attribution"
+                    )
+                    confirmation_method = "replay_error"
+                finally:
+                    unfreeze = getattr(self.mutator, "unfreeze_crash_window", None)
+                    if unfreeze is not None:
+                        try:
+                            unfreeze()
+                        except Exception:
+                            pass
+
+        # 5c. Stamp the confirmation outcome onto the record so the
+        # crash_monitor's own artifact (crashes/*.json via save_crash_record)
+        # carries the same reproduced/confirmation_method as CrashManager.
+        record.reproduced = reproduced
+        record.confirmation_method = confirmation_method
+
         # 6. Save crash artifact to disk
         crash_path = self.save_crash_record(record)
-        logger.error(f"Crash PoC saved to: {crash_path}")
+        if reproduced:
+            logger.error(f"Crash PoC saved (REPRODUCED) to: {crash_path}")
+        elif self.confirm_crashes:
+            logger.warning(
+                f"Crash PoC saved (UNCONFIRMED — replay did not reproduce) "
+                f"to: {crash_path}"
+            )
+        else:
+            logger.error(f"Crash PoC saved to: {crash_path}")
 
         # 7. Record through CrashManager for deduplication
         # Use classification type as crash_type for richer reporting
@@ -353,6 +445,8 @@ class CrashMonitor:
                     crash_type=crash_type_str,
                     rule_set_id=record.mutation_rule_id,
                     notes=classification.get("detail", "") if classification else "",
+                    reproduced=reproduced,
+                    confirmation_method=confirmation_method,
                 )
                 if result.is_new:
                     logger.info(
@@ -732,6 +826,121 @@ class CrashMonitor:
         # loop will re-detect if the target is still dead and trigger a
         # fresh on_crash() cycle.
         await self.resume_interceptor()
+
+    # -------------------------------------------------------------------
+    # Post-Crash Confirmation (Phase 1)
+    # -------------------------------------------------------------------
+
+    async def _confirm_crash(
+        self,
+        candidates: list[tuple],
+    ) -> tuple[bytes, Optional[str], bool]:
+        """Replay candidate packets on a clean target to find the real culprit.
+
+        Iterates the candidates most-recent-first (crashes usually come from
+        a packet close to the moment of death), resetting the target before
+        each replay so each attempt starts from a known-good state. Returns
+        the first packet that reproduces the crash (``reproduced=True``).
+
+        If no candidate reproduces (e.g. the crash needs a multi-packet
+        prefix — Phase 2), falls back to the most-recent candidate flagged
+        ``reproduced=False`` so the PoC is still recorded but clearly marked
+        as unconfirmed.
+
+        Failure isolation: any reset/replay error is logged and skipped —
+        this never raises. A confirmation that can't run degrades to the
+        legacy ``window[-1]`` attribution (``reproduced=False``).
+
+        Args:
+            candidates: ``[(ts, payload, rule_id), ...]`` oldest → newest,
+                        from the frozen crash window.
+
+        Returns:
+            ``(payload, rule_id, reproduced)``.
+        """
+        if not candidates:
+            return b"", None, False
+
+        host = getattr(self.mutator, "target_host", None) if self.mutator else None
+        port = getattr(self.mutator, "target_port", None) if self.mutator else None
+        if not host or not port:
+            ts, payload, rule_id = candidates[-1]
+            return payload, rule_id, False
+
+        # Cap the confirmation cost: at most this many resets/replays per
+        # crash. Most-recent candidates are most likely, so we slice the tail.
+        max_attempts = min(len(candidates), 50)
+        tried = 0
+        for ts, payload, rule_id in reversed(candidates[-max_attempts:]):
+            if not payload:
+                continue
+            tried += 1
+            try:
+                await self.sandbox.reset_state()
+            except Exception as exc:
+                logger.debug(f"confirm: reset failed before replay: {exc}")
+                continue
+            try:
+                if not await self.sandbox.is_target_alive():
+                    continue  # target didn't come back — can't test this one
+            except Exception:
+                continue
+            reproduced = await self._replay_and_check(payload, host, port)
+            if reproduced:
+                logger.info(
+                    f"confirm: REPRODUCED crash with replayed packet "
+                    f"(len={len(payload)}, rule={rule_id}, tried={tried})"
+                )
+                return payload, rule_id, True
+
+        # No single packet reproduced — likely needs a prefix (stateful).
+        ts, payload, rule_id = candidates[-1]
+        logger.warning(
+            f"confirm: no candidate reproduced the crash "
+            f"(tried {tried}/{len(candidates)}); flagging PoC as unconfirmed "
+            f"(likely needs a sequence prefix — Phase 2)"
+        )
+        return payload, rule_id, False
+
+    async def _replay_and_check(
+        self, payload: bytes, host: str, port: int
+    ) -> bool:
+        """Send one payload on a fresh connection; return True if the target
+        crashed (``is_target_alive`` False) afterward.
+
+        Single-threaded targets (LIFA server) die on a crashing packet, so a
+        dead target after the send is the deterministic reproduction oracle.
+        """
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=2.0
+            )
+        except Exception:
+            return False  # can't connect → no reproduction signal
+        try:
+            writer.write(payload)
+            await writer.drain()
+            # Drain any response to drive the server to actually process the
+            # payload (ASAN crashes often fire during processing, not recv).
+            try:
+                await asyncio.wait_for(reader.read(4096), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+            except Exception:
+                pass
+        # Grace period for the crash to manifest, then check liveness.
+        await asyncio.sleep(0.2)
+        try:
+            alive = await self.sandbox.is_target_alive()
+        except Exception:
+            alive = True
+        return not alive
 
     async def pause_interceptor(self) -> None:
         """Signal the Interceptor and MutationEngine to pause.

@@ -91,6 +91,13 @@ class CrashEntry:
     report_path:     str            # Relative path to .report.json file
     rule_set_id:     Optional[str]  # Active rule set at time of crash
     notes:           str = ""
+    # Post-crash confirmation (Phase 1):
+    #   reproduced=True  → the PoC was replayed on a clean target and
+    #                      re-triggered the crash (deterministic PoC).
+    #   reproduced=False → PoC came from window[-1] attribution OR replay
+    #                      did not reproduce (needs a sequence prefix).
+    reproduced:           bool = False
+    confirmation_method:  str  = "window_last"   # window_last | replay_confirmed | replay_unconfirmed | replay_error
 
 
 @dataclass
@@ -120,6 +127,11 @@ class CrashStatistics:
     crash_types:         dict[str, int]  # crash_type → total hits per type
     poc_directory:       str
     index_file:          str
+    # Post-crash confirmation (Phase 1): how many unique PoCs were confirmed
+    # by replay vs. attributed-but-unconfirmed. confirmation_ratio is the
+    # key RQ3 reliability metric.
+    reproduced_crashes:  int = 0
+    unconfirmed_crashes: int = 0
     first_crash_time:    Optional[str]   = None  # ISO-8601 of first unique crash
 
 
@@ -414,6 +426,8 @@ class CrashManager:
         crash_type:   str   = "unknown",
         rule_set_id:  Optional[str] = None,
         notes:        str   = "",
+        reproduced:   bool  = False,
+        confirmation_method: str = "window_last",
     ) -> RecordResult:
         """
         Record a crash event and apply deduplication.
@@ -491,6 +505,8 @@ class CrashManager:
                 crash_type         = crash_type,
                 poc_file_path      = str(poc_path),
                 notes              = notes,
+                reproduced         = reproduced,
+                confirmation_method = confirmation_method,
             )
             self._write_report(report_path, crash_report)
 
@@ -508,6 +524,8 @@ class CrashManager:
                 report_path     = str(report_path.relative_to(self.crash_dir)),
                 rule_set_id     = rule_set_id,
                 notes           = notes,
+                reproduced      = reproduced,
+                confirmation_method = confirmation_method,
             )
             self._index[primary_sig] = entry
             self._struct_map.setdefault(struct_sig, set()).add(primary_sig)
@@ -591,6 +609,12 @@ class CrashManager:
                 crash_types     = types,
                 poc_directory   = str(self.crash_dir),
                 index_file      = str(self.crash_dir / self.INDEX_FILENAME),
+                reproduced_crashes = sum(
+                    1 for e in self._index.values() if e.reproduced
+                ),
+                unconfirmed_crashes = sum(
+                    1 for e in self._index.values() if not e.reproduced
+                ),
                 # FIX: precise first crash time from earliest CrashEntry,
                 # not from coarse telemetry snapshot granularity.
                 first_crash_time = (
