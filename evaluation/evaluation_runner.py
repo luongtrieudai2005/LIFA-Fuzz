@@ -812,9 +812,12 @@ async def run_single_baseline(
         except (Exception, asyncio.TimeoutError):
             pass
 
-        # Collect gcov coverage BEFORE sandbox.stop() removes the container
+        # Collect gcov coverage ONLY in --coverage mode. In crash-finding mode
+        # (auto_reset/snapshot) gcov counters are discarded on every snapshot
+        # restore, so coverage is unmeasurable — and reading the coverage rootfs
+        # here would report STALE .gcda from a previous run (a fake number).
         try:
-            if sandbox is not None:
+            if sandbox is not None and coverage:
                 coverage_data = await _collect_gcov_coverage(
                     baseline_dir, sandbox, target=target,
                     sandbox_driver=sandbox_driver,
