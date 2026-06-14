@@ -311,7 +311,7 @@ def clear_archive(*, force: bool = False) -> int:
 # =============================================================================
 
 
-def cleanup_orphaned_resources() -> None:
+def cleanup_orphaned_resources(free_port_8001: bool = True) -> None:
     """Kill orphaned processes, containers, and network devices.
 
     Handles:
@@ -320,6 +320,13 @@ def cleanup_orphaned_resources() -> None:
         - TAP network devices (tap-lifa0)
         - Unix socket files (/tmp/firecracker-lifa.sock)
         - Port 8001 bindings
+
+    Args:
+        free_port_8001: When True, run ``fuser -k 8001/tcp`` to free the
+            port. **Set False when the caller is the process that owns
+            port 8001** (e.g. the evaluation runner, whose interceptor
+            binds 8001 in-process) — otherwise fuser SIGKILLs the runner
+            itself. At campaign start (no in-process owner yet) keep True.
     """
     print("  🧹 Cleaning orphaned resources...")
 
@@ -364,15 +371,20 @@ def cleanup_orphaned_resources() -> None:
         print("     ✓ Removed socket: /tmp/firecracker-lifa.sock")
 
     # 2e. Free port 8001
-    try:
-        result = subprocess.run(
-            ["fuser", "-k", "8001/tcp"],
-            capture_output=True, timeout=5,
-        )
-        if result.returncode == 0:
-            print("     ✓ Freed port 8001")
-    except Exception:
-        pass
+    # SKIPPED when the caller owns port 8001 (in-process interceptor) —
+    # fuser -k would SIGKILL the caller itself.
+    if not free_port_8001:
+        print("     ⊘ Skip fuser -k 8001/tcp (caller owns the port)")
+    else:
+        try:
+            result = subprocess.run(
+                ["fuser", "-k", "8001/tcp"],
+                capture_output=True, timeout=5,
+            )
+            if result.returncode == 0:
+                print("     ✓ Freed port 8001")
+        except Exception:
+            pass
 
     print("  🧹 Orphan cleanup complete.")
 

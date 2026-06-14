@@ -1463,28 +1463,52 @@ Examples:
     print("╚══════════════════════════════════════════════════════════╝")
 
     results = {}
+    # Hard cap per baseline: run duration + generous grace for teardown. This
+    # GUARANTEES the campaign advances to the next baseline even if a baseline's
+    # finally cleanup or the next baseline's sandbox boot hangs — otherwise the
+    # whole B,C run can freeze after B finishes and never reach C. The grace is
+    # well beyond normal teardown (sandbox.stop 15s + sleep 10s + boot 15s),
+    # so it only trips on a genuine hang, and the baseline's summary is already
+    # written before its finally runs, so no data is lost.
+    _GRACE_S = 300
+    _baseline_hard_timeout = args.duration + _GRACE_S
     for i, bid in enumerate(baselines):
-        summary = await run_single_baseline(
-            baseline_id=bid,
-            duration_s=args.duration,
-            sandbox_driver=args.driver,
-            target=args.target,
-            total_baselines=len(baselines),
-            baseline_index=i,
-        )
+        print(f"\n  ▶ Starting baseline {bid} "
+              f"(hard cap {_baseline_hard_timeout}s = {args.duration}s run + {_GRACE_S}s grace)")
+        try:
+            summary = await asyncio.wait_for(
+                run_single_baseline(
+                    baseline_id=bid,
+                    duration_s=args.duration,
+                    sandbox_driver=args.driver,
+                    target=args.target,
+                    total_baselines=len(baselines),
+                    baseline_index=i,
+                ),
+                timeout=_baseline_hard_timeout,
+            )
+        except asyncio.TimeoutError:
+            print(
+                f"\n  ⚠ Baseline {bid} exceeded hard timeout "
+                f"({_baseline_hard_timeout}s) — forcing advance to next baseline. "
+                f"Summary (if written before hang) is preserved on disk."
+            )
+            summary = {"baseline": bid, "error": "baseline_hard_timeout"}
         results[bid] = summary
 
         # Wait between baselines for cleanup
         if bid != baselines[-1]:
-            print("\n  Waiting 10s for cleanup...")
-            # Kill any orphaned VMs / containers / TAP devices / sockets /
-            # port-8001 bindings left behind by this baseline. Without this,
-            # baseline B's sandbox.start() or interceptor can conflict on the
-            # TAP device (tap-lifa0), the Firecracker socket, or port 8001 —
-            # which manifests as the run hanging after A finishes instead of
-            # advancing to B. cleanup_orphaned_resources() is otherwise only
-            # called once at campaign start, so it must be repeated here.
-            cleanup_orphaned_resources()
+            print(f"\n  ⏭ Baseline {bid} done — cleaning up before next baseline...")
+            # Kill orphaned VMs / containers / TAP devices / Firecracker sockets
+            # left behind by this baseline so the next one starts clean.
+            # free_port_8001=False because THIS process owns port 8001 (the
+            # interceptor binds it in-process) — fuser -k would SIGKILL us.
+            # The interceptor.stop() in the baseline's finally already freed
+            # the port; the VM/TAP/socket orphans are what we still need to catch.
+            t0 = time.monotonic()
+            cleanup_orphaned_resources(free_port_8001=False)
+            print(f"  ⏭ Inter-baseline cleanup took {time.monotonic() - t0:.1f}s, "
+                  f"sleeping 10s, then starting next baseline.")
             await asyncio.sleep(10)
 
     # Write comparison
