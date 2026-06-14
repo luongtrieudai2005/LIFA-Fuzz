@@ -38,10 +38,10 @@ graph TB
         MONITOR["Crash Monitor<br/>Detects panics/segfaults"]
         FAST_RULES["Active Rule Set<br/>Current mutation strategy"]
         TRAFFIC_LOG["Traffic Log Buffer<br/>Raw + mutated traffic"]
-        MITM       -->|"Raw packets"|       TRAFFIC_LOG
+        MITM -->|"Raw packets"| TRAFFIC_LOG
         FAST_RULES --> ENGINE
-        ENGINE     -->|"Mutated packets"|   MITM
-        MONITOR    -.->|"Crash alerts"|     MITM
+        ENGINE -->|"Mutated packets"| MITM
+        MONITOR -.->|"Crash alerts"| MITM
     end
 
     subgraph "Block 3: Neural-Mathematical Fusion"
@@ -51,14 +51,14 @@ graph TB
         LLM["LLM Agent<br/>Infers protocol grammar"]
         SLOW_RULES["RulesOrchestrator<br/>Dedup + fusion + fallback"]
         RULEGEN["Rule Generator<br/>Outputs SemanticRules"]
-        PARSER     -->|"Parsed traffic"|    DIFF
-        DIFF       --> HEATMAP
-        HEATMAP    -->|"math_hint"|         LLM
-        HEATMAP    -->|"Bootstrap fallback"| SLOW_RULES
-        PARSER     -->|"Raw samples"|       LLM
-        LLM        -->|"Inferred grammar"|  SLOW_RULES
+        PARSER -->|"Parsed traffic"| DIFF
+        DIFF --> HEATMAP
+        HEATMAP -->|"math_hint"| LLM
+        HEATMAP -->|"Bootstrap fallback"| SLOW_RULES
+        PARSER -->|"Raw samples"| LLM
+        LLM -->|"Inferred grammar"| SLOW_RULES
         SLOW_RULES --> RULEGEN
-        RULEGEN    -->|"New/updated rules"| FAST_RULES
+        RULEGEN -->|"New/updated rules"| FAST_RULES
     end
 
     TRAFFIC_LOG -->|"Batch send"| PARSER
@@ -69,14 +69,14 @@ graph TB
         RUNNER["EvaluationRunner<br/>3 Baselines (A/B/C)"]
         PLOTS["PlotGenerator<br/>Paper-ready PNGs"]
         TELEMETRY --> RUNNER
-        RQ1       --> PLOTS
-        RUNNER    --> PLOTS
+        RQ1 --> PLOTS
+        RUNNER --> PLOTS
     end
 
-    CLIENT    -->|"All traffic"|       MITM
-    MITM      -->|"Forward / mutated"| SERVER
-    SERVER    -->|"Responses"|         MITM
-    MITM      -->|"Forward responses"| CLIENT
+    CLIENT -->|"All traffic"| MITM
+    MITM -->|"Forward / mutated"| SERVER
+    SERVER -->|"Responses"| MITM
+    MITM -->|"Forward responses"| CLIENT
 
     style SERVER fill:#f9f,stroke:#333
     style LLM fill:#ff9,stroke:#333
