@@ -1396,8 +1396,9 @@ Examples:
         help="Duration per baseline in seconds (default: 300)",
     )
     parser.add_argument(
-        "--baseline", choices=["A", "B", "C", "all"], default="all",
-        help="Which baseline to run (default: all)",
+        "--baseline", default="all",
+        help="Which baseline(s) to run: A, B, C, all, or comma-separated "
+             "like B,C (default: all). Runs in the given order.",
     )
     parser.add_argument(
         "--driver", choices=["docker", "firecracker"], default="docker",
@@ -1421,7 +1422,24 @@ Examples:
 
     args = parser.parse_args()
 
-    baselines = list(BASELINE_CONFIGS.keys()) if args.baseline == "all" else [args.baseline]
+    # Parse --baseline: "all", a single letter (A/B/C), or a comma-separated
+    # subset like "B,C" / "A,C". Preserve the requested order and de-dup.
+    _valid = set(BASELINE_CONFIGS.keys())
+    if args.baseline == "all":
+        baselines = list(BASELINE_CONFIGS.keys())
+    else:
+        requested = [b.strip().upper() for b in args.baseline.split(",") if b.strip()]
+        invalid = [b for b in requested if b not in _valid]
+        if invalid:
+            parser.error(
+                f"Invalid --baseline value(s): {invalid}. "
+                f"Choose from {sorted(_valid)}, 'all', or a comma-separated subset."
+            )
+        # de-dup while preserving order
+        seen: set[str] = set()
+        baselines = [b for b in requested if not (b in seen or seen.add(b))]
+        if not baselines:
+            parser.error("--baseline resolved to no baselines.")
 
     # ── Pre-run cleanup: archive old results, kill orphans ────────
     from scripts.cleanup import (
