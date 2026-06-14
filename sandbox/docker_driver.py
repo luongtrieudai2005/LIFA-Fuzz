@@ -94,14 +94,20 @@ class DockerSandbox(BaseSandbox):
         logger.info("Starting Docker sandbox (target only)...")
 
         try:
-            # 1. Build target image
+            # 1. Build target image — skip if already present (e.g. a pre-built
+            #    coverage-instrumented image tagged lifa-fuzz-server:latest).
             build_path = str(self.build_context)
-            logger.info(f"Building target server image from {build_path}...")
-            client.images.build(
-                path=build_path,
-                tag=self.target_image_tag,
-                rm=True,
-            )
+            if client.images.list(name=self.target_image_tag):
+                logger.info(
+                    f"Image '{self.target_image_tag}' already present — skipping build."
+                )
+            else:
+                logger.info(f"Building target server image from {build_path}...")
+                client.images.build(
+                    path=build_path,
+                    tag=self.target_image_tag,
+                    rm=True,
+                )
 
             # 2. Create network (idempotent)
             self._network = self._create_network()

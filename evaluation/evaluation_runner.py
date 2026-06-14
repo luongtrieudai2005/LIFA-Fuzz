@@ -960,8 +960,81 @@ async def _collect_gcov_coverage(
                 print(f"  ⚠ Coverage collection failed: {e}")
                 return {}
 
-        # For non-lighttpd targets, use original docker cp approach
-        if target != "lighttpd":
+        # Collect coverage for lightftp target (gcov-instrumented build,
+        # built via Dockerfile.lightftp-coverage which keeps /tmp/LightFTP).
+        if target == "lightftp":
+            try:
+                import shutil
+                # gcov tool must be compatible with the gcc that built fftp
+                # (builder is bookworm = gcc-12). Host may lack gcov-12, so try
+                # candidates in order of preference; first available wins.
+                _GCOV_CANDIDATES = ["gcov-12", "gcov-11", "gcov-15", "gcov"]
+                gcov_tool = next(
+                    (g for g in _GCOV_CANDIDATES if shutil.which(g)), None
+                )
+                if gcov_tool is None:
+                    print("  ⚠ No gcov tool found on host — skipping lightftp coverage")
+                    return {}
+
+                # Step 1: SIGINT (signal 2) to flush gcov .gcda files.
+                # fftp is PID 1 (exec'd by /init).
+                sp.run(
+                    ["docker", "exec", container_name, "kill", "-2", "1"],
+                    capture_output=True, timeout=10,
+                )
+                await asyncio.sleep(2)  # Wait for gcov flush
+                print(f"  ✓ Sent SIGINT to fftp (PID 1) — gcov buffers flushed")
+
+                # Step 2: Copy .gcda+.gcno (object dir) and source from container.
+                # fftp writes .gcda to the absolute build path baked in at
+                # compile time: /tmp/LightFTP/Source/Release/*.gcda
+                for src in [
+                    f"{container_name}:/tmp/LightFTP/Source/Release/.",
+                    f"{container_name}:/tmp/LightFTP/Source/.",
+                ]:
+                    sp.run(
+                        ["docker", "cp", src, str(work_dir)],
+                        capture_output=True, timeout=30,
+                    )
+                gcda_files = list(work_dir.rglob("*.gcda"))
+                if not gcda_files:
+                    print("  ℹ No .gcda files found after SIGINT — ensure the "
+                          "runtime image keeps /tmp/LightFTP (coverage variant)")
+                    return {}
+                print(f"  ✓ Copied {len(gcda_files)} .gcda files from container")
+
+                # Step 3: Run lcov on HOST with a compatible gcov tool.
+                info_path = coverage_dir / "coverage.info"
+                lcov_result = sp.run(
+                    ["lcov", "--capture",
+                     "--directory", str(work_dir),
+                     "--output-file", str(info_path),
+                     "--gcov-tool", gcov_tool,
+                     "--rc", "lcov_branch_coverage=1",
+                     "--ignore-errors", "source,mismatch"],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if lcov_result.returncode == 0:
+                    print(f"  ✓ lcov --capture succeeded ({gcov_tool})")
+                    coverage_data = TelemetryCollector.parse_lcov(str(info_path))
+                    coverage_data["lcov_path"] = str(info_path)
+                    coverage_data["gcov_tool"] = gcov_tool
+                    print(
+                        f"  ✓ Coverage: {coverage_data['line_coverage_pct']:.1f}% lines "
+                        f"({coverage_data['lines_hit']}/{coverage_data['lines_total']}), "
+                        f"{coverage_data['branch_coverage_pct']:.1f}% branches "
+                        f"({coverage_data['branches_hit']}/{coverage_data['branches_total']})"
+                    )
+                    return coverage_data
+                else:
+                    print(f"  ⚠ lcov failed ({gcov_tool}): {lcov_result.stderr[:200]}")
+                    return {}
+            except Exception as e:
+                print(f"  ⚠ lightftp coverage collection failed: {e}")
+                return {}
+
+        # For other targets, use original docker cp approach
+        if target not in ("lighttpd", "lightftp"):
             gcda_search_paths = [
                 f"{container_name}:/app/.",
             ]
