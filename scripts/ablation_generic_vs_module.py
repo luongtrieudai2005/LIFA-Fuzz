@@ -38,21 +38,34 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent
 
 
-def _run_config(protocol_module: str, duration: int, out_tag: str) -> dict:
+def _run_config(
+    protocol_module: str, duration: int, out_tag: str,
+    baselines: str = "C", measure_coverage: bool = False,
+) -> dict:
     """Run one evaluation_runner campaign with a given protocol_module.
 
-    Sets fast_loop.protocol_module via a temporary config override. Uses the
-    Firecracker coverage rootfs (--coverage) so real code coverage is measured.
+    Default = CRASH-FINDING mode (auto_reset=True, confirm_crashes): the fuzzer
+    runs the full `duration`, restarting the target after each crash, and every
+    recorded crash is reproduced on a clean target (reproduced=True) — the honest
+    oracle. This is what you want for "does it find the CVE".
+
+    measure_coverage=True adds --coverage, which disables auto_reset (target
+    stops at first crash) to measure gcov line/branch coverage — only use when
+    you want "time-to-first-crash + coverage-at-crash", not a crash sweep.
     """
     cmd = [
         sys.executable, "-m", "evaluation.evaluation_runner",
-        "--baseline", "B,C",            # B=math-only, C=LLM (skip A random)
+        "--baseline", baselines,
         "--duration", str(duration),
         "--driver", "firecracker",
         "--target", "lightftp",
-        "--coverage",
         "--no-dashboard",
     ]
+    if measure_coverage:
+        # NOTE: --coverage sets auto_reset=False → the baseline STOPS at the
+        # first crash (target stays dead). Only use this when you want
+        # "time-to-first-crash + coverage-at-crash", NOT a crash-finding sweep.
+        cmd.append("--coverage")
     env_module = protocol_module  # passed via a temp config tweak below
     print(f"\n{'='*60}\n  ABLATION: protocol_module={protocol_module} ({out_tag})\n{'='*60}")
     print(f"  cmd: {' '.join(cmd)}")
@@ -102,6 +115,11 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--duration", type=int, default=600, help="per-baseline seconds")
+    p.add_argument("--baselines", default="C",
+                   help="which baseline(s) per module, e.g. C or B,C (default C)")
+    p.add_argument("--coverage", action="store_true",
+                   help="also measure gcov coverage (STOPS at first crash — "
+                        "only for time-to-first-crash+coverage, not a crash sweep)")
     p.add_argument("--out", default="evaluation/results/ablation_generic_vs_module.json")
     args = p.parse_args()
 
@@ -109,12 +127,16 @@ def main() -> int:
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "note": "Honest ablation: black-box core (null) vs disclosed FTP module (ftp). "
                 "If core-only finds no CVE, that is the real result — report it.",
+        "baselines": args.baselines,
+        "measure_coverage": args.coverage,
         "configs": {},
     }
     # Order: ftp first (known-good baseline), then null (the thesis test).
     for module, tag in [("ftp", "+FTP-module (case-study)"),
                         ("null", "core-only (black-box thesis)")]:
-        results["configs"][module] = _run_config(module, args.duration, tag)
+        results["configs"][module] = _run_config(
+            module, args.duration, tag, args.baselines, args.coverage,
+        )
 
     out = _ROOT / args.out
     out.parent.mkdir(parents=True, exist_ok=True)
