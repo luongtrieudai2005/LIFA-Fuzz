@@ -61,34 +61,52 @@ RESULTS_DIR = Path(__file__).parent / "results"
 # =============================================================================
 
 
+# Virtual packet length for normalizing relative-to-end offsets (e.g. FTP
+# CRLF described as the "last 2 bytes" via [-2,-1)). Large enough that
+# positive offsets (0..~60) never collide with end-anchored ones.
+_REF_PACKET_LEN = 64
+
+
+def _norm(o: int) -> int:
+    """Normalize an offset into an absolute frame.
+
+    Semantics:
+      - ``-1``        → end of packet (exclusive) → ``_REF_PACKET_LEN``
+      - ``< -1``      → N bytes from end (``-2`` = last 2 bytes' start)
+                        → ``_REF_PACKET_LEN + o``
+      - ``>= 0``      → as-is.
+
+    This lets a text-protocol field be described as "the last N bytes"
+    (e.g. FTP CRLF = ``[-2,-1)`` → ``[62,64)``) and still compare against
+    fields using ordinary absolute offsets. Both inferred and ground-truth
+    fields are normalized through the same frame, so matching is consistent.
+    """
+    if o == -1:
+        return _REF_PACKET_LEN
+    if o < -1:
+        return _REF_PACKET_LEN + o
+    return o
+
+
 def _ranges_overlap(
     a_start: int, a_end: int,
     b_start: int, b_end: int,
 ) -> int:
     """Return the number of overlapping bytes between two ranges.
 
-    Uses -1 to represent "extends to end of packet".
+    Handles relative-to-end offsets (``-1`` = end, ``< -1`` = N-from-end)
+    via :func:`_norm`.
     """
-    # Handle variable-length (-1 = open-ended)
-    if a_end == -1 and b_end == -1:
-        # Both variable → they overlap from max(start) onward
-        return max(0, min(a_end if a_end != -1 else 1000,
-                          b_end if b_end != -1 else 1000) - max(a_start, b_start))
-    if a_end == -1:
-        overlap_end = b_end
-    elif b_end == -1:
-        overlap_end = a_end
-    else:
-        overlap_end = min(a_end, b_end)
-
+    a_start, a_end = _norm(a_start), _norm(a_end)
+    b_start, b_end = _norm(b_start), _norm(b_end)
     overlap_start = max(a_start, b_start)
+    overlap_end = min(a_end, b_end)
     return max(0, overlap_end - overlap_start)
 
 
 def _field_span(f: Any) -> int:
     """Return the byte span of a field (offset_end - offset_start)."""
-    end = f.offset_end if f.offset_end != -1 else 65535
-    return max(1, end - f.offset_start)
+    return max(1, _norm(f.offset_end) - _norm(f.offset_start))
 
 
 def match_inferred_to_ground(
@@ -118,8 +136,9 @@ def match_inferred_to_ground(
             if j in matched_ground:
                 continue
 
-            # Check offset proximity with tolerance
-            start_close = abs(inf_field.offset_start - gt_field.offset_start) <= boundary_tolerance
+            # Check offset proximity with tolerance (normalize so end-anchored
+            # offsets like FTP CRLF [-2,...) compare in a common frame).
+            start_close = abs(_norm(inf_field.offset_start) - _norm(gt_field.offset_start)) <= boundary_tolerance
 
             # Check overlap
             overlap = _ranges_overlap(
