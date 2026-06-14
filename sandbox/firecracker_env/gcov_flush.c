@@ -13,6 +13,7 @@
  */
 #include <signal.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 extern void __gcov_dump(void);  /* gcc >= 11; resolves to the linked gcov runtime */
@@ -24,6 +25,16 @@ static void _gcov_on_signal(int sig) {
                       * Without this, the guest panics on PID-1 exit (panic=1)
                       * before the kernel syncs, and .gcda never reaches the
                       * host's ext4 file. */
+    /* For crash signals (SIGABRT/SIGSEGV), re-raise with default disposition
+     * after flushing so the process actually terminates (and, for ASAN, the
+     * abort completes) — no infinite loop if flush itself faults. */
+    if (sig == SIGABRT || sig == SIGSEGV) {
+        struct sigaction dfl;
+        memset(&dfl, 0, sizeof(dfl));
+        dfl.sa_handler = SIG_DFL;
+        sigaction(sig, &dfl, NULL);
+        raise(sig);
+    }
     _exit(0);
 }
 
@@ -33,6 +44,12 @@ static void _install_gcov_flush_handler(void) {
     sa.sa_handler = _gcov_on_signal;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
+    /* SIGTERM/SIGINT: graceful (timer / CtrlAltDel). SIGABRT: ASAN abort on
+     * memory error. SIGSEGV: illegal access. Catching the latter two lets a
+     * REPLAY flush .gcda even when a mutation crashes ffp — so the coverage
+     * of the crashing segment survives and accumulates across restarts. */
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGSEGV, &sa, NULL);
 }
