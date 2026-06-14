@@ -225,10 +225,19 @@ class Interceptor:
             except asyncio.CancelledError:
                 pass
 
-        server_writer.close()
-        await server_writer.wait_closed()
-        client_writer.close()
-        await client_writer.wait_closed()
+        # Connection cleanup. During fuzzing the target resets connections
+        # aggressively (RST on malformed input / crash), so wait_closed() can
+        # raise ConnectionResetError / BrokenPipeError. These are EXPECTED at
+        # this point (we're tearing the socket down anyway) — suppress them so
+        # they don't (a) spam the log with unhandled-exception traces (disk
+        # fill risk on long campaigns) or (b) skip the _active_connections
+        # decrement below.
+        for w in (server_writer, client_writer):
+            try:
+                w.close()
+                await w.wait_closed()
+            except (ConnectionResetError, BrokenPipeError, OSError, asyncio.CancelledError):
+                pass
         self._active_connections -= 1
         logger.info(f"Connection from {peer} closed (active: {self._active_connections})")
 
