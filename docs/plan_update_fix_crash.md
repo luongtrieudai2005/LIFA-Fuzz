@@ -8,7 +8,8 @@
 > bandit (novelty-weighted selection + plateau ε-decay, ablate thành Baseline D) dựa trên
 > literature Woo/EcoFuzz. Sau khi phân tích dữ liệu thực (xem §1), hướng đó bị **loại bỏ**
 > vì lý do thực dụng: không cần thiết cho paper, chi phí/nhiễu cao, và reward đề xuất trùng
-> vùng proxy mà baseline B đã dẫn đầu. v4.0 giữ nguyên đóng góp đã code xong, frame lại thành
+> vùng proxy — một proxy mà kiểm chứng cho thấy thực ra đo *đa dạng mutation command-field*,
+> không phải độ phủ thật (§1.2). v4.0 giữ nguyên đóng góp đã code xong, frame lại thành
 > *engineering design*, và dồn effort vào hai việc thật sự còn thiếu: đo code coverage nhị
 > phân và gọi LLM thật cho RQ1.
 
@@ -17,9 +18,10 @@
 ## 0. TL;DR
 
 - **Bỏ Baseline D (novelty-bandit).** Lý do thực dụng (xem §1.3): không cần thiết cho paper,
-  chi phí/nhiễu cao cho một đóng góp phụ, và reward đề xuất trùng vùng proxy mà B đã dẫn đầu
-  nên kỳ vọng cải thiện biên nhỏ. Dữ liệu C<B (C: 1,63 vs B: 3,91 edges/1000 exec) cho thấy
-  hướng cần làm là *hiểu* trade-off và *đo đúng*, không phải thêm cơ chế.
+  chi phí/nhiễu cao cho một đóng góp phụ, và reward đề xuất trùng vùng proxy — một proxy mà
+  kiểm chứng (§1.2) cho thấy thực ra đo *đa dạng mutation command-field*, không phải độ phủ
+  thật. Dữ liệu C<B (C: 1,63 vs B: 3,91 edges/1000 exec) phản ánh B sinh nhiều command rác
+  hơn, không phải hiểu protocol hơn.
 - **Scheduling = engineering design, không phải contribution thuật toán.** WeightedScheduler,
   EWMA sampling, two-mode crash isolation, State Transition Graph đã code xong và giải vấn đề
   thực tế (xem §2). Trình bày dưới góc kỹ thuật có cite protocol-RE, không cần ablate, không
@@ -36,29 +38,44 @@
 ### 1.1 Kết quả thực nghiệm thật
 
 Từ `logs/state_coverage_stats_{A,B,C}.csv` (chiến dịch mở rộng trên LightFTP/Firecracker),
-metric đáng tin nhất hiện có là số transition trạng thái giao thức (STG edges = bộ ba
-`prev_code, command, new_code`):
+metric đáng tin nhất hiện có là số "STG edges" mà hệ thống ghi được — bộ ba
+`prev_code, command, new_code`. **Cảnh báo diễn giải (xem §1.2):** vì fuzzer mắc kẹt ở trạng
+thái greeting (`unique_states = 1`, chỉ thấy code `220`), `prev_code = new_code = 220` gần
+như luôn, nên số "edge" thực tế ≈ **số chuỗi command-field khác nhau** bị đột biến, không
+phải số transition trạng thái thật. Bảng dưới đây vẫn dùng được để so sánh *độ đa dạng
+mutation của command field* giữa các baseline, nhưng **không phải** thước đo độ phủ giao
+thức.
 
-| Baseline | Executions | STG edges | **edges / 1000 exec** |
+| Baseline | Executions | "STG edges"* | **edges / 1000 exec** |
 |---|---|---|---|
 | A — Pure Random | 1.438.799 | 3.752 | 2,61 |
 | B — Math-Only | 1.422.891 | **5.563** | **3,91** |
 | C — Full Fusion | 1.356.229 | 2.217 | **1,63** |
 
-Chuẩn hóa theo số execution: **B (3,91) > A (2,61) > C (1,63)**. Baseline dùng LLM (C)
-khám phá state transition **kém nhất**, kém B khoảng 2,4 lần.
+\* Trên thực tế ≈ số chuỗi command-field khác nhau được đột biến (xem §1.2). Chuẩn hóa theo
+execution: **B (3,91) > A (2,61) > C (1,63)** — baseline dùng LLM (C) sinh **ít chuỗi
+command-field đa dạng hơn** nhất, kém B khoảng 2,4 lần.
 
-### 1.2 Cơ chế — vì sao C lại kém
+### 1.2 Cơ chế — vì sao C sinh ít chuỗi command-field hơn (đã kiểm chứng)
 
-LLM gán `STATIC` cho magic/constant → fuzzer skip; các trường còn lại tập trung vào
-`BOUNDARY_VALUES` (length) và `DICTIONARY` (opcode). Hệ quả fuzzer sinh **ít loại command
-FTP khác nhau** → ít transition `(prev_code, cmd, new_code)`. B (math-only) ít thu hẹp
-command hơn → vô tình chạm nhiều transition hơn.
+Cơ chế đã được kiểm chứng trực tiếp bằng test `extract_ftp_command` (`state_transition_graph.py:110`):
+hàm này chấp nhận **bất kỳ chuỗi alpha nào dài 2–6 ký tự** (không chỉ real verbs) — không gian
+~321 triệu chuỗi khả thi. Mô phỏng 14k mutation → ~11.520 chuỗi distinct (~82%). Vì fuzzer
+mắc kẹt ở greeting (`unique_states = 1`), số "edge" ≈ số chuỗi command-field distinct.
 
-> *Lưu ý: §1.1 là số đo trực tiếp từ CSV; §1.2 là **giả thuyết cơ chế** nhất quán với dữ liệu
-> nhưng chưa được kiểm chứng trực tiếp (chưa đếm command-diversity từng baseline). Việc xác
-> minh cơ chế — đếm số command FTP khác nhau mà mỗi baseline thực sự gửi — là một kiểm tra
-> nhỏ, đáng làm trước khi viết finding này vào paper.*
+- **C (LLM)** gán `STATIC` cho magic/constant → skip; command field được đột biến theo
+  strategy `DICTIONARY` (danh sách real verbs nhỏ: `USER`, `PASS`, `LIST`...) → **ít chuỗi
+  distinct** (cardinality thấp, có chủ đích vì LLM "biết" command là opcode).
+- **B (math-only)** đột biến command field tự do → sinh hàng nghìn chuỗi alpha garbage
+  distinct (`ZZZZZ`, `QQQQ`, ...) → nhiều "edge" hơn.
+- **A (random)** cũng đột biến tự do nhưng trải đều mọi offset nên command field ít được
+  chạm hơn B → nằm giữa.
+
+**Hệ quả quan trọng:** các "edge" của B/A đa số là `(220, "ZZZZZ", 220)` — command rác mà
+server bỏ qua. **Đây là noise mutation, không phải khám phá protocol.** Không baseline nào
+đạt real state (cả ba mắc kẹt greeting), nên không có phép đo *độ phủ trạng thái thật* nào
+trong dữ liệu hiện tại. Việc gọi STG edges là "state coverage" (như đã viết trong báo cáo) là
+**sai lệch** — nó là *độ đa dạng mutation của command field*.
 
 ### 1.3 Vì sao không làm bandit
 
@@ -69,26 +86,36 @@ thực dụng hơn:
 1. **Không cần thiết cho paper.** Câu chuyện scheduling của đề tài đứng vững ở mức
    *engineering design* (§2) — giải vấn đề thực. Không có yêu cầu phải có thêm một thuật
    toán scheduling để paper "đủ đóng góp".
-2. **Dữ liệu C<B chỉ ra hướng cần hiểu, không phải hướng cần thêm cơ chế.** LLM đang *đánh
-   đổi* state coverage lấy độ chính xác ngữ pháp. Việc đáng làm là hiểu trade-off này (đã
-   là finding §1.4) và đo đúng (§4.1), chứ không phải xếp thêm một tầng bandit lên trên.
+2. **Dữ liệu C<B chỉ ra hướng cần hiểu, không phải hướng cần thêm cơ chế.** LLM đang cố ý
+   thu hẹp không gian mutation (command-field diversity thấp hơn). Việc đáng làm là đo đúng
+   (code coverage thật, §4.1) để biết hẹp hóa này có giảm code path thật hay không, chứ
+   không phải xếp thêm một tầng bandit lên trên.
 3. **Chi phí/nhiễu cao cho đóng góp phụ.** Novelty rate đòi hỏi gắn strategy vào từng
    response (schema `response_buffer` phải thêm `rule_id` — hiện chưa có), chia sẻ
    `response_buffer.jsonl` với EWMA controller vốn đọc-truncate, và định nghĩa lại vai trò
-   của ε. Toàn bộ chỉ để thử một đóng góp phụ, với xác suất thắng thấp (B đã dẫn đầu state
-   coverage → bandit ít khả năng vượt).
-4. **Tín hiệu reward trùng vùng với proxy đã đo.** Novelty rate ≈ "đã thấy response/state
-   mới", cùng họ với state coverage. Tối ưu cho nó gần như tối ưu cho thứ B đã giỏi — kỳ
-   vọng cải thiện biên nhỏ, không xứng công.
+   của ε. Toàn bộ chỉ để thử một đóng góp phụ, với xác suất thắng thấp.
+4. **Tín hiệu reward trùng vùng với proxy sai.** Novelty rate ≈ "đã thấy response/command
+   mới" — cùng họ với proxy §1.1, mà §1.2 đã chứng minh thực ra đo *đa dạng mutation
+   command-field*, không phải độ phủ thật. Tối ưu cho proxy sai = khuyến khích sinh thêm
+   rác, không phải hiểu thêm protocol.
 
-### 1.4 Nhưng phát hiện C<B tự nó có giá trị
+### 1.4 C<B nghĩa gì, và không nghĩa gì
 
-Việc LLM "hiểu đúng giao thức nhưng thận trọng quá" — tăng độ chính xác ngữ pháp nhưng
-giảm độ phủ trạng thái — là một **trade-off chưa được báo cáo** trong LLM-for-fuzzing. Đây
-là *finding* có giá trị khi viết lên, không cần thêm cơ chế nào để khai thác. Lưu ý quan
-trọng để không diễn giải sai: Bảng 2b đo *state coverage*, **không** phải code coverage
-nhị phân (hệ thống chưa có — xem §4.1). C kém hơn B ở state coverage là đã xác nhận; C
-kém hơn B ở code path thật thì chưa đo được.
+**Nghĩa:** LLM (C) cố tình thu hẹp không gian mutation của command field (vì nó suy luận
+đúng rằng đó là opcode → dùng dictionary nhỏ). Điều này measurable là C sinh ít chuỗi
+command-field distinct hơn B/A. Đây là hành vi **đúng theo thiết kế** (đột biến có chủ đích
+vào semantic), không phải khuyết điểm.
+
+**Không nghĩa:** không thể kết luận "C kém hơn B trong khám phá protocol" hay "C chạm ít
+state hơn". Vì (i) các "edge" của B/A chủ yếu là command rác bị server bỏ qua, và (ii) không
+baseline đạt real state. Câu hỏi thực sự — *liệu C chạm nhiều hay ít code path nhị phân hơn
+B* — **chưa đo được** (hệ thống không có code coverage thật, xem §4.1).
+
+**Vì sao vẫn bỏ bandit (§1.3):** reward bandit đề xuất (novelty rate ≈ "đã thấy
+response/command mới") chính là dạng của metric §1.1 — tức nó tối ưu cho *đa dạng mutation
+command-field*, thứ B/A đang "thắng" bằng cách sinh rác. Tối ưu cho proxy này = khuyến khích
+sinh thêm rác, không phải hiểu thêm protocol. Bandit không đứng vững trên *proxy sai*, bất
+chấp cơ chế C<B có nghĩa gì.
 
 ---
 
@@ -134,9 +161,9 @@ coi đây là "thuật toán mới".
 
 **Vấn đề.** Hệ thống hiện *không có* feedback coverage nhị phân. Chỉ số
 `unique_code_branches` thực ra đếm cặp (offset, giá trị) bị đột biến — là độ rộng mutation,
-không phải branch nhị phân. Vì vậy mọi kết luận A/B/C đến nay chỉ dựa trên proxy ở tầng
-giao thức (STG edges). Không thể trả lời "C chạm ít code path hơn B thật không, hay chỉ ít
-state transition hơn".
+không phải branch nhị phân. Còn "STG edges" (§1.2) thực ra đo *đa dạng mutation command-field*,
+không phải độ phủ giao thức. Tóm lại **không có proxy nào đo khám phá code path thật**. Không
+thể trả lời "C chạm ít code path hơn B thật không".
 
 **Việc.** Hiện LightFTP chỉ biên dịch với `-fsanitize=address` (phát hiện memory error,
 **không** sinh code coverage). Để có coverage nhị phân, cần build lại LightFTP với
@@ -146,7 +173,8 @@ dùng chung. Telemetry đã có hàm parse lcov (`telemetry_collector.py:137-209
 bổ sung được cột "code branches" và C<B được kiểm tra lại đúng nghĩa.
 
 **Tầm quan trọng.** Đây là điều kiện cần cho *mọi* kết luận định lượng về độ phủ. Không có
-nó, C<B chỉ là khẳng định về state coverage, không phải code coverage.
+nó, C<B chỉ cho thấy C thu hẹp không gian mutation command-field — chưa nói gì được về việc
+C chạm nhiều hay ít code path hơn B.
 
 ### 4.2 Gọi LLM thật cho RQ1 trên protocol có ground-truth độc lập
 
