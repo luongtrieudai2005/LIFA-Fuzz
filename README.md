@@ -22,38 +22,40 @@ All without source code, RFCs, or protocol-specific knowledge in the core engine
 <img width="1516" height="1038" alt="image" src="https://github.com/user-attachments/assets/022f1808-1002-44a4-99f5-db7dbda727d5" />
 
 ```
-Block 1: Sandbox (Firecracker MicroVM)
-  Target server (ASAN-instrumented) + honest client
-        |
-        | captured traffic (JSONL)
-        v
-Block 2: Fast Loop (asyncio, ~50-70 EPS stateful)
-  SeedFeeder -> FuzzTarget (Prefix, Target, Suffix)
-      |
-      +-- ProtocolModule (NullModule = pure black-box default)
-      +-- MutationEngine
-      |     +-- 15 generic operators (BINARY_ONLY)
-      |     +-- Stateful sequence replay (1 TCP connection)
-      |     +-- Greeting drain (aligns request-response)
-      |     +-- StateTracker (P-PSM inferred or protocol-specific)
-      |
-      +-- CrashMonitor -> CrashManager (SHA256 + structural dedup)
-            +-- Phase 2: replay prefix+target on clean target
-        |
-        | traffic log (JSONL)
-        v
-Block 3: Slow Loop (separate process, ~1 inference/min)
-  DifferentialAnalyzer (entropy, Pearson, Kendall)
-  StateMachineInferer (Veritas P-PSM: K-S filter + PAM + DFA)
-      |
-      v
-  LLMAgent (math_hint + state_hint -> grammar inference)
-      |
-      v
-  RulesOrchestrator -> SemanticRules -> Fast Loop
-  EWMA Controller -> adaptive_k.json -> Fast Loop
+┌──────────────────────────────────────────┐
+│ Block 1: Sandbox (Firecracker MicroVM)   │
+│ Target server (ASAN) + honest client     │
+└──────────────────────┬───────────────────┘
+                       │ traffic (JSONL)
+                       ▼
+┌──────────────────────────────────────────┐
+│ Block 2: Fast Loop (asyncio, 50-70 EPS)  │
+│                                          │
+│  SeedFeeder -> FuzzTarget                │
+│      |-- ProtocolModule (NullModule)     │
+│      |-- MutationEngine                  │
+│      |   |-- 15 generic operators        │
+│      |   |-- Stateful replay (1 TCP)     │
+│      |   |-- Greeting drain              │
+│      |   +-- StateTracker (P-PSM)        │
+│      +-- CrashMonitor + Phase 2          │
+└──────────────────────┬───────────────────┘
+                       │ traffic log
+                       ▼
+┌──────────────────────────────────────────┐
+│ Block 3: Slow Loop (~1 inference/min)    │
+│                                          │
+│  DiffAnalyzer + StateMachineInferer      │
+│      |                                   │
+│      v                                   │
+│  LLMAgent (grammar inference)            │
+│      |                                   │
+│      v                                   │
+│  RulesOrchestrator -> SemanticRules      │
+│  EWMA Controller -> adaptive_k.json      │
+└──────────────────────────────────────────┘
 
-IPC: file-based (JSON/JSONL), atomic rename-swap, zero blocking
+IPC: file-based (JSON/JSONL), atomic rename-swap
 ```
 
 ### ProtocolModule: Black-Box Core + Opt-In Modules
