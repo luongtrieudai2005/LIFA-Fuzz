@@ -66,29 +66,25 @@ def _run_config(
         # first crash (target stays dead). Only use this when you want
         # "time-to-first-crash + coverage-at-crash", NOT a crash-finding sweep.
         cmd.append("--coverage")
-    env_module = protocol_module  # passed via a temp config tweak below
     print(f"\n{'='*60}\n  ABLATION: protocol_module={protocol_module} ({out_tag})\n{'='*60}")
     print(f"  cmd: {' '.join(cmd)}")
-    # Patch config.yaml's protocol_module in place for this run, restore after.
-    cfg_path = _ROOT / "config.yaml"
-    original = cfg_path.read_text()
-    patched = original
-    import re
-    patched = re.sub(
-        r'(protocol_module:\s*)"\w+"', rf'\1"{protocol_module}"', patched, count=1,
-    )
-    cfg_path.write_text(patched)
+    # Pass the module via ENV VAR (LIFA_PROTOCOL_MODULE), which eval_runner
+    # reads and forwards to MutationEngine. Cleaner than patching config.yaml
+    # (no file mutation, no restore-on-crash risk) and unambiguous — the
+    # previous config-patch approach was IGNORED by eval_runner, so BOTH
+    # ablation configs silently ran NullModule (invalidating the comparison).
+    import os as _os
+    env = dict(_os.environ)
+    env["LIFA_PROTOCOL_MODULE"] = protocol_module
     t0 = time.time()
     try:
         proc = subprocess.run(cmd, cwd=str(_ROOT), capture_output=True,
-                              text=True, timeout=duration * 4 + 600)
+                              text=True, timeout=duration * 4 + 600, env=env)
         ok = proc.returncode == 0
         tail = (proc.stdout + proc.stderr)[-2000:]
     except subprocess.TimeoutExpired as e:
         ok = False
         tail = (e.stdout or b"")[-2000:].decode(errors="replace") if e.stdout else "TIMEOUT"
-    finally:
-        cfg_path.write_text(original)  # ALWAYS restore
     elapsed = time.time() - t0
     # Harvest per-baseline summary.json (unique_crashes, coverage, eps).
     results_dir = _ROOT / "evaluation/results"

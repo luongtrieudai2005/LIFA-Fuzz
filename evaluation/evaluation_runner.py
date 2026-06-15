@@ -449,6 +449,16 @@ async def run_single_baseline(
         # Firecracker + FTP: need generous timeouts (FTP banner + command
         # response arrive asynchronously over the TAP bridge).
         _is_fc_ftp = (sandbox_driver == "firecracker" and target == "lightftp")
+        # Resolve ProtocolModule: env var override (ablation uses this to force
+        # null/ftp cleanly) else auto-resolve (lightftp→ftp case-study, else
+        # null = pure black-box core). WITHOUT this, MutationEngine defaulted to
+        # NullModule → no FTP state tracking → the "stuck at 220" diagnostic was
+        # blind (chains all empty). See scripts/ablation_generic_vs_module.py.
+        import os as _os
+        _protocol_module = _os.environ.get("LIFA_PROTOCOL_MODULE")
+        if not _protocol_module:
+            _protocol_module = "ftp" if target == "lightftp" else "null"
+
         mutator = MutationEngine(
             target_host=target_host,
             target_port=target_port,
@@ -458,6 +468,7 @@ async def run_single_baseline(
             connection_timeout=1.0 if _is_fc_ftp else 0.2,
             recv_timeout=0.5 if _is_fc_ftp else 0.01,
             no_recv=False,
+            protocol_module=_protocol_module,
         )
 
         # ── 5. Crash Monitor ──────────────────────────────────────
