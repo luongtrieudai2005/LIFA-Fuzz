@@ -202,11 +202,34 @@ Bên cạnh đó, engine hỗ trợ sequence-aware fuzzing với mô hình $M = 
 
 Weighted scheduler mở rộng RandomSubset bằng cách gán trọng số cho mỗi strategy: BOUNDARY_VALUES (trường length, nguồn crash số một trong thực tế) nhận trọng số 4.0, DICTIONARY (opcode) nhận 3.0, trong khi RANDOM_BYTES chỉ nhận 1.0. Trọng số này nhân với confidence score từ LLM, tạo ra phân phối ưu tiên các trường hứa hẹn nhất.
 
-## 3.5. State Transition Graph
+## 3.5. Theo dõi trạng thái giao thức — từ hardcode sang suy diễn
 
-Đối với giao thức có trạng thái (stateful protocol) như FTP, việc fuzzing hiệu quả đòi hỏi không chỉ khám phá các trường trong gói tin mà còn khám phá các trạng thái giao thức. StateTransitionGraph theo dõi các cạnh chuyển đổi trạng thái dưới dạng bộ ba (prev_code, command, new_code) — ví dụ ("220", "USER", "331") — và đánh dấu seed nào phát hiện cạnh mới là STATE_NOVELTY. Các seed này nhận priority boost 5x trong seed selector, giúp fuzzer tập trung vào các đường dẫn trạng thái chưa được khám phá.
+Đối với giao thức có trạng thái (stateful protocol) như FTP, việc fuzzing hiệu quả
+đòi hỏi khám phá cả trạng thái giao thức, không chỉ trường trong gói tin. LIFA-Fuzz
+theo dõi chuyển đổi trạng thái qua hai cơ chế:
 
-Cơ chế này tương tự như edge coverage trong AFL, nhưng hoạt động ở tầng giao thức thay vì tầng binary. Mỗi lần `recv()` trả về response (được EWMA điều phối), status code được trích xuất và ghi vào graph — piggyback trên network I/O đã xảy ra, không tạo thêm kết nối nào.
+**FTPModule (case study)**: StateTransitionGraph theo dõi cạnh chuyển đổi
+$\langle\text{prev\_code}, \text{command}, \text{new\_code}\rangle$ — ví dụ
+$\langle\text{"220"}, \text{USER}, \text{"331"}\rangle$ — và đánh dấu seed phát
+hiện cạnh mới là STATE\_NOVELTY (priority boost 5×). Đây là module disclosed cho
+case study LightFTP, không thuộc core.
+
+**StateMachineInferer (Tầng 3 — đóng góp tổng quát)**: Để hỗ trợ giao thức lạ
+không có module chuyên biệt, LIFA-Fuzz tích hợp Veritas [24] — hệ thống suy diễn
+Probabilistic Protocol State Machine (P-PSM) từ network traces thuần thống kê,
+không cần đặc tả giao thức, mã nguồn, hay từ khóa hardcode. Quá trình gồm 4 bước:
+(1) trích xuất message units 3-byte từ packet headers + lọc K-S test, (2) gom
+nhóm PAM + Jaccard similarity + Dunn index chọn $k$ tối ưu, (3) gán nhãn trạng
+thái cho mỗi packet theo medoid gần nhất, (4) xây DFA từ chuỗi trạng thái qua
+các phiên + xác suất chuyển tiếp $\to$ P-PSM.
+
+P-PSM được suy diễn offline trong Slow Loop (như DifferentialAnalyzer), ghi ra
+file cho Fast Loop đọc. `InferredStateTracker` trong Fast Loop gán nhãn mỗi
+response packet bằng medoid gần nhất $\to$ theo dõi chuyển đổi trạng thái
+generic. Cơ chế này tương tự edge coverage trong AFL, nhưng hoạt động ở tầng
+giao thức và **tự động suy diễn** cho bất kỳ protocol nào có traffic — giải
+bài toán stateful black-box mà ProtocolGPT [25] (white-box, cần mã nguồn)
+không giải được.
 
 ## 3.6. Intent-driven mutation: Action Sequence
 
@@ -296,7 +319,14 @@ Các chiến dịch được chạy ở nhiều độ dài khác nhau (từ 2 ph
 
 ## 5.3. Kết quả sơ bộ
 
-Phần này báo cáo các kết quả đo được từ các chiến dịch thực nghiệm đã chạy. Cần nhấn mạnh đây là **kết quả sơ bộ**: số liệu RQ1 thu được ở chế độ MOCK (chưa gọi LLM thực), và phép so sánh RQ3 trên ba baseline chưa cho ra kết luận định lượng ổn định. Các con số dưới đây được trích xuất trực tiếp từ `evaluation/results/` và `evaluation/archive/`.
+> **Cảnh báo trung thực (cập nhật):** Các kết quả A/B/C và RQ3 trong phần này
+> được đo khi fuzzer còn **lỗi triển khai nghiêm trọng** — SeedFeeder không gom
+> session thành multi-packet (mỗi packet là seed riêng → fuzzer không bao giờ
+> xác thực → mắc kẹt ở greeting 220, không chạm code post-auth). Mọi so sánh
+> A/B/C, số coverage, và số crash từ các chiến dịch **trước khi sửa lỗi này đều
+> KHÔNG hợp lệ** và cần re-validate. RQ1 (F1 = 0,857 MOCK / 1,000 REAL) đo
+> độc lập với pipeline fuzzing nên **vẫn hợp lệ**. Phần này giữ số cũ cho tham
+> chiếu lịch sử; số hợp lệ sẽ thay thế sau re-run.
 
 **RQ1 — Độ chính xác suy diễn ngữ pháp.** Ở chế độ MOCK, pipeline đạt Precision = 1.00, Recall = 0.75, **F1 = 0.857**, với độ chính xác offset = 1.00 (mọi trường suy diễn khớp offset ground truth trong dung sai ±1 byte). Tuy nhiên độ chính xác về *kiểu trường* và *strategy* thấp hơn (0.33 và 0.67 tương ứng): analyzer gộp hai trường opcode và length kế nhau thành một trường length duy nhất, dẫn đến thiếu 1 trường (Recall = 0.75). Mức F1 > 0.85 khớp với kỳ vọng cho giao thức đơn giản, song phải ghi rõ hai điểm: (i) đây là chế độ MOCK, chưa phản ánh chất lượng suy diễn của LLM thực; và (ii) ground truth là giao thức do chính tác giả thiết kế (xem hạn chế Section 6.5). Vì vậy F1 này chủ yếu kiểm chứng cơ chế khớp offset, chưa phải đánh giá khả năng tổng quát hóa.
 
@@ -449,3 +479,7 @@ Nhiều hướng phát triển tự nhiên từ kết quả hiện tại:
 [22] Sun, Y., Luo, Q., Wang, Y., et al. "SemFuzz: A Semantics-Aware Fuzzing Framework for Network Protocol Implementations." Proceedings of the ACM Web Conference 2026 (WWW '26), 2026. https://doi.org/10.1145/3774904.3792541
 
 [23] Qin, S., Hu, F., Ma, Z., et al. "NSFuzz: Towards Efficient and State-Aware Network Service Fuzzing." ACM Transactions on Software Engineering and Methodology (TOSEM), 2023.
+
+[24] Wang, Y., Zhang, Z., Yao, D., Qu, B., Guo, L. "Inferring Protocol State Machine from Network Traces: A Probabilistic Approach" (Veritas). 2011.
+
+[25] Wei, H., Chen, L., Du, Z., et al. "Unleashing the Power of LLM to Infer State Machine from the Protocol Implementation" (ProtocolGPT). arXiv:2405.00393, 2024. https://arxiv.org/abs/2405.00393

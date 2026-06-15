@@ -298,7 +298,11 @@ class CrashMonitor:
             if _get_window is not None:
                 crash_window = _get_window()
                 if crash_window:
-                    _, offending_packet, rule_id = crash_window[-1]
+                    # PHASE 2: crash_window entries are 4-tuple (ts, payload,
+                    # rule_id, prefix). Unpack robustly (handle both 3/4-tuple).
+                    _entry = crash_window[-1]
+                    offending_packet = _entry[1] if len(_entry) > 1 else b""
+                    rule_id = _entry[2] if len(_entry) > 2 else None
 
         # Tertiary: backward-compat private field access (defensive — a
         # mutator stand-in or future implementation may not expose these).
