@@ -65,6 +65,18 @@ class FTPModule(ProtocolModule):
         return StateTransitionGraph.extract_ftp_command(payload)
 
     def classify(self, response: bytes, payload: bytes) -> PacketStatus:
+        """Classify FTP response for fuzzer metrics.
+
+        Distinction: REJECTED = the send was WASTED (server didn't process
+        the command). ACCEPTED = the command reached a handler (even if the
+        handler returned an application-level error — that's useful fuzzing).
+
+        - 2xx/3xx: ACCEPTED (success)
+        - 500 syntax error / 530 auth fail: REJECTED (parse/auth waste)
+        - 501 not implemented / 550 file/perm error / other 4xx/5xx:
+          ACCEPTED (server PARSED the command + processed it, returned an
+          app error — the mutation reached deep code, NOT waste)
+        """
         if not response:
             return PacketStatus.REJECTED
         if len(response) >= 3:
@@ -72,8 +84,14 @@ class FTPModule(ProtocolModule):
                 code = int(response[:3])
                 if 200 <= code < 400:
                     return PacketStatus.ACCEPTED
-                if 400 <= code < 600:
+                # 500 = syntax error (couldn't parse) = waste
+                # 530 = not logged in (auth fail) = waste
+                if code == 500 or code == 530:
                     return PacketStatus.REJECTED
+                # 501/550/other = server processed command, returned app
+                # error. For fuzzing: NOT waste (reached handler).
+                if 400 <= code < 600:
+                    return PacketStatus.ACCEPTED
             except ValueError:
                 pass
         return PacketStatus.ACCEPTED
