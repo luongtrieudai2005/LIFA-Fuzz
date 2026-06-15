@@ -53,10 +53,17 @@ class InferredStateTracker:
         self._novel_seeds: dict[str, str] = {}
         self._label_counter: int = 0
         self._last_mtime: float = 0.0
+        self._prev_state: Optional[int] = None  # internal prev (from label_packet)
+        self._last_seq_id: str = ""              # for session boundary detection
         self._maybe_reload()
 
     def _maybe_reload(self) -> None:
-        """Re-read shared/state_machine.json if it changed."""
+        """Re-read shared/state_machine.json if it changed.
+
+        On reload: clear accumulated state tracking. A new P-PSM means the
+        state definitions changed (different medoids, different indices) —
+        old edges/states are stale and must not pollute new tracking.
+        """
         try:
             if not _SM_PATH.exists():
                 return
@@ -67,7 +74,24 @@ class InferredStateTracker:
             from slow_loop.state_machine_inferer import ProbabilisticStateMachine
 
             data = json.loads(_SM_PATH.read_text())
-            self._psm = ProbabilisticStateMachine.from_dict(data)
+            new_psm = ProbabilisticStateMachine.from_dict(data)
+            # Clear stale tracking if P-PSM changed (different state count or
+            # different medoids). Don't clear on first load (init).
+            if self._psm is not None and (
+                new_psm.n_states != self._psm.n_states
+                or new_psm.medoids != self._psm.medoids
+            ):
+                log.info(
+                    f"InferredStateTracker: P-PSM changed "
+                    f"({self._psm.n_states}→{new_psm.n_states} states), "
+                    f"clearing {len(self._edges)} stale edges"
+                )
+                self._states.clear()
+                self._edges.clear()
+                self._novel_seeds.clear()
+                self._total_edges = 0
+                self._prev_state = None
+            self._psm = new_psm
             log.info(
                 f"InferredStateTracker: loaded P-PSM "
                 f"({self._psm.n_states} states, "
@@ -85,11 +109,16 @@ class InferredStateTracker:
     ) -> bool:
         """Record a state transition edge.
 
+        Uses INTERNAL prev_state tracking (from label_packet) — NOT the
+        caller's prev_state, which is "" for NullModule (useless). The
+        tracker chains labeled states itself, resetting on session boundary.
+
         Args:
-            prev_state:   previous state index (int) or "init" string.
-            label:        packet label (command/payload identifier — generic).
-            new_state_raw: the raw response bytes to label.
-            sequence_id:  session ID for novelty tracking.
+            prev_state:   ignored for chaining (caller's value is module-
+                          specific and unreliable for generic tracking).
+            label:        packet label (diagnostic, in edge key).
+            new_state_raw: raw response bytes — labeled via P-PSM label_packet.
+            sequence_id:  session ID — reset prev_state when it changes.
 
         Returns:
             True if this edge is novel (never seen before).
@@ -105,8 +134,14 @@ class InferredStateTracker:
         if new_state is None:
             return False  # "unknown" state (data packet, too far from medoids)
 
-        # Normalize prev_state to int (or -1 for init)
-        prev_idx = prev_state if isinstance(prev_state, int) else -1
+        # Session boundary detection: reset prev_state when sequence_id changes.
+        if sequence_id and sequence_id != self._last_seq_id:
+            self._prev_state = None  # new session → fresh chain
+            self._last_seq_id = sequence_id
+
+        # Use INTERNAL prev_state (chained from previous label_packet result).
+        # Falls back to -1 (init) for the first packet in a session.
+        prev_idx = self._prev_state if self._prev_state is not None else -1
         self._states.add(new_state)
 
         edge_key = f"{prev_idx}|{label[:8]}|{new_state}"
@@ -116,6 +151,9 @@ class InferredStateTracker:
             self._edges[edge_key] = True
             if sequence_id and sequence_id not in self._novel_seeds:
                 self._novel_seeds[sequence_id] = edge_key
+
+        # Chain: this state becomes the next call's prev_state.
+        self._prev_state = new_state
 
         return is_new
 
