@@ -627,6 +627,7 @@ class MutationEngine:
         self._current_k: int = 200          # Sampling interval (K_max default)
         self._packet_counter: int = 0       # Monotonic — never reset
         self._recv_count: int = 0           # Number of recv() calls (for telemetry)
+        self._seq_log_counter: int = 0      # Samples _execute_sequence chain logs
         self._consecutive_failures: int = 0 # Back-pressure: consecutive CRASH/TIMEOUT
         self._MAX_CONSECUTIVE_FAILURES = 5  # Back off after this many failures
         self._rule_response_stats: dict[str, dict[str, int]] = {}  # Per rule-type stats
@@ -1781,13 +1782,40 @@ class MutationEngine:
         # Track prev_code across the entire sequence to chain edges.
         prev_code = "220"
 
+        # Collect the full response chain for diagnostics: [greeting, *prefix, target].
+        # Task B — exposes whether auth (e.g. FTP 230) completes before the target.
+        chain: list[str] = []
+
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(self.target_host, self.target_port),
                 timeout=self.connection_timeout,
             )
 
-            # Step B: Send prefix packets verbatim — drain response after each
+            # Step A: drain the server's initial greeting (e.g. FTP "220 ready"
+            # banner) BEFORE sending our first packet. GENERIC — we do not
+            # inspect content, just consume whatever the server sends on connect
+            # so the first prefix read returns the prefix's own response, not the
+            # greeting. Without this, every read is off-by-one (a classic FTP
+            # client bug) → state mis-tracked, auth slips, target response misread.
+            # Protocols with no greeting: the read times out (≤ recv_timeout) and
+            # we proceed. reader.read returns as soon as data is available, so a
+            # real greeting costs ~nothing.
+            try:
+                greeting = await asyncio.wait_for(
+                    reader.read(4096), timeout=self.recv_timeout
+                )
+                if greeting and self._module is not None:
+                    g_code = self._module.extract_state_code(greeting)
+                    chain.append(g_code)
+                    if g_code:
+                        prev_code = g_code  # initial state for edge chaining
+            except (asyncio.TimeoutError, Exception):
+                pass  # no greeting on connect — fine
+
+            # Step B: Send prefix packets VERBATIM (never mutated) — these
+            # establish protocol state (e.g. USER→PASS auth). Only the target is
+            # fuzzed (Task C). Drain each response so the next read aligns.
             for pkt_bytes in target.prefix:
                 writer.write(pkt_bytes)
                 await writer.drain()
@@ -1795,16 +1823,23 @@ class MutationEngine:
                     resp = await asyncio.wait_for(
                         reader.read(4096), timeout=self.recv_timeout
                     )
-                    # State-transition tracking for prefix packets — module-owned.
-                    if resp and self._state_tracker is not None:
-                        new_code = self._module.extract_state_code(resp)
-                        cmd = self._module.extract_command(pkt_bytes)
-                        self._state_tracker.record_edge(
-                            prev_code, cmd, new_code, target.sequence_id
+                    if resp:
+                        new_code = (
+                            self._module.extract_state_code(resp)
+                            if self._module is not None else ""
                         )
-                        prev_code = new_code
+                        chain.append(new_code)  # diagnostic
+                        # State-transition tracking — module-owned.
+                        if self._state_tracker is not None:
+                            cmd = self._module.extract_command(pkt_bytes)
+                            self._state_tracker.record_edge(
+                                prev_code, cmd, new_code, target.sequence_id
+                            )
+                            prev_code = new_code
+                    else:
+                        chain.append("")  # empty reply
                 except (asyncio.TimeoutError, Exception):
-                    pass  # server may not respond to every prefix packet
+                    chain.append("timeout")  # prefix got no response
 
             # Step C: Send mutated target — always read and classify response
             writer.write(mutated_payload)
@@ -1818,24 +1853,30 @@ class MutationEngine:
                 if resp:
                     status = self._classify_response(resp, mutated_payload)
                     self._record_response_sample(resp)
+                    t_code = (
+                        self._module.extract_state_code(resp)
+                        if self._module is not None else ""
+                    )
+                    chain.append(t_code)  # diagnostic: target's response code
                     # State-transition tracking for mutated target — module-owned.
                     if self._state_tracker is not None:
-                        new_code = self._module.extract_state_code(resp)
                         cmd = self._module.extract_command(
                             mutated_payload
                         )
                         is_novel = self._state_tracker.record_edge(
-                            prev_code, cmd, new_code, target.sequence_id
+                            prev_code, cmd, t_code, target.sequence_id
                         )
                         if is_novel:
                             log.info(
                                 f"STATE_NOVELTY: new edge "
-                                f"({prev_code},{cmd},{new_code}) "
+                                f"({prev_code},{cmd},{t_code}) "
                                 f"seed={target.sequence_id[:8]}",
                             )
                 else:
+                    chain.append("")
                     status = PacketStatus.REJECTED
             except asyncio.TimeoutError:
+                chain.append("timeout")
                 status = PacketStatus.TIMEOUT
 
             # Step D: Send suffix packets verbatim
@@ -1889,6 +1930,17 @@ class MutationEngine:
                     await writer.wait_closed()
                 except Exception:
                     pass
+
+            # Task B: log the full response chain — [greeting, *prefix, target].
+            # Reveals whether auth (e.g. FTP 230) completes BEFORE the mutated
+            # target, i.e. whether the target is fuzzed post-auth. Diagnoses the
+            # "stuck at 220" class of bugs; sample-logged to avoid spam.
+            if self._seq_log_counter % 50 == 0:  # log ~2% of sequences
+                log.info(
+                    f"SEQ {target.sequence_id[:8]} chain={chain} "
+                    f"target_idx={target.target_index} status={status.value}"
+                )
+            self._seq_log_counter += 1
 
         # Backward compat — crash_monitor reads this (only mutated target)
         self._last_injected_packet = mutated_payload
