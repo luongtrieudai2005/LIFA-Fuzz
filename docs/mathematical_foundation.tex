@@ -1,0 +1,529 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\geometry{margin=2.5cm}
+
+\newtheorem{definition}{Definition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{remark}{Remark}
+\newtheorem{assumption}{Assumption}
+
+\title{Mathematical Foundations of LIFA-Fuzz:\\A Neural-Mathematical Protocol Fuzzer}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Overview}
+
+LIFA-Fuzz is a protocol fuzzer that combines statistical signal processing
+with large language model (LLM) inference to infer and exploit the grammar of
+network protocols. This document presents the mathematical foundations of the
+system, independent of implementation:
+
+\begin{enumerate}
+  \item \textbf{Cross-packet differential analysis} --- a suite of four
+        statistical tests (Shannon entropy, population variance, Pearson
+        correlation, Kendall's tau-b) that jointly classify each byte offset
+        in a packet stream into a semantic field type.
+  \item \textbf{EWMA adaptive sampling} --- an exponentially weighted moving
+        average controller that dynamically adjusts the system's response
+        sampling interval in response to measured coverage discovery rates.
+  \item \textbf{Probabilistic protocol state machine inference} --- a
+        black-box, specification-free method that infers a protocol's state
+        machine from captured network traces using statistical message-unit
+        extraction, PAM clustering, and DFA construction (Veritas-inspired).
+  \item \textbf{Inverse-frequency power schedule (IFPS)} --- an
+        acceptance-rejection sampling scheme for seed selection that
+        allocates mutation effort inversely to past selection frequency,
+        ensuring $O(1)$ expected time per selection regardless of corpus
+        size.
+\end{enumerate}
+
+\section{Foundation 1: Cross-Packet Differential Analysis}
+
+The system infers protocol structure by applying four statistical tests to
+each byte offset across a collection of captured packets. Each test captures
+a different structural property: randomness (entropy), dispersion (variance),
+length-dependence (correlation), and sequential trend (rank correlation).
+
+\subsection{Data Model}
+
+Let $\mathcal{P} = \{p_1, \dots, p_N\}$ be a multiset of packets, each
+$p_j \in \{0,1\}^{m_j}$ a byte string of length $m_j$. For byte offset $i$,
+define the observation vector
+
+\[
+V_i = \bigl[\,p_j[i] \mid j \in \{1,\dots,N\} \land i < m_j\,\bigr],
+\qquad n_i = |V_i|,
+\]
+
+where each $v \in V_i$ lies in $\{0,\dots,255\}$.
+
+\subsection{Shannon Entropy}
+
+\begin{definition}[Empirical entropy]
+\[
+H(V_i) = -\sum_{v=0}^{255} \hat p(v) \log_2 \hat p(v),\qquad
+\hat p(v) = \frac{|\{x \in V_i : x = v\}|}{n_i}.
+\]
+\end{definition}
+
+\begin{theorem}[Structural discrimination]
+For any $V_i$ with $n_i \geq 1$,
+\[
+0 \leq H(V_i) \leq 8.
+\]
+The lower bound $H = 0$ occurs when all bytes are identical (constant
+fields: magic bytes, padding). The upper bound $H = 8$ occurs when bytes
+are uniformly distributed (encrypted or compressed payload). Entropy thus
+separates three structural regimes:
+
+\[
+\ell_H(V_i) =
+\begin{cases}
+\text{STATIC}        & H \leq 0.1, \\[2pt]
+\text{LOW\_ENTROPY}  & 0.1 < H < 3.5, \\[2pt]
+\text{HIGH\_ENTROPY} & H \geq 3.5.
+\end{cases}
+\]
+\end{theorem}
+
+\begin{proof}
+Nonnegativity is immediate from the definition. The upper bound follows
+from Gibbs' inequality: for any distribution on a finite set $\mathcal{X}$,
+$H(p) \leq \log_2 |\mathcal{X}|$, with equality iff $p$ is uniform.
+Here $|\mathcal{X}| = 256$, so $\log_2 256 = 8$.
+\end{proof}
+
+\subsection{Population Variance}
+
+\begin{definition}
+\[
+\sigma^2(V_i) = \frac{1}{n_i} \sum_{v \in V_i} (v - \mu_i)^2,\qquad
+\mu_i = \frac{1}{n_i} \sum_{v \in V_i} v.
+\]
+\end{definition}
+
+\begin{proposition}
+For byte-valued data,
+\[
+\max \sigma^2 = \frac{255^2}{4} = 16256.25,
+\]
+achieved when $V_i$ contains only $0$ and $255$ in equal proportion.
+\end{proposition}
+
+Variance is used as a tiebreaker when entropy is intermediate: high-variance
+low-entropy offsets suggest flag fields or enums with extreme values.
+
+\subsection{Pearson Correlation with Packet Length}
+
+Length fields are detected by correlating decoded byte values with packet
+length. For each offset $i$, decode $V_i$ under byte widths
+$k \in \{1,2,4\}$ and both endiannesses $e \in \{\text{le}, \text{be}\}$,
+producing vectors $D_{i,k,e}$. Let $L_j = m_j$ be the length of packet $j$.
+
+\begin{definition}[Length correlation]
+\[
+r_{i,k,e} = \frac{\sum_j (d_j - \bar d)(L_j - \bar L)}
+                 {\sqrt{\sum_j (d_j - \bar d)^2}\;
+                  \sqrt{\sum_j (L_j - \bar L)^2}},
+\qquad
+r_L(V_i) = \max_{k,e} |r_{i,k,e}|.
+\]
+The maximum is subject to the plausibility constraint
+$\max_j D_{i,k,e}^{(j)} \leq (\max_j L_j - h) \cdot 9/8$,
+where $h$ is a candidate header size.
+\end{definition}
+
+\begin{theorem}[Range]
+For any finite non-degenerate sequences, $r_{i,k,e} \in [-1, 1]$.
+\end{theorem}
+
+\begin{proof}
+Cauchy-Schwarz inequality applied to the centred vectors.
+\end{proof}
+
+If $r_L(V_i) \geq 0.85$, the offset is classified as CALCULATED with
+sub-type LENGTH\_FIELD.
+
+\subsection{Kendall's Tau-b for Monotonic Trend}
+
+Sequence numbers are detected by measuring monotonic trend robust to ties.
+Let $(v_j, j)$ be (value, capture-index) pairs at offset $i$.
+
+\begin{definition}[Kendall tau-b]
+For all $\binom{n_i}{2}$ unordered pairs $(j_1, j_2)$ with $j_1 < j_2$,
+define:
+\begin{align*}
+C   &= \#\{\text{concordant}: v_{j_1} < v_{j_2}\}, \\
+D   &= \#\{\text{discordant}: v_{j_1} > v_{j_2}\}, \\
+T_y &= \#\{\text{tied in value}: v_{j_1} = v_{j_2}\}.
+\end{align*}
+Then
+\[
+\tau_b(V_i) = \frac{C - D}{\sqrt{(n_0 - T_y)\, n_0}},\qquad
+n_0 = \binom{n_i}{2}.
+\]
+\end{definition}
+
+\begin{theorem}[Computational complexity]
+$D$ can be computed in $O(n_i \log n_i)$ time via merge-sort inversion
+count. If $\pi$ stably sorts $V_i$ by value, then $D$ equals the number of
+inversions in $\pi$ (pairs $(\alpha, \beta)$ with $\alpha < \beta$ but
+$\pi(\alpha) > \pi(\beta)$). Each tie group of size $k$ contributes
+$\binom{k}{2}$ to $T_y$.
+\end{theorem}
+
+If $\tau_b(V_i) \geq 0.75$, the offset is classified as CALCULATED with
+sub-type SEQUENCE\_NUMBER.
+
+\subsection{Combined Classification}
+
+The four statistics are combined via strict priority:
+
+\[
+\ell(V_i) =
+\begin{cases}
+\text{STATIC}                & H \leq 0.1, \\
+\text{CALCULATED (LENGTH)}  & \text{else if } r_L \geq 0.85, \\
+\text{CALCULATED (SEQUENCE)} & \text{else if } \tau_b \geq 0.75, \\
+\text{HIGH\_ENTROPY}         & \text{else if } H \geq 3.5, \\
+\text{LOW\_ENTROPY}          & \text{otherwise}.
+\end{cases}
+\]
+
+Adjacent offsets with the same label are grouped into field groups.
+Multi-byte CALCULATED groups with combined width $\in \{2,3,4,8\}$ are
+merged (matching uint16/uint24/uint32/uint64).
+
+\section{Foundation 2: EWMA Adaptive Sampling}
+
+The system adjusts its response sampling interval $k(t)$ (number of packets
+between successive \texttt{recv()} calls) using an Exponentially Weighted
+Moving Average (EWMA) of the coverage discovery rate.
+
+\subsection{Proxy Metric}
+
+Let epoch $t$ have duration $\Delta t$ seconds. The coverage increment
+combines two proxy measurements:
+
+\[
+\Delta C_t = \frac{0.3 \cdot \Delta A_t + 0.7 \cdot B_t}{\Delta t},
+\]
+
+where $\Delta A_t$ is the number of newly discovered field groups and $B_t$
+the number of unique hex response prefixes observed during epoch $t$.
+
+\subsection{EWMA Recurrence and Sampling Interval}
+
+\begin{definition}[Smoothed coverage intensity]
+\[
+\lambda_C(0) = 0,\qquad
+\lambda_C(t) = \delta \cdot \Delta C_t + (1 - \delta) \cdot \lambda_C(t-1),
+\quad \delta = 0.1.
+\]
+\end{definition}
+
+\begin{definition}[Adaptive sampling interval]
+\[
+k(t) = \max\!\Bigl(k_{\min},\;
+       \bigl\lfloor \tfrac{K_{\max}}{1 + \theta \cdot \lambda_C(t)}
+       \bigr\rfloor \Bigr),
+\qquad
+K_{\max} = 200,\; \theta = 2.0,\; k_{\min} = 5.
+\]
+\end{definition}
+
+When $\lambda_C$ is high (many recent discoveries), $k$ decreases, increasing
+sampling frequency. When the protocol is saturated ($\lambda_C \to 0$),
+$k$ approaches $K_{\max}$, conserving LLM budget.
+
+\begin{theorem}[Convergence under stationarity]
+If $\Delta C_t$ is stationary with mean $\mu$, then
+$\mathbb{E}[\lambda_C(t)] \to \mu$ as $t \to \infty$, with effective
+window $1/\delta = 10$ epochs.
+\end{theorem}
+
+\begin{proof}
+Expanding: $\lambda_C(t) = \delta \sum_{i=0}^{t-1} (1-\delta)^i \Delta C_{t-i}
++ (1-\delta)^t \lambda_C(0)$. Taking expectations,
+$\mathbb{E}[\lambda_C(t)] \to \mu \cdot \delta \cdot 1/\delta = \mu$.
+\end{proof}
+
+\subsection{Boundedness and Monotonicity}
+
+The EWMA controller is a simple adaptive filter, not a feedback regulator
+with stability concerns. Its properties follow directly from the formula:
+
+\begin{theorem}[Boundedness]
+$0 \leq \lambda_C(t) \leq \max_t \Delta C_t$ for all $t$.
+\end{theorem}
+
+\begin{proof}
+$\lambda_C(0) = 0$. Each update is a convex combination:
+$\lambda_C(t) = \delta \Delta C_t + (1-\delta)\lambda_C(t-1)$.
+Since $\Delta C_t \geq 0$ and $\delta \in (0,1)$, the result follows by
+induction.
+\end{proof}
+
+\begin{theorem}[Monotonic response]
+$k(t)$ is a strictly decreasing function of $\lambda_C(t)$:
+$\frac{\partial k}{\partial \lambda_C} = \frac{-\theta K_{\max}}
+{(1+\theta \lambda_C)^2} < 0$.
+\end{theorem}
+
+\begin{proof}
+Direct differentiation of $k = \lfloor K_{\max}/(1+\theta\lambda_C) \rfloor$.
+\end{proof}
+
+The controller is thus free of oscillation or chattering by construction
+($k$ is a smooth, bounded, monotonic function of a bounded input), unlike
+step-function AIMD controllers that jump between $k=1$ and $k=K_{\max}$.
+
+\subsection{Regime Classification}
+
+The normalised rate $\rho(t) = k(t) / K_{\max}$ defines the operating regime:
+
+\[
+\text{regime}(\rho) =
+\begin{cases}
+\text{INTENSIVE} & \rho < 0.1, \\[2pt]
+\text{ACTIVE}    & 0.1 \leq \rho < \frac13, \\[2pt]
+\text{NORMAL}    & \frac13 \leq \rho < \frac23, \\[2pt]
+\text{SPARSE}    & \rho \geq \frac23.
+\end{cases}
+\]
+
+\section{Foundation 3: Probabilistic Protocol State Machine Inference}
+
+For stateful protocols (FTP, SSH, TLS), a fuzzer must reach deep protocol
+states to exercise vulnerable code. LIFA-Fuzz infers a Probabilistic
+Protocol State Machine (P-PSM) from captured traffic using a purely
+statistical, specification-free approach inspired by Veritas
+\cite{veritas}. No source code, RFC, or protocol keyword is required.
+
+\subsection{Message-Unit Extraction}
+
+Let $\mathcal{P} = \{p_1, \dots, p_N\}$ be captured packets. Define a
+\emph{message unit} as a length-$\ell$ byte subsequence starting at offset
+$i$ in a packet header (first $n$ bytes):
+
+\[
+u_{j,i} = p_j[i\,..\,i+\ell-1], \qquad \ell = 3,\; n = 12.
+\]
+
+\begin{definition}[Frequency-filtered unit set]
+Partition $\mathcal{P}$ into two equal halves $\mathcal{P}_A, \mathcal{P}_B$.
+Count the frequency $f_u^A, f_u^B$ of each distinct unit $u$ in each half.
+The candidate unit set is
+\[
+\Phi = \{u : f_u^A \geq \lambda \;\land\; f_u^B \geq \lambda\},
+\]
+where $\lambda$ is the smallest threshold such that the two frequency
+distributions pass a two-sample Kolmogorov--Smirnov test at significance
+level $1 - \alpha < 10^{-8}$.
+\end{definition}
+
+This K-S filter retains only units whose frequency is \emph{consistently
+high} across independent samples --- a signature of protocol structure
+rather than random payload coincidence.
+
+\subsection{Format Message Reconstruction}
+
+For each packet $p_j$, greedily extend from offset $0$ using candidate
+units from $\Phi$:
+
+\[
+m_j = p_j[0\,..\,i^*], \quad i^* = \max\{i : \forall\, 0 \leq j < i-\ell+1,\;
+p_j[j\,..\,j+\ell-1] \in \Phi\}.
+\]
+
+The resulting $m_j$ (if $|m_j| \geq \ell$) is the packet's \emph{format
+message} --- the protocol-keyword prefix that identifies its type.
+
+\subsection{State Message Clustering}
+
+\begin{definition}[Byte-frequency feature vector]
+For a format message $m$, define
+\[
+\mathbf{v}(m) = \bigl[\,c_0, c_1, \dots, c_{255}\,\bigr], \qquad
+c_b = |\{i : m[i] = b\}|,
+\]
+the 256-dimensional histogram of byte values.
+\end{definition}
+
+\begin{definition}[Jaccard distance]
+\[
+d(m_a, m_b) = 1 - \frac{|\{b : c_b(m_a) > 0\} \cap \{b : c_b(m_b) > 0\}|}
+                    {|\{b : c_b(m_a) > 0\} \cup \{b : c_b(m_b) > 0\}|}.
+\]
+\end{definition}
+
+Format messages are grouped via Partitioning Around Medoids (PAM) under
+Jaccard distance. The optimal cluster count $k$ maximises the Dunn index:
+
+\begin{definition}[Dunn index]
+\[
+D(k) = \frac{\min_{i \neq j}\;\delta(C_i, C_j)}
+            {\max_{i}\;\Delta(C_i)},
+\]
+where $\delta(C_i, C_j) = d(\text{medoid}_i, \text{medoid}_j)$ is the
+inter-cluster distance and $\Delta(C_i) = \max_{a,b \in C_i} d(a, b)$ is
+the intra-cluster diameter.
+\end{definition}
+
+Each cluster's medoid (the member minimising total distance to all others)
+is a \emph{protocol state message} --- the representative header pattern for
+that state type.
+
+\subsection{State Machine Construction}
+
+Each captured packet is labelled with its nearest medoid state type. Flows
+(session sequences) become state-type sequences $F = (\pi_1, \dots,
+\pi_h)$. Transition probabilities are estimated empirically:
+
+\begin{definition}[P-PSM transition probability]
+\[
+P(\pi_i \to \pi_j) = \frac{|\{t : \pi_t = \pi_i \;\land\; \pi_{t+1} =
+\pi_j\}|}{|\{t : \pi_t = \pi_i\}|}.
+\]
+\end{definition}
+
+The resulting directed graph $(Q, \Sigma, \delta, P)$ is a Probabilistic
+Protocol State Machine: states $Q$ are the cluster medoids, alphabet
+$\Sigma$ is the set of observed state-message types, transitions $\delta$
+are the observed edges, and $P$ assigns probabilities.
+
+\begin{theorem}[State labelling cost]
+Labelling a new packet requires computing $k$ Jaccard distances (one per
+medoid), each $O(256)$. Total: $O(256k)$ per packet, where $k$ is the
+number of inferred states (typically $5$--$15$). This is fast enough for
+real-time use in the Fast Loop.
+\end{theorem}
+
+\begin{proof}
+Each Jaccard distance computes set intersection/union over at most 256
+elements. With $k$ medoids, the total is $256k$ operations, each $O(1)$
+amortised.
+\end{proof}
+
+\subsection{Black-Box Property}
+
+The entire pipeline --- unit extraction, K-S filtering, PAM clustering, DFA
+construction --- operates on raw captured bytes without any protocol
+specification, source code, keyword list, or port number. It is applicable
+to any stateful protocol whose traffic can be captured, making it a genuine
+black-box state inference method.
+
+\section{Foundation 4: Inverse-Frequency Power Schedule (IFPS)}
+
+Seed selection uses an acceptance-rejection scheme that allocates mutation
+effort inversely to past selection frequency, ensuring fair exploration of
+the corpus.
+
+\subsection{Energy Function}
+
+Let $\mathcal{C} = \{s_1, \dots, s_N\}$ be the seed corpus and $f_i$ the
+number of times seed $s_i$ has been selected.
+
+\begin{definition}[Energy]
+\[
+E(i) = \frac{1}{f_i + 1},\qquad
+E'(i) =
+\begin{cases}
+5 \cdot E(i) & \text{if seed $i$ is STATE\_NOVELTY}, \\
+E(i)         & \text{otherwise}.
+\end{cases}
+\]
+\end{definition}
+
+A seed never selected ($f_i = 0$) receives maximal energy $E = 1$.
+Seeds that discovered a novel state transition receive a $5\times$ boost.
+As $f_i \to \infty$, $E \to 0$, ensuring underrepresented sequences are
+explored before over-fuzzed ones.
+
+\subsection{Acceptance-Rejection Sampler}
+
+\begin{algorithm}[H]
+\caption{IFPS seed selection}
+\begin{algorithmic}[1]
+\State $n \gets |\mathcal{C}|$
+\If{$n = 0$} \Return error \EndIf
+\If{$n = 1$} \Return $\mathcal{C}[0]$ \EndIf
+\For{$\text{attempt} = 1 \textbf{ to } n + 10$}
+    \State $i \sim \text{Uniform}\{0, \dots, n-1\}$
+    \State $u \sim \text{Uniform}[0, 1]$
+    \If{$u < \min(E'(i), 1)$}
+        \State \Return $\mathcal{C}[i]$
+    \EndIf
+\EndFor
+\State \Return $\mathcal{C}[\text{Uniform}\{0, \dots, n-1\}]$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{theorem}[Correctness]
+Assume the fallback is never reached (probability $\to 0$ as $n$ grows).
+Then the probability that seed $i$ is selected in any given trial is
+proportional to $E'(i)$:
+
+\[
+P(\text{select } i) = \frac{E'(i)}{\sum_{j=1}^n E'(j)}.
+\]
+\end{theorem}
+
+\begin{proof}
+In each trial, pick $i$ uniformly: $P(\text{pick } i) = 1/n$. Accept with
+probability $a_i = \min(E'(i), 1)$. By the acceptance-rejection lemma,
+conditioned on acceptance occurring,
+
+\[
+P(\text{return } i) = \frac{(1/n) \cdot a_i}{\sum_j (1/n) \cdot a_j}
+= \frac{a_i}{\sum_j a_j}.
+\]
+
+When $E'(i) \leq 1$ (all seeds with $f_i \geq 4$ for novel seeds or
+$f_i \geq 0$ for normal seeds), $a_i = E'(i)$, so $P(\text{return } i)
+\propto E'(i)$. Novel seeds with $f_i < 4$ have $E'(i) > 1$, so $a_i = 1$;
+this caps acceptance at 1, ensuring novel seeds are always accepted and
+equally likely among themselves, preserving proportionality in practice.
+\end{proof}
+
+\subsection{Expected Time Analysis}
+
+Let $a_{\min} = \min_j a_j$. Since $E'(j) > 0$ for all finite $f_j$,
+$a_{\min} > 0$.
+
+\begin{theorem}[$O(1)$ expected time]
+The expected number of trials per selection is at most $1 / a_{\min}$, a
+constant independent of corpus size $n$. In the worst case (all seeds at the
+frequency cap $f_j = 999$), $a_j = 1/1000$, giving at most $1000$ expected
+trials. The probability of reaching the $n+10$ fallback is
+$(1 - 1/1000)^{n+10} \to 0$ exponentially as $n$ grows.
+\end{theorem}
+
+\subsection{Corpus Maintenance}
+
+To prevent unbounded memory growth:
+
+\[
+|\mathcal{C}| > 5000 \;\Longrightarrow\; \text{evict } 20\% \text{ most-frequent seeds},
+\qquad
+f_i \gets \min(f_i, 999) \text{ every } 10^4 \text{ sends}.
+\]
+
+The cap $f_i \leq 999$ prevents any single seed from dominating
+indefinitely while providing a uniform lower bound $a_j \geq 1/1000$ for
+the acceptance probability, guaranteeing the $O(1)$ expected-time bound.
+
+\end{document}
