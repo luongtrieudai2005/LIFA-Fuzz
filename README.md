@@ -22,67 +22,56 @@ All without source code, RFCs, or protocol-specific knowledge in the core engine
 <img width="1516" height="1038" alt="image" src="https://github.com/user-attachments/assets/022f1808-1002-44a4-99f5-db7dbda727d5" />
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ Block 1: Sandbox (Firecracker MicroVM)                      │
-│   LightFTP (ASAN-instrumented) + FTP Client                  │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ captured traffic (JSONL)
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│ Block 2: Fast Loop (asyncio, ~50-70 EPS stateful)           │
-│                                                               │
-│  SeedFeeder ──▶ FuzzTarget ⟨Prefix, Target, Suffix⟩         │
-│       │                 │                                      │
-│  ProtocolModule     MutationEngine                             │
-│  (NullModule =      ├─ 15 generic operators (BINARY_ONLY)    │
-│   pure black-box,   ├─ 4 FTP operators (FTPModule, opt-in)   │
-│   or FTPModule =    ├─ Stateful sequence replay (1 TCP conn) │
-│   case-study)       ├─ Greeting drain (aligns responses)     │
-│                      └─ StateTracker (InferredStateTracker    │
-│                         or FTPStateTracker)                   │
-│                                                               │
-│  CrashMonitor ── CrashManager (SHA256 + structural dedup)    │
-│       └── Phase 2: replay prefix+target on clean target      │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ traffic log (JSONL)
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│ Block 3: Slow Loop (separate process, ~1 inference/min)      │
-│                                                               │
-│  DifferentialAnalyzer    StateMachineInferer                  │
-│  (Shannon H, Pearson r,  (Veritas P-PSM:                     │
-│   Kendall τ per offset)   K-S filter + PAM + DFA)            │
-│       │                        │                              │
-│       ▼                        ▼                              │
-│  LLMAgent ←──── math_hint + state_hint ──┘                   │
-│  (GLM-5-Turbo REAL,                                           │
-│   self-consistency N=5)                                       │
-│       │                                                        │
-│       ▼                                                        │
-│  RulesOrchestrator ──▶ SemanticRules ──▶ Fast Loop           │
-│                                                               │
-│  EWMA Controller ──▶ adaptive_k.json ──▶ Fast Loop           │
-└─────────────────────────────────────────────────────────────┘
+Block 1: Sandbox (Firecracker MicroVM)
+  Target server (ASAN-instrumented) + honest client
+        |
+        | captured traffic (JSONL)
+        v
+Block 2: Fast Loop (asyncio, ~50-70 EPS stateful)
+  SeedFeeder -> FuzzTarget (Prefix, Target, Suffix)
+      |
+      +-- ProtocolModule (NullModule = pure black-box default)
+      +-- MutationEngine
+      |     +-- 15 generic operators (BINARY_ONLY)
+      |     +-- Stateful sequence replay (1 TCP connection)
+      |     +-- Greeting drain (aligns request-response)
+      |     +-- StateTracker (P-PSM inferred or protocol-specific)
+      |
+      +-- CrashMonitor -> CrashManager (SHA256 + structural dedup)
+            +-- Phase 2: replay prefix+target on clean target
+        |
+        | traffic log (JSONL)
+        v
+Block 3: Slow Loop (separate process, ~1 inference/min)
+  DifferentialAnalyzer (entropy, Pearson, Kendall)
+  StateMachineInferer (Veritas P-PSM: K-S filter + PAM + DFA)
+      |
+      v
+  LLMAgent (math_hint + state_hint -> grammar inference)
+      |
+      v
+  RulesOrchestrator -> SemanticRules -> Fast Loop
+  EWMA Controller -> adaptive_k.json -> Fast Loop
 
 IPC: file-based (JSON/JSONL), atomic rename-swap, zero blocking
 ```
 
 ### ProtocolModule: Black-Box Core + Opt-In Modules
 
-The Fast Loop core contains **zero hardcoded protocol knowledge**. All protocol-specific logic (FTP status codes, CRLF framing, command extraction) lives in pluggable `ProtocolModule` subclasses:
+The Fast Loop core contains **zero hardcoded protocol knowledge**. All protocol-specific logic lives in pluggable `ProtocolModule` subclasses:
 
 - **`NullModule`** (default) — pure black-box: any reply = ACCEPTED, no framing, no state tracking. Relies on P-PSM (inferred) for state.
-- **`FTPModule`** (opt-in, disclosed case-study) — FTP status code parsing, CRLF enforcement, FTP state tracker, 4 FTP mutation operators.
+- **Protocol-specific modules** (opt-in, disclosed case-study) — status code parsing, framing, protocol state tracker, protocol mutation operators.
 
 **For unknown protocols:** `NullModule` + inferred P-PSM = automatic state tracking without any protocol knowledge. This is the generality claim.
 
 ### Stateful Sequence Replay
 
-LIFA-Fuzz captures real client traffic (e.g. FTP USER→PASS→SYST→...) and groups packets by session ID into `SeedSequence` objects. The mutation engine:
+LIFA-Fuzz captures real client traffic and groups packets by session ID into `SeedSequence` objects. The mutation engine:
 
 1. Splits each sequence into **Prefix** (verbatim, establishes state) + **Target** (fuzzed) + **Suffix**.
 2. Opens **one TCP connection**, drains the server greeting, replays the prefix, then sends the mutated target.
-3. Reads and classifies the full response chain `[220, 331, 230, 215, 257, 200, 501]`.
+3. Reads and classifies the full response chain.
 
 This solves the **stateful reachability problem**: the fuzzer authenticates and reaches post-auth code where vulnerabilities live. Without this, mutations only hit the greeting (pre-auth) and never trigger deep bugs.
 
@@ -165,27 +154,16 @@ python3 scripts/rq1_real.py --protocol ftp --self-consistent
 Recent smoke test (2 min, baselines A/B/C on LightFTP/Firecracker):
 
 ```
-SEQ chain examples (auth → post-auth → fuzzed command):
-  [220, 331, 230, 215, 257, 200, 550, 550, 550, 501]  ← 10-state deep
-  [220, 331, 230, 215, 257, 200, 501]                    ← 7-state
-  [220, 331, 500]                                         ← auth failed
+SEQ chain examples (auth -> post-auth -> fuzzed command):
+  [220, 331, 230, 215, 257, 200, 550, 550, 550, 501]  <- 10-state deep
+  [220, 331, 230, 215, 257, 200, 501]                    <- 7-state
+  [220, 331, 500]                                         <- auth failed
 
-Auth rate:    98%  (98/100 chains reach 230 = logged in)
-State depth:  83%  reach depth 5+ (PWD, TYPE, LIST)
+Auth rate:    98%  (98/100 chains reach logged-in state)
+State depth:  83%  reach depth 5+ (deep protocol states)
 Target:       65%  fuzz post-auth commands (idx 5-8)
 Server:       57%  ACCEPTED mutated commands (deep processing)
 ```
-
----
-
-## Mathematical Foundations
-
-Four foundations, all backed by code (`docs/mathematical_foundation.tex`):
-
-1. **Cross-Packet Differential Analysis** — Shannon entropy (0 ≤ H ≤ 8), Pearson correlation (|r| ≤ 1), Kendall τ-b, variance. Combined priority classification → field groups.
-2. **EWMA Adaptive Sampling** — `k = ⌊K_max / (1 + θ·λ_C)⌋`. Bounded (convex combination), monotonic (strictly decreasing). No Lyapunov (removed — over-dressed, proved obvious properties).
-3. **P-PSM Inference** (Veritas-inspired) — K-S two-sample test (pure Python), PAM + Jaccard + Dunn index, DFA transitions (0.005 threshold). Pure black-box.
-4. **IFPS Seed Scheduling** — Inverse-frequency acceptance-rejection, energy E = 1/(f+1), O(1) expected time.
 
 ---
 
