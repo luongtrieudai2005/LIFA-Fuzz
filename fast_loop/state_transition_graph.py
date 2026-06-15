@@ -142,7 +142,7 @@ class StateTransitionGraph:
         self,
         prev_code: str,
         command: str,
-        new_code: str,
+        new_state_raw,
         sequence_id: str = "",
     ) -> bool:
         """Record a state transition edge.
@@ -156,14 +156,21 @@ class StateTransitionGraph:
               that sequence_id as a novel seed for IFPS priority boost.
 
         Args:
-            prev_code:    FTP status code before this command.
-            command:      FTP command keyword (from extract_ftp_command).
-            new_code:     FTP status code after this command.
-            sequence_id:  SeedSequence ID (for novelty tracking).
+            prev_code:      FTP status code before this command.
+            command:        FTP command keyword (from extract_ftp_command).
+            new_state_raw:  Raw response bytes (or str code). FTP code is
+                            extracted from bytes[:3] for backward compat.
+            sequence_id:    SeedSequence ID (for novelty tracking).
 
         Returns:
             True if this is a new edge, False if already known.
         """
+        # Extract FTP status code from raw response bytes (or accept str).
+        if isinstance(new_state_raw, bytes):
+            new_code = new_state_raw[:3].decode("ascii", errors="replace") if len(new_state_raw) >= 3 else "000"
+        else:
+            new_code = str(new_state_raw)
+
         self._total_edge_records += 1
         self._states.add(prev_code)
         self._states.add(new_code)

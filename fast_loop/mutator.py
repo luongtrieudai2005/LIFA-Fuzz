@@ -1608,12 +1608,14 @@ class MutationEngine:
                 if resp:
                     status = self._classify_response(resp, payload)
                     self._record_response_sample(resp)
-                    # State-transition tracking — module-owned (FTPModule →
-                    # FTP STG; NullModule → None, skipped = pure black-box).
+                    # State-transition tracking — pass RAW RESPONSE BYTES so
+                    # both FTPStateTracker (extracts code from bytes[:3]) and
+                    # InferredStateTracker (label_packet on full bytes) work.
+                    # Previously passed new_code (module-extracted) which was ""
+                    # for NullModule → label_packet("") → None → tracker DEAD.
                     if self._state_tracker is not None:
-                        new_code = self._module.extract_state_code(resp)
                         cmd = self._module.extract_command(payload)
-                        self._state_tracker.record_edge("220", cmd, new_code, seed_id)
+                        self._state_tracker.record_edge("220", cmd, resp, seed_id)
                 else:
                     status = PacketStatus.REJECTED
             except asyncio.TimeoutError:
@@ -1829,11 +1831,11 @@ class MutationEngine:
                             if self._module is not None else ""
                         )
                         chain.append(new_code)  # diagnostic
-                        # State-transition tracking — module-owned.
+                        # State-transition tracking — pass RAW RESPONSE BYTES.
                         if self._state_tracker is not None:
                             cmd = self._module.extract_command(pkt_bytes)
                             self._state_tracker.record_edge(
-                                prev_code, cmd, new_code, target.sequence_id
+                                prev_code, cmd, resp, target.sequence_id
                             )
                             prev_code = new_code
                     else:
@@ -1858,13 +1860,13 @@ class MutationEngine:
                         if self._module is not None else ""
                     )
                     chain.append(t_code)  # diagnostic: target's response code
-                    # State-transition tracking for mutated target — module-owned.
+                    # State-transition tracking — pass RAW RESPONSE BYTES.
                     if self._state_tracker is not None:
                         cmd = self._module.extract_command(
                             mutated_payload
                         )
                         is_novel = self._state_tracker.record_edge(
-                            prev_code, cmd, t_code, target.sequence_id
+                            prev_code, cmd, resp, target.sequence_id
                         )
                         if is_novel:
                             log.info(
