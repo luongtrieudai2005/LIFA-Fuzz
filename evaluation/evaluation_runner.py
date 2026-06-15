@@ -419,31 +419,15 @@ async def run_single_baseline(
                     raw_data=seed_data,
                 ))
         elif target == "lightftp":
-            from shared.schemas import Direction, TrafficRecord
-            # Inject FTP protocol seeds — cover authentication + data commands
-            ftp_seeds = [
-                b"USER admin\r\n",
-                b"PASS admin\r\n",
-                b"USER anonymous\r\n",
-                b"PASS guest@\r\n",
-                b"SYST\r\n",
-                b"PWD\r\n",
-                b"TYPE I\r\n",
-                b"MKD testdir\r\n",
-                b"CWD testdir\r\n",
-                b"LIST\r\n",
-                b"NOOP\r\n",
-                b"QUIT\r\n",
-                b"DELE testfile.txt\r\n",
-                b"SIZE testfile.txt\r\n",
-                b"FEAT\r\n",
-                b"REST 0\r\n",
-            ]
-            for seed_data in ftp_seeds:
-                await seed_queue.put(TrafficRecord(
-                    direction=Direction.CLIENT_TO_SERVER,
-                    raw_data=seed_data,
-                ))
+            # BLACK-BOX: do NOT inject hardcoded FTP seeds. The state oracle is
+            # the REAL client (ftp_client.py) whose traffic the Interceptor
+            # captures → the SeedFeeder groups it into multi-packet sessions →
+            # _execute_sequence replays the prefix (auth) + fuzzes the target.
+            # Injecting "USER admin"/"PASS admin" here would hardcode protocol
+            # knowledge (the very black-box violation we refactored out).
+            # If the corpus ends up single-packet-dominated, the fix is in the
+            # FEEDER (real traffic), not here.
+            pass
 
         # Target-specific mutator tuning
         # Firecracker + FTP: need generous timeouts (FTP banner + command
@@ -458,6 +442,13 @@ async def run_single_baseline(
         _protocol_module = _os.environ.get("LIFA_PROTOCOL_MODULE")
         if not _protocol_module:
             _protocol_module = "ftp" if target == "lightftp" else "null"
+        # Register the FTP module so get_protocol_module("ftp") resolves — the
+        # module name is only in the shared registry after fast_loop.ftp_module
+        # is imported (its register_protocol_module call runs at import). Without
+        # this, "ftp" silently fell back to NullModule → extract_state_code
+        # returned "" → SEQ chains all empty → no state tracking → blind.
+        if _protocol_module == "ftp":
+            import fast_loop.ftp_module  # noqa: F401 (registers "ftp")
 
         mutator = MutationEngine(
             target_host=target_host,
@@ -511,12 +502,23 @@ async def run_single_baseline(
         background_tasks.append(mutation_task)
 
         # ── 6b. Seed Feeder ──────────────────────────────────────
-        from shared.schemas import Direction, TrafficRecord
+        from shared.schemas import Direction, TrafficRecord, SeedSequence
 
         async def _feed_seed_queue() -> None:
-            """Read JSONL traffic log and push C2S seeds into the mutator queue."""
+            """Read JSONL traffic log and push C2S seeds into the mutator queue.
+
+            Groups C2S packets by session_id into multi-packet SeedSequence
+            (ported from main.py). WITHOUT grouping, each packet becomes a
+            single-packet seed → the mutator fuzzes each on a fresh connection
+            (no prefix, no state setup) → stateful protocols (FTP auth) never
+            reached → "stuck at greeting". Grouping makes the real client
+            traffic the state oracle (black-box: no protocol knowledge here).
+            """
             last_pos = 0
             import json as _json
+            import time as _time
+            session_buffers: dict[str, dict] = {}
+            session_timeout = 2.0  # s — flush a session after this idle gap
             while True:
                 try:
                     p = Path(traffic_log)
@@ -525,6 +527,7 @@ async def run_single_baseline(
                         continue
                     with open(p) as f:
                         lines = f.readlines()
+                    now = _time.time()
                     for line in lines[last_pos:]:
                         line = line.strip()
                         if not line:
@@ -538,15 +541,30 @@ async def run_single_baseline(
                             and not rec.get("is_mutated")
                         ):
                             raw_hex = rec.get("payload", rec.get("raw_hex", ""))
-                            # FIX: accept all non-empty payloads (>= 2 hex chars
-                            # = 1 byte). Short packets like ACKs and status bytes
-                            # are legitimate protocol messages. Matches main.py.
                             if raw_hex and len(raw_hex) >= 2:
+                                sid = rec.get("session_id", "")
                                 tr = TrafficRecord(
                                     direction=Direction.CLIENT_TO_SERVER,
                                     raw_data=bytes.fromhex(raw_hex),
+                                    session_id=sid,
+                                    timestamp=rec.get("timestamp", now),
                                 )
-                                await seed_queue.put(tr)
+                                if sid:
+                                    buf = session_buffers.setdefault(
+                                        sid, {"packets": [], "last_seen": now})
+                                    buf["packets"].append(tr)
+                                    buf["last_seen"] = now
+                                else:
+                                    await seed_queue.put(SeedSequence(packets=[tr]))
+                    # Flush sessions idle past the timeout → multi-packet seeds.
+                    expired = [
+                        sid for sid, buf in session_buffers.items()
+                        if now - buf["last_seen"] >= session_timeout and buf["packets"]
+                    ]
+                    for sid in expired:
+                        buf = session_buffers.pop(sid)
+                        await seed_queue.put(
+                            SeedSequence(session_id=sid, packets=buf["packets"]))
                     last_pos = len(lines)
                 except Exception:
                     pass
