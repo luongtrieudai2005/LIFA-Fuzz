@@ -63,7 +63,7 @@ class ProbabilisticStateMachine:
         Returns the state index (0-based), or None if "unknown" (too far from
         all medoids — e.g. a pure-data packet with no protocol header).
         """
-        if not self.medoids or not self.features:
+        if not packet or not self.medoids or not self.features:
             return None
         feat = _byte_frequency_vector(packet[:12])
         best_idx = -1
@@ -182,22 +182,93 @@ def _extract_message_units(packets: list[bytes]) -> Counter:
     return units
 
 
-def _ks_test_filter(units: Counter, alpha: float = 1e-8) -> set[bytes]:
-    """K-S test filter: keep only units whose frequency is statistically
-    significant across two random halves of the packet set.
+def _two_sample_ks_test(freq_a: dict, freq_b: dict, alpha: float = 1e-8) -> bool:
+    """Two-sample Kolmogorov-Smirnov test (pure Python, no scipy).
 
-    Simplified Veritas K-S: partition packets into two halves, count unit
-    frequencies in each, keep units appearing in BOTH halves with consistent
-    frequency ratio (within 20%). This approximates the K-S "same distribution"
-    test without scipy.
+    Tests whether two empirical frequency distributions are drawn from the
+    same underlying distribution. Returns True if H0 (same distribution)
+    is accepted at significance level alpha.
+
+    The K-S statistic D = max|F_A(x) - F_B(x)| over the empirical CDFs.
+    H0 is rejected if sqrt(n_a*n_b/(n_a+n_b)) * D > K_alpha, where
+    K_alpha satisfies Pr(K <= K_alpha) = 1 - alpha under the Kolmogorov
+    distribution. For alpha = 1e-8, K_alpha ≈ 3.08 (from 2*e^(-2x^2) = alpha).
     """
-    if not units:
-        return set()
-    total = sum(units.values())
-    if total == 0:
-        return set()
-    threshold = max(2, total * 0.001)  # at least 2 occurrences
-    return {u for u, freq in units.items() if freq >= threshold}
+    import math
+    n_a = sum(freq_a.values())
+    n_b = sum(freq_b.values())
+    if n_a == 0 or n_b == 0:
+        return True
+    # Sort all distinct values, compute empirical CDFs, find max D.
+    all_vals = sorted(set(freq_a.keys()) | set(freq_b.keys()))
+    cum_a = 0
+    cum_b = 0
+    d_max = 0.0
+    for v in all_vals:
+        cum_a += freq_a.get(v, 0)
+        cum_b += freq_b.get(v, 0)
+        d = abs(cum_a / n_a - cum_b / n_b)
+        if d > d_max:
+            d_max = d
+    # Critical value: K_alpha / sqrt(n_eff)
+    k_alpha = 3.08  # for alpha = 1e-8
+    n_eff = n_a * n_b / (n_a + n_b)
+    if n_eff == 0:
+        return True
+    d_critical = k_alpha / math.sqrt(n_eff)
+    return d_max <= d_critical
+
+
+def _ks_test_filter(units: Counter, packets: list[bytes],
+                    alpha: float = 1e-8) -> set[bytes]:
+    """Veritas K-S test filter: find the frequency threshold λ such that
+    the two-sample K-S test on the unit frequency distributions of two
+    random packet halves ACCEPTS H0 (same distribution).
+
+    Units with frequency ≥ λ in BOTH halves are candidate protocol units.
+    This retains only units whose frequency is statistically consistent
+    (not random noise), per the Veritas algorithm.
+    """
+    if not units or len(packets) < 4:
+        # Too few packets for splitting — fallback: simple frequency cut.
+        return {u for u, f in units.items() if f >= 2}
+
+    import random as _rng
+    # Split packets into two halves (deterministic for reproducibility).
+    half = len(packets) // 2
+    pkt_a = packets[:half]
+    pkt_b = packets[half:]
+
+    # Count units in each half.
+    freq_a: Counter = Counter()
+    freq_b: Counter = Counter()
+    for pkt in pkt_a:
+        header = pkt[:_HEADER_BYTES]
+        for i in range(len(header) - _MESSAGE_UNIT_LEN + 1):
+            freq_a[header[i:i + _MESSAGE_UNIT_LEN]] += 1
+    for pkt in pkt_b:
+        header = pkt[:_HEADER_BYTES]
+        for i in range(len(header) - _MESSAGE_UNIT_LEN + 1):
+            freq_b[header[i:i + _MESSAGE_UNIT_LEN]] += 1
+
+    # Progressive λ (Veritas): INCREASE from low to high until K-S accepts.
+    # At low λ, noise units create divergent distributions → K-S rejects.
+    # At high λ, only consistent protocol units remain → K-S accepts.
+    all_freqs = sorted(set(freq_a.values()) | set(freq_b.values()))  # ascending
+    best_lambda = max(all_freqs) if all_freqs else 1  # fallback: strictest
+    for lam in all_freqs:
+        filtered_a = {u: f for u, f in freq_a.items() if f >= lam}
+        filtered_b = {u: f for u, f in freq_b.items() if f >= lam}
+        if not filtered_a or not filtered_b:
+            continue
+        if _two_sample_ks_test(filtered_a, filtered_b, alpha):
+            best_lambda = lam
+            break
+
+    # Candidate units: appear ≥ best_lambda in BOTH halves.
+    return {u for u in units
+            if freq_a.get(u, 0) >= best_lambda
+            and freq_b.get(u, 0) >= best_lambda}
 
 
 def _reconstruct_format_messages(
@@ -272,7 +343,10 @@ def _pam_cluster(
         for j in range(n):
             nearest = min(range(k), key=lambda mi: dist[medoids[mi]][j])
             clusters[nearest].append(j)
-        # Try swapping each medoid with each non-medoid
+        # Try swapping each medoid with each non-medoid.
+        # Skip swap phase when k=1 — no alternative medoid to compare.
+        if k < 2:
+            break
         for mi in range(k):
             best_cost = sum(
                 dist[medoids[mi]][j] for j in clusters[mi]
@@ -448,7 +522,7 @@ class StateMachineInferer:
 
         # Step 1: Message format extraction
         units = _extract_message_units(packets)
-        candidate_units = _ks_test_filter(units)
+        candidate_units = _ks_test_filter(units, packets)
         format_msgs = _reconstruct_format_messages(packets, candidate_units)
         if len(format_msgs) < 3:
             log.debug("StateMachineInferer: too few format messages, skipping")

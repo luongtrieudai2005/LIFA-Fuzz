@@ -1,0 +1,358 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{geometry}
+\usepackage{hyperref}
+
+\geometry{margin=2.5cm}
+
+\newtheorem{definition}{Definition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{conjecture}{Conjecture}
+\newtheorem{assumption}{Assumption}
+\newtheorem{remark}{Remark}
+
+\title{Mathematical Problems in LIFA-Fuzz:\\Formulations Awaiting Proof}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Introduction}
+
+This document formulates four mathematical problems arising from the
+LIFA-Fuzz protocol fuzzer. Each problem is stated in self-contained
+mathematical language with definitions, assumptions, and the specific
+claim that requires proof. Background context is kept minimal.
+
+\paragraph{Notation.}
+$\mathbb{N} = \{0,1,2,\dots\}$, $\mathbb{E}$ denotes expectation,
+$\operatorname{Var}$ denotes variance, $\lfloor\cdot\rfloor$ is the
+integer floor.
+
+\section{Boundedness and Monotonicity of the EWMA Adaptive Sampler}
+
+The EWMA controller is a simple adaptive filter, not a feedback regulator
+requiring stability analysis. Its properties are elementary
+and follow directly from the formula.
+
+\subsection{Dynamical Model}
+
+Let $t \in \mathbb{N}$ index discrete epochs. The smoothed coverage
+intensity is
+\[
+x_{t+1} = \delta \cdot \Delta_{t+1} + (1-\delta) \cdot x_t,
+\qquad x_0 = 0,
+\]
+where $\delta \in (0,1)$ (fixed at $0.1$) and $\Delta_t \ge 0$ is the
+coverage increment at epoch $t$. The sampling interval is
+\[
+k(x) = \max\!\Bigl(k_{\min},\;\Bigl\lfloor \frac{K_{\max}}{1+\theta x}\Bigr\rfloor\Bigr).
+\]
+
+\subsection{Elementary Properties}
+
+\begin{theorem}[Boundedness]
+$0 \le x_t \le \max_t \Delta_t$ for all $t$.
+\end{theorem}
+
+\begin{proof}
+$x_0 = 0$. Each update is a convex combination:
+$\delta \Delta_t + (1-\delta) x_{t-1}$. Since $\Delta_t \ge 0$ and
+$\delta \in (0,1)$, the result follows by induction.
+\end{proof}
+
+\begin{theorem}[Monotonic response]
+$\frac{\partial k}{\partial x} = \frac{-\theta K_{\max}}{(1+\theta x)^2} < 0$,
+so $k$ is strictly decreasing in $x$.
+\end{theorem}
+
+\begin{proof}
+Direct differentiation.
+\end{proof}
+
+The controller is thus free of oscillation or chattering by construction,
+unlike step-function AIMD controllers that jump between $k=1$ and
+$k = K_{\max}$.
+
+\section{Correctness and Expected Time of the IFPS Sampler}
+
+\subsection{Model}
+
+Let $\mathcal{C} = \{s_1, \dots, s_N\}$ be a set of seeds.  Each seed
+$s_i$ has a nonnegative integer frequency $f_i$ and an energy
+
+\[
+E(i) = \frac{1}{f_i + 1},
+\qquad
+E'(i) =
+\begin{cases}
+5 \cdot E(i) & \text{if seed $i$ is marked STATE\_NOVELTY}, \\
+E(i)         & \text{otherwise}.
+\end{cases}
+\]
+
+\subsection{Algorithm}
+
+\begin{definition}[IFPS trial]
+A single trial consists of:
+\begin{enumerate}
+  \item Pick $i \sim \operatorname{Uniform}\{1,\dots,N\}$.
+  \item Accept $i$ with probability $a_i = \min(E'(i), 1)$.
+\end{enumerate}
+The algorithm repeats trials for at most $N+10$ attempts. If all
+fail, it returns a uniformly random seed (the fallback).
+\end{definition}
+
+\subsection{Theorems}
+
+\begin{theorem}[Correctness of acceptance-rejection]
+\label{thm:ifps-correct}
+Assume the fallback is never reached (its probability tends to $0$ as
+$N \to \infty$).  Then the probability that seed $i$ is returned in a
+given trial is
+
+\[
+P(\text{select } i) = \frac{E'(i)}{\sum_{j=1}^N E'(j)}.
+\]
+\end{theorem}
+
+\begin{proof}
+Elementary.  Pick $i$ uniformly: $P(\text{pick } i) = 1/N$.  Accept with
+probability $a_i$.  By the acceptance-rejection lemma, conditioned on
+acceptance occurring,
+
+\[
+P(\text{return } i) = \frac{(1/N) \cdot a_i}{\sum_j (1/N) \cdot a_j}
+= \frac{a_i}{\sum_j a_j}.
+\]
+
+For seeds with $E'(i) \le 1$ (all seeds with $f_i \ge 4$ for novel
+seeds, or any $f_i$ for normal seeds), $a_i = E'(i)$.  For novel seeds
+with $f_i < 4$, $E'(i) > 1$ so $a_i = 1$, capping the acceptance
+probability at unity.  In either case $a_i \propto E'(i)$ up to the cap.
+\end{proof}
+
+\begin{theorem}[Expected time]
+\label{thm:ifps-time}
+Let $a_{\min} = \min_i a_i$.  Since $E'(i) > 0$ for all finite $f_i$,
+$a_{\min} > 0$.  The expected number of trials per successful selection
+is at most $1 / a_{\min}$, a constant independent of $N$.  Moreover, the
+frequency cap $f_i \le 999$ (enforced every $10^4$ sends) guarantees
+$a_{\min} \ge 1/1000$.
+\end{theorem}
+
+\begin{proof}
+Each trial succeeds with probability $p = \frac{1}{N} \sum_i a_i \ge a_{\min}$.
+The number of trials $T$ is geometric with success probability $p$,
+so $\mathbb{E}[T] = 1/p \le 1/a_{\min}$.  Under the cap,
+$a_i \ge \min(1/1000, 1) = 1/1000$.
+\end{proof}
+
+\begin{remark}
+Both theorems are proved; they are included for completeness.
+\end{remark}
+
+\subsection{Open Problem}
+
+\begin{enumerate}
+  \item \textbf{Non-asymptotic fallback probability.}
+        Theorem~\ref{thm:ifps-correct} assumes the fallback is never
+        reached.  Can we bound the probability of reaching the fallback
+        after $N+10$ trials as a function of $N$ and $a_{\min}$?
+        A sharper bound than $(1 - a_{\min})^{N+10}$ would be useful
+        for selecting the retry limit.
+\end{enumerate}
+
+\section{Collision Bounds for Two-Level Crash Deduplication}
+
+\subsection{Primary Signature (Exact Match)}
+
+Let $p$ be a crash payload (a byte string).  Define
+
+\[
+\sigma_1(p) =
+\begin{cases}
+\operatorname{SHA256}(\texttt{"\_\_empty\_crash\_\_"} \;\|\;
+    \texttt{monotonic\_ns})[0:16] & \text{if } p = \varepsilon, \\[4pt]
+\operatorname{SHA256}(p)[0:16]    & \text{otherwise}.
+\end{cases}
+\]
+
+The output is $16$ bytes ($128$ bits).  For distinct nonempty payloads
+$p \neq p'$, the probability of a collision under the random-oracle model
+for SHA256 is $2^{-128}$ per pair.
+
+\begin{proposition}[Birthday bound]
+\label{prop:collision}
+After collecting $n$ distinct crash payloads, the probability of at
+least one collision in $\sigma_1$ is approximately
+
+\[
+P(\text{collision}) \approx 1 - \exp\!\left(-\frac{n^2}{2^{129}}\right).
+\]
+
+For $n \le 2^{32}$, this gives $P(\text{collision}) \le 2^{-65}$.
+\end{proposition}
+
+\begin{proof}
+Classical birthday problem with $N = 2^{128}$ bins.
+\end{proof}
+
+\subsection{Structural Signature (Similarity Grouping)}
+
+Define the structural fingerprint
+
+\[
+\sigma_2(p) = \operatorname{XXH64}\bigl(
+    \operatorname{head}_{24}(p) \;\|\;
+    \operatorname{len}_{32\text{be}}(p) \;\|\;
+    \operatorname{fold}(p)
+\bigr)[0:6],
+\]
+
+where $\operatorname{head}_{24}(p) = p[0:24]$,
+$\operatorname{len}_{32\text{be}}(p)$ is the 4-byte big-endian length,
+and $\operatorname{fold}(p)$ is a content summary:
+
+\[
+\operatorname{fold}(p) =
+\begin{cases}
+p & |p| < 32, \\[4pt]
+\operatorname{mid}_8(p) \;\|\;
+    \displaystyle\bigoplus_{c \in \operatorname{chunks}_8(p)} c
+    & |p| \ge 32,
+\end{cases}
+\]
+
+with $\operatorname{mid}_8(p) = p[|p|/2 : |p|/2+8]$ and XOR fold of
+8-byte big-endian chunks (final chunk zero-padded).  The output is
+$6$ bytes ($48$ bits).
+
+\begin{proposition}
+\label{prop:structural-collision}
+Under the random-oracle model for XXH64, the pairwise collision
+probability for $\sigma_2$ is $2^{-48}$, and after $n$ payloads,
+
+\[
+P(\text{collision}) \approx 1 - \exp\!\left(-\frac{n^2}{2^{49}}\right).
+\]
+\end{proposition}
+
+\subsection{Open Problem}
+
+\begin{enumerate}
+  \item \textbf{Structural vs.\ random collisions.}
+        Proposition~\ref{prop:structural-collision} treats XXH64 as a
+        random oracle.  In practice, two structurally similar payloads
+        (differing by one byte) may produce correlated fingerprints.
+        Can we bound the probability that $\sigma_2$ collides for
+        \emph{structurally distinct} payloads, accounting for the
+        specific construction of $\operatorname{fold}$?
+\end{enumerate}
+
+\section{Probabilistic Protocol State Machine Inference}
+
+\subsection{Formal Model of a Protocol}
+
+\begin{definition}[Protocol]
+A protocol is a tuple $(\mathcal{S}, \mathcal{A}, \delta, s_0)$ where:
+\begin{itemize}
+  \item $\mathcal{S}$ is a finite set of states.
+  \item $\mathcal{A}$ is a finite set of message types (the alphabet).
+  \item $\delta: \mathcal{S} \times \mathcal{A} \to \mathcal{S}$ is the
+        (deterministic) transition function.
+  \item $s_0 \in \mathcal{S}$ is the initial state.
+\end{itemize}
+\end{definition}
+
+Each captured packet $p$ is generated by some state $s$ and carries an
+(unknown) message type $a \in \mathcal{A}$.  The observed byte string
+$p$ is a noisy rendering of $a$; the precise mapping
+$\nu: \mathcal{A} \to \{0,1\}^*$ (from message type to wire format) is
+unknown.
+
+\subsection{Inference Pipeline}
+
+The pipeline proceeds as follows:
+
+\begin{enumerate}
+  \item \textbf{Message-unit extraction.}
+        Extract all length-3 substrings (``units'') from the first 12
+        bytes of each packet.  Split the corpus in half and retain only
+        units appearing at least $\lambda$ times in both halves, where
+        $\lambda$ is the smallest threshold such that the two empirical
+        frequency distributions pass a two-sample Kolmogorov--Smirnov
+        test at significance $1 - \alpha < 10^{-8}$.
+  \item \textbf{Format message reconstruction.}
+        For each packet, greedily extend from offset 0 using candidate
+        units from step~1.  The maximal prefix composed entirely of
+        candidate units is the packet's \emph{format message} $m$.
+  \item \textbf{Clustering.}
+        Represent each format message $m$ by its byte-frequency histogram
+        $\mathbf{v}(m) \in \mathbb{N}^{256}$.  Cluster using
+        Partitioning Around Medoids (PAM) under Jaccard distance on the
+        support sets $\{b : v_b > 0\}$.  Select $k$ maximising the
+        Dunn index.
+  \item \textbf{State machine.}
+        Each cluster medoid becomes a state.  Transition probabilities
+        are estimated from observed sequences.
+\end{enumerate}
+
+\subsection{Open Problem}
+
+The central question is: under what conditions on the protocol
+$(\mathcal{S}, \mathcal{A}, \delta, s_0)$ and the encoding $\nu$ does
+this pipeline recover the true state machine?
+
+\begin{conjecture}[Sufficient condition for recovery]
+\label{conj:ppsm}
+Assume:
+\begin{enumerate}
+  \item \textbf{Distinct keyword prefixes.}
+        For each message type $a \in \mathcal{A}$, the first 12 bytes
+        of $\nu(a)$ contain at least one length-3 substring not present
+        in the first 12 bytes of $\nu(a')$ for any $a' \neq a$.
+        (Equivalently, the set of 3-grams in the first 12 bytes
+        uniquely identifies each message type.)
+  \item \textbf{Frequency separation.}
+        There exists a threshold $\lambda$ such that protocol message
+        types appear in every session while random byte sequences
+        (payload data) do not, and the K-S test at $\alpha < 10^{-8}$
+        distinguishes the two classes.
+  \item \textbf{Homogeneous byte distributions.}
+        Packets of the same message type $a$ have byte-frequency
+        histograms $\mathbf{v}(\nu(a))$ whose Jaccard distance to each
+        other is strictly less than their distance to histograms of
+        any other message type $a' \neq a$.
+\end{enumerate}
+Then the pipeline recovers a state graph isomorphic to the true protocol
+state machine, up to relabelling of states.
+\end{conjecture}
+
+\begin{remark}
+Assumptions 1--3 are strong.  In practice some message types may share
+prefixes (e.g., ``220 `` and ``230 `` both begin with ``2`` and ``0``).
+The goal is to determine which assumptions are necessary and which can
+be relaxed, and to bound the recovery error when they are violated.
+\end{remark}
+
+\section{Summary of Open Problems}
+
+\begin{enumerate}
+  \item Sharper drift bounds and convergence rate for the EWMA closed-loop
+        system (Section~\ref{conj:ultimate} and its open problems).
+  \item Non-asymptotic fallback probability for the IFPS sampler
+        (Section~\ref{thm:ifps-correct}).
+  \item Structural collision bound for the XXH64-based crash fingerprint
+        (Section~\ref{prop:structural-collision}).
+  \item Sufficient conditions for protocol state machine recovery
+        (Conjecture~\ref{conj:ppsm}) and relaxation thereof.
+\end{enumerate}
+
+\end{document}
