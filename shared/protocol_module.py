@@ -132,7 +132,19 @@ class NullModule(ProtocolModule):
         return payload
 
     def state_tracker(self) -> Optional[Any]:
-        return None
+        """Return an InferredStateTracker if a P-PSM has been inferred
+        (shared/state_machine.json exists), else None.
+
+        Lazy import avoids circular dependency (fast_loop imports shared).
+        The tracker re-reads the P-PSM file periodically, so it picks up
+        the Slow Loop's output even though the file may not exist yet at
+        init time.
+        """
+        try:
+            from fast_loop.state_machine_tracker import InferredStateTracker
+            return InferredStateTracker()
+        except ImportError:
+            return None
 
     def response_sample_extra(self, response: bytes) -> dict[str, Any]:
         return {}
