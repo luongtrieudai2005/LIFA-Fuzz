@@ -1651,7 +1651,7 @@ class MutationEngine:
         self._last_injected_packet = payload
         # H3 fix: append to crash attribution window
         if not self._window_frozen:
-            self._crash_window.append((time.monotonic(), payload, self._last_injected_rule_id))
+            self._crash_window.append((time.monotonic(), payload, self._last_injected_rule_id, []))  # [] prefix = single-packet, no session
 
         # Feed result back to Interceptor for stuck detection
         if self.status_callback:
@@ -1739,7 +1739,7 @@ class MutationEngine:
         self._last_injected_packet = payload
         # H3 fix: append to crash attribution window
         if not self._window_frozen:
-            self._crash_window.append((time.monotonic(), payload, self._last_injected_rule_id))
+            self._crash_window.append((time.monotonic(), payload, self._last_injected_rule_id, []))  # [] prefix = single-packet, no session
 
         # Feed result back to Interceptor for stuck detection
         if self.status_callback:
@@ -1944,9 +1944,14 @@ class MutationEngine:
 
         # Backward compat — crash_monitor reads this (only mutated target)
         self._last_injected_packet = mutated_payload
-        # H3 fix: append to crash attribution window
+        # H3 fix: append to crash attribution window. PHASE 2: include the
+        # session PREFIX so confirm_crashes can replay prefix+target (a target
+        # alone won't reproduce a stateful crash — needs USER+PASS auth first).
         if not self._window_frozen:
-            self._crash_window.append((time.monotonic(), mutated_payload, self._last_injected_rule_id))
+            self._crash_window.append((
+                time.monotonic(), mutated_payload,
+                self._last_injected_rule_id, list(target.prefix),
+            ))
 
         if self.status_callback:
             self.status_callback(target.sequence_id, status)

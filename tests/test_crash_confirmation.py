@@ -144,7 +144,7 @@ async def test_confirm_crash_finds_the_real_culprit_not_window_last():
 
     # Patch the TCP replay to use the sandbox's killer knowledge instead of a
     # real socket: a payload reproduces iff it equals the killer.
-    async def fake_replay(payload, host, port):
+    async def fake_replay(payload, host, port, prefix=None):
         if payload == killer:
             sandbox._alive = False  # killer crashes the target
             return True
@@ -168,7 +168,7 @@ async def test_confirm_crash_none_reproduces_falls_back_flagged():
     cm = CrashMonitor(sandbox=sandbox, mutator=mutator, auto_reset=True,
                       restart_delay_s=0, confirm_crashes=True)
 
-    async def never_replay(payload, host, port):
+    async def never_replay(payload, host, port, prefix=None):
         return False
     cm._replay_and_check = never_replay
 
@@ -206,7 +206,7 @@ async def test_confirm_crash_reset_failure_is_isolated():
     cm = CrashMonitor(sandbox=flaky, mutator=mutator, auto_reset=True,
                       restart_delay_s=0, confirm_crashes=True)
 
-    async def replay(payload, host, port):
+    async def replay(payload, host, port, prefix=None):
         if payload == b"K":
             flaky._alive = False
             return True
@@ -263,7 +263,7 @@ async def test_on_crash_with_confirmation_records_reproduced_flag(tmp_path):
     # Bypass the real TCP replay + the 0.5s drain for test speed.
     mon.confirm_drain_s = 0.0
 
-    async def fake_replay(payload, host, port):
+    async def fake_replay(payload, host, port, prefix=None):
         if payload == killer:
             sandbox._alive = False
             return True
@@ -298,7 +298,7 @@ async def test_on_crash_confirmation_unconfirmed_when_no_replay_matches(tmp_path
     )
     mon.confirm_drain_s = 0.0
 
-    async def never_replay(payload, host, port):
+    async def never_replay(payload, host, port, prefix=None):
         return False
     mon._replay_and_check = never_replay
 

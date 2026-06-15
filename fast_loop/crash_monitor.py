@@ -852,8 +852,10 @@ class CrashMonitor:
         legacy ``window[-1]`` attribution (``reproduced=False``).
 
         Args:
-            candidates: ``[(ts, payload, rule_id), ...]`` oldest → newest,
-                        from the frozen crash window.
+            candidates: ``[(ts, payload, rule_id, prefix), ...]`` oldest → newest,
+                        from the frozen crash window. ``prefix`` is the verbatim
+                        session-setup packets (e.g. USER+PASS) — replayed before
+                        the target so stateful crashes reproduce (Phase 2).
 
         Returns:
             ``(payload, rule_id, reproduced)``.
@@ -864,14 +866,19 @@ class CrashMonitor:
         host = getattr(self.mutator, "target_host", None) if self.mutator else None
         port = getattr(self.mutator, "target_port", None) if self.mutator else None
         if not host or not port:
-            ts, payload, rule_id = candidates[-1]
-            return payload, rule_id, False
+            _e = candidates[-1]
+            return _e[1], _e[2], False
 
         # Cap the confirmation cost: at most this many resets/replays per
         # crash. Most-recent candidates are most likely, so we slice the tail.
         max_attempts = min(len(candidates), 50)
         tried = 0
-        for ts, payload, rule_id in reversed(candidates[-max_attempts:]):
+        for _entry in reversed(candidates[-max_attempts:]):
+            payload = _entry[1]
+            rule_id = _entry[2]
+            # PHASE 2: the session prefix (verbatim setup packets e.g. USER+PASS).
+            # A stateful crash only reproduces if the prefix is replayed first.
+            prefix = _entry[3] if len(_entry) > 3 else []
             if not payload:
                 continue
             tried += 1
@@ -885,32 +892,36 @@ class CrashMonitor:
                     continue  # target didn't come back — can't test this one
             except Exception:
                 continue
-            reproduced = await self._replay_and_check(payload, host, port)
+            reproduced = await self._replay_and_check(payload, host, port, prefix)
             if reproduced:
                 logger.info(
                     f"confirm: REPRODUCED crash with replayed packet "
-                    f"(len={len(payload)}, rule={rule_id}, tried={tried})"
+                    f"(len={len(payload)}, rule={rule_id}, "
+                    f"prefix={len(prefix)}pkts, tried={tried})"
                 )
                 return payload, rule_id, True
 
-        # No single packet reproduced — likely needs a prefix (stateful).
-        ts, payload, rule_id = candidates[-1]
+        # No single packet reproduced — even with prefix. Genuinely unconfirmed.
+        _e = candidates[-1]
         logger.warning(
             f"confirm: no candidate reproduced the crash "
             f"(tried {tried}/{len(candidates)}); flagging PoC as unconfirmed "
-            f"(likely needs a sequence prefix — Phase 2)"
         )
-        return payload, rule_id, False
+        return _e[1], _e[2], False
 
     async def _replay_and_check(
-        self, payload: bytes, host: str, port: int
+        self, payload: bytes, host: str, port: int, prefix: list | None = None,
     ) -> bool:
-        """Send one payload on a fresh connection; return True if the target
-        crashed (``is_target_alive`` False) afterward.
+        """Replay prefix (session setup) + payload on a fresh connection;
+        return True if the target crashed afterward.
 
-        Single-threaded targets (LIFA server) die on a crashing packet, so a
-        dead target after the send is the deterministic reproduction oracle.
+        PHASE 2 (stateful): for stateful protocols, the target packet alone
+        won't reach the vulnerable code — the prefix (e.g. USER+PASS auth)
+        must be replayed first on the SAME connection. Without this, every
+        stateful crash is marked unconfirmed (target alone doesn't reproduce).
+        The prefix is the verbatim setup captured from the real client.
         """
+        prefix = prefix or []
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(host, port), timeout=2.0
@@ -918,10 +929,22 @@ class CrashMonitor:
         except Exception:
             return False  # can't connect → no reproduction signal
         try:
+            # Drain the server greeting (e.g. FTP 220 banner) before any send.
+            try:
+                await asyncio.wait_for(reader.read(4096), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
+            # Replay the prefix packets verbatim, draining each response.
+            for pkt in prefix:
+                writer.write(pkt)
+                await writer.drain()
+                try:
+                    await asyncio.wait_for(reader.read(4096), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
+            # Send the target payload + drain (ASAN fires during processing).
             writer.write(payload)
             await writer.drain()
-            # Drain any response to drive the server to actually process the
-            # payload (ASAN crashes often fire during processing, not recv).
             try:
                 await asyncio.wait_for(reader.read(4096), timeout=1.0)
             except asyncio.TimeoutError:
