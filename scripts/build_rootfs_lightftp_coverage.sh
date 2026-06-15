@@ -72,7 +72,7 @@ COPY --from=builder /usr/local/bin/fftp /usr/local/bin/fftp
 COPY --from=builder /tmp/LightFTP /opt/lightftp-build
 
 RUN mkdir -p /tmp/ftp_root && \
-    printf '[ftpconfig]\nport=21\ninterface=0.0.0.0\nexternal_ip=172.16.0.2\nlocal_mask=255.255.255.0\nminport=1024\nmaxport=65535\nmaxusers=100\n\n[admin]\npswd=*\naccs=admin\nroot=/tmp/ftp_root\n' > /etc/fftp.conf
+    printf '[ftpconfig]\nport=21\ninterface=0.0.0.0\nexternal_ip=172.16.0.2\nlocal_mask=255.255.255.0\nminport=1024\nmaxport=65535\nmaxusers=100\nmaxcmds=999999\n\n[admin]\npswd=*\naccs=admin\nroot=/tmp/ftp_root\n' > /etc/fftp.conf
 
 # /init: run ffp in the BACKGROUND so a watchdog (shell builtin kill — no
 # external kill binary needed) can SIGTERM it after the coverage duration,

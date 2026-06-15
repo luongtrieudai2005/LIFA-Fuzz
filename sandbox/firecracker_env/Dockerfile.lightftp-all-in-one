@@ -29,7 +29,7 @@ COPY --from=builder /usr/local/bin/fftp /usr/local/bin/fftp
 
 # Write fftp.conf
 RUN mkdir -p /tmp/ftp_root && \
-    printf 'rootdir=/tmp/ftp_root\nport=21\nmaxusers=100\nmaxcmds=10000\ngoodbyemsg=Goodbye!\n' > /etc/fftp.conf
+    printf 'rootdir=/tmp/ftp_root\nport=21\nmaxusers=100\nmaxcmds=999999\nmaxcmds=10000\ngoodbyemsg=Goodbye!\n' > /etc/fftp.conf
 
 # Create /init script — starts fftp directly (no SSH needed!)
 RUN printf '#!/bin/sh\n\
