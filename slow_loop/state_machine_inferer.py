@@ -62,6 +62,10 @@ class ProbabilisticStateMachine:
 
         Returns the state index (0-based), or None if "unknown" (too far from
         all medoids — e.g. a pure-data packet with no protocol header).
+
+        Uses GLOBAL d_max = 2 * max(cluster_diameters) per Veritas spec,
+        NOT per-cluster diameter. Per-cluster would let singleton clusters
+        (diameter=0) accept any packet including garbage.
         """
         if not packet or not self.medoids or not self.features:
             return None
@@ -73,13 +77,18 @@ class ProbabilisticStateMachine:
             if d < best_dist:
                 best_dist = d
                 best_idx = i
-        # Reject if too far from nearest medoid (likely a data packet).
         if best_idx < 0:
             return None
-        if best_idx < len(self.cluster_diameters):
-            d_max = 2 * self.cluster_diameters[best_idx]
-            if d_max > 0 and best_dist > d_max:
-                return None
+        # Global d_max (Veritas §3.4): max over ALL clusters of 2*Δ(C_i).
+        # Cap at 0.75 — Jaccard distance max is 1.0, so d_max > 1.0 means
+        # NO filtering (everything accepted). With coarse clusters (large
+        # diameter), uncapped d_max would accept garbage packets.
+        global_d_max = 2 * max(self.cluster_diameters) if self.cluster_diameters else 0.5
+        global_d_max = min(global_d_max, 0.75)
+        if global_d_max == 0:
+            global_d_max = 0.5  # singleton-only fallback
+        if best_dist > global_d_max:
+            return None
         return best_idx
 
     def to_dict(self) -> dict[str, Any]:
@@ -233,7 +242,6 @@ def _ks_test_filter(units: Counter, packets: list[bytes],
         # Too few packets for splitting — fallback: simple frequency cut.
         return {u for u, f in units.items() if f >= 2}
 
-    import random as _rng
     # Split packets into two halves (deterministic for reproducibility).
     half = len(packets) // 2
     pkt_a = packets[:half]
@@ -273,16 +281,17 @@ def _ks_test_filter(units: Counter, packets: list[bytes],
 
 def _reconstruct_format_messages(
     packets: list[bytes], candidate_units: set[bytes]
-) -> list[bytes]:
+) -> list[tuple[bytes, int]]:
     """Reconstruct protocol format messages from candidate units.
 
     For each packet, greedily extend from position 0 using candidate 3-byte
-    units. The longest reconstructed sequence is the packet's format message.
+    units. Returns (format_msg, packet_index) pairs so the caller can build
+    feature vectors from the ORIGINAL packet headers (not just the short
+    format message), ensuring consistency between clustering and labeling.
     """
-    format_messages: list[bytes] = []
-    for pkt in packets:
+    results: list[tuple[bytes, int]] = []
+    for idx, pkt in enumerate(packets):
         header = pkt[:_HEADER_BYTES]
-        best_seq = b""
         # Try starting from position 0 (Veritas: format messages start at the beginning)
         seq = b""
         i = 0
@@ -294,10 +303,8 @@ def _reconstruct_format_messages(
             else:
                 break
         if len(seq) >= _MESSAGE_UNIT_LEN:
-            best_seq = header[:i]
-        if best_seq:
-            format_messages.append(best_seq)
-    return format_messages
+            results.append((header[:i], idx))
+    return results
 
 
 # ===========================================================================
@@ -441,6 +448,10 @@ def _infer_transitions(
     """Build transition probability matrix from labeled sessions.
 
     Each session is a list of state indices. Count consecutive pairs, normalize.
+
+    Veritas §3.4: "only keeps the state type pairs with a frequency above
+    0.005" — filters noise transitions (e.g. single-occurrence mislabeled
+    pairs from out-of-order packets or Jaccard mislabeling).
     """
     pair_counts: Counter = Counter()
     state_counts: Counter = Counter()
@@ -448,8 +459,12 @@ def _infer_transitions(
         for i in range(len(sess) - 1):
             pair_counts[(sess[i], sess[i + 1])] += 1
             state_counts[sess[i]] += 1
+    total_pairs = sum(pair_counts.values())
     transitions: dict[tuple[int, int], float] = {}
     for (si, sj), count in pair_counts.items():
+        # Veritas frequency threshold: filter noise transitions.
+        if total_pairs > 0 and count / total_pairs < 0.005:
+            continue
         total = state_counts.get(si, 1)
         if total > 0:
             transitions[(si, sj)] = count / total
@@ -523,13 +538,20 @@ class StateMachineInferer:
         # Step 1: Message format extraction
         units = _extract_message_units(packets)
         candidate_units = _ks_test_filter(units, packets)
-        format_msgs = _reconstruct_format_messages(packets, candidate_units)
-        if len(format_msgs) < 3:
+        fmt_results = _reconstruct_format_messages(packets, candidate_units)
+        if len(fmt_results) < 3:
             log.debug("StateMachineInferer: too few format messages, skipping")
             return ProbabilisticStateMachine()
 
-        # Step 2: Feature extraction + PAM clustering + Dunn optimal k
-        features = [_byte_frequency_vector(fm) for fm in format_msgs]
+        # Step 2: Feature extraction from ORIGINAL packet headers (12B),
+        # NOT from short format messages. This ensures label_packet() —
+        # which also uses packet[:12] — produces consistent Jaccard distances.
+        # Using format_msg features (3-4 bytes) vs packet[:12] (12 bytes)
+        # inflates distances (0.7+ for matching commands) → wrong labeling.
+        format_msgs = [fm for fm, _ in fmt_results]
+        packet_indices = [idx for _, idx in fmt_results]
+        features = [_byte_frequency_vector(packets[idx][:_HEADER_BYTES])
+                     for idx in packet_indices]
         k = _optimal_k(features, max_k=min(12, len(features)))
         if k < 2:
             log.debug("StateMachineInferer: optimal k < 2, skipping")
@@ -546,6 +568,11 @@ class StateMachineInferer:
         )
 
         # Step 3+4: Label sessions + infer transitions
+        # Use global d_max capped at 0.75 (consistent with label_packet).
+        global_d_max = 2 * max(diameters) if diameters else 0.5
+        global_d_max = min(global_d_max, 0.75)
+        if global_d_max == 0:
+            global_d_max = 0.5
         labeled_sessions: list[list[int]] = []
         if sessions:
             for sess in sessions:
@@ -559,10 +586,8 @@ class StateMachineInferer:
                         if d < best_dist:
                             best_dist = d
                             best_idx = mi_idx
-                    if best_idx >= 0:
-                        d_max = 2 * diameters[best_idx] if best_idx < len(diameters) else 1.0
-                        if d_max == 0 or best_dist <= d_max:
-                            labels.append(best_idx)
+                    if best_idx >= 0 and best_dist <= global_d_max:
+                        labels.append(best_idx)
                 if len(labels) >= 2:
                     labeled_sessions.append(labels)
 

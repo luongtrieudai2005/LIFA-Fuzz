@@ -566,14 +566,27 @@ class RulesOrchestrator:
 
                 if not hasattr(self, "_state_inferer"):
                     self._state_inferer = StateMachineInferer(min_packets=10)
-                # Extract ALL packets (both directions) for P-PSM inference.
+                # Extract REAL (non-mutated) packets for P-PSM inference.
+                # Mutated packets have corrupted headers → wrong format messages
+                # → garbage clustering → wrong state machine. State inference
+                # must reflect REAL protocol behavior, not fuzzer's mutations.
+                real_pkts = [p for p in full_selected
+                             if p.get("payload", p.get("raw_hex", ""))
+                             and not p.get("is_mutated", False)]
                 all_packets = [
-                    bytes.fromhex(pkt.get("payload", pkt.get("raw_hex", "")))
-                    for pkt in full_selected
-                    if pkt.get("payload", pkt.get("raw_hex", ""))
+                    bytes.fromhex(p.get("payload", p.get("raw_hex", "")))
+                    for p in real_pkts
                 ]
                 if len(all_packets) >= self._state_inferer.min_packets:
-                    psm = self._state_inferer.infer(all_packets)
+                    # Build sessions from REAL packets only (group by session_id).
+                    from collections import defaultdict as _dd
+                    sess_map: dict = _dd(list)
+                    for p in real_pkts:
+                        ph = p.get("payload", p.get("raw_hex", ""))
+                        sid = p.get("session_id", "")
+                        sess_map[sid].append(bytes.fromhex(ph))
+                    sessions = list(sess_map.values())
+                    psm = self._state_inferer.infer(all_packets, sessions)
                     if psm.n_states >= 2:
                         sm_path = _Path("shared/state_machine.json")
                         sm_path.write_text(_json.dumps(psm.to_dict()))
