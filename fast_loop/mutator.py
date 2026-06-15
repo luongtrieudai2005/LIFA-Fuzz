@@ -1596,6 +1596,14 @@ class MutationEngine:
                 timeout=self.connection_timeout,
             )
 
+            # Drain server greeting (e.g. FTP 220 banner) before sending.
+            # Without this, the first read returns the greeting, not the
+            # response to our packet — off-by-one (same bug as _execute_sequence).
+            try:
+                await asyncio.wait_for(reader.read(4096), timeout=self.recv_timeout)
+            except asyncio.TimeoutError:
+                pass
+
             writer.write(payload)
             await writer.drain()
 
