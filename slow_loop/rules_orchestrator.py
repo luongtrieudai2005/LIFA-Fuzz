@@ -551,6 +551,33 @@ class RulesOrchestrator:
                     f"(need {self._analyzer.min_packets}, have {len(raw_packets)})"
                 )
 
+            # ── 5a. State Machine Inference (Tầng 3 — Veritas-inspired) ──
+            # Generic state machine from traffic: no hardcoded FTP. Produces
+            # P-PSM → shared/state_machine.json → Fast Loop InferredStateTracker.
+            try:
+                from slow_loop.state_machine_inferer import StateMachineInferer
+                import json as _json
+                from pathlib import Path as _Path
+
+                if not hasattr(self, "_state_inferer"):
+                    self._state_inferer = StateMachineInferer(min_packets=10)
+                if len(raw_packets) >= self._state_inferer.min_packets:
+                    psm = self._state_inferer.infer(raw_packets)
+                    if psm.n_states >= 2:
+                        sm_path = _Path("shared/state_machine.json")
+                        sm_path.write_text(_json.dumps(psm.to_dict()))
+                        logger.info(
+                            f"  State machine inference: {psm.n_states} states, "
+                            f"{len(psm.transitions)} transitions → {sm_path}"
+                        )
+                        state_hint = psm.to_hint()
+                        if state_hint and math_hint:
+                            math_hint += "\n\n" + state_hint
+                        elif state_hint:
+                            math_hint = state_hint
+            except Exception as e:
+                logger.debug(f"  State machine inference skipped: {e}")
+
             # ── 5b. Skip LLM if no unseen packets ───────────────────
             # Incremental optimisation: if all diverse samples have already
             # been sent to the LLM, there is nothing new to learn.
