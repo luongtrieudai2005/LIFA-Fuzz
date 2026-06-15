@@ -19,6 +19,8 @@ All without source code, RFCs, or protocol-specific knowledge in the core engine
 
 ## Architecture
 
+<img width="1516" height="1038" alt="image" src="https://github.com/user-attachments/assets/022f1808-1002-44a4-99f5-db7dbda727d5" />
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │ Block 1: Sandbox (Firecracker MicroVM)                      │
