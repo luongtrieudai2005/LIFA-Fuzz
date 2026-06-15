@@ -198,10 +198,23 @@ Server:       57%  ACCEPTED mutated commands (deep processing)
 
 ## References
 
-- **Veritas** — Wang, Y. et al. "Inferring Protocol State Machine from Network Traces: A Probabilistic Approach." 2011. (P-PSM inference)
-- **ProtocolGPT** — Wei, H. et al. "Unleashing the Power of LLM to Infer State Machine from the Protocol Implementation." arXiv:2405.00393, 2024. (Contrast: white-box, needs source code — LIFA-Fuzz is black-box)
-- **SemFuzz** — Sun, Y. et al. "SemFuzz: A Semantics-Aware Fuzzing Framework." WWW '26, 2026. (Contrast: needs RFC)
-- **NSFuzz** — Qin, S. et al. "NSFuzz: Towards Efficient and State-Aware Network Service Fuzzing." TOSEM, 2023. (Contrast: needs source + instrumentation)
+**State machine inference (core contribution):**
+- **Veritas** — Wang, Y. et al. "Inferring Protocol State Machine from Network Traces: A Probabilistic Approach." 2011. (P-PSM inference — LIFA-Fuzz's Tầng 3)
+- **ProtocolGPT** — Wei, H. et al. arXiv:2405.00393, 2024. (Contrast: white-box, needs source code)
+- **Prospex** — Comparetti, P.M. et al. IEEE S&P, 2009. (Protocol spec extraction — needs binary trace)
+
+**LLM for protocol analysis:**
+- **SemFuzz** — Sun, Y. et al. WWW '26, 2026. (Semantics-aware fuzzing — needs RFC)
+- **Pordanesh & Tan** — arXiv:2406.06637, 2024. (GPT-4 for binary reverse engineering)
+
+**Protocol fuzzing & RE:**
+- **NSFuzz** — Qin, S. et al. TOSEM, 2023. (State-aware fuzzing — needs source + instrumentation)
+- **AFL** — Zalewski, M. 2017. / **AFL++** — 2025. / **libFuzzer** — LLVM, 2025. (Coverage-guided fuzzing baselines)
+- **boofuzz** — jtpereyda, 2025. / **Peach** — 2020. / **SPIKE** — Aitel, D. 2005. (Grammar-aware fuzzing lineage)
+- **Duchêne et al.** — "Protocol RE Using Shannon Entropy." IEEE TIFS, 2018. (Entropy-based field detection — justifies DifferentialAnalyzer)
+
+**Infrastructure:**
+- **Firecracker MicroVM** — AWS, 2025. https://firecracker-microvm.github.io/ (Sandbox isolation + snapshot/restore)
 
 ---
 
