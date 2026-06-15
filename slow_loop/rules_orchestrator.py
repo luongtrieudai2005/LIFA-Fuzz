@@ -554,6 +554,11 @@ class RulesOrchestrator:
             # ── 5a. State Machine Inference (Tầng 3 — Veritas-inspired) ──
             # Generic state machine from traffic: no hardcoded FTP. Produces
             # P-PSM → shared/state_machine.json → Fast Loop InferredStateTracker.
+            # CRITICAL: feed BOTH directions (C2S + S2C). Server responses
+            # (220, 331, 230) are the actual STATE messages — without them
+            # the P-PSM only clusters client commands, missing real states.
+            # raw_packets (C2S only) is for DifferentialAnalyzer; the P-PSM
+            # needs its own all-direction packet list.
             try:
                 from slow_loop.state_machine_inferer import StateMachineInferer
                 import json as _json
@@ -561,8 +566,14 @@ class RulesOrchestrator:
 
                 if not hasattr(self, "_state_inferer"):
                     self._state_inferer = StateMachineInferer(min_packets=10)
-                if len(raw_packets) >= self._state_inferer.min_packets:
-                    psm = self._state_inferer.infer(raw_packets)
+                # Extract ALL packets (both directions) for P-PSM inference.
+                all_packets = [
+                    bytes.fromhex(pkt.get("payload", pkt.get("raw_hex", "")))
+                    for pkt in full_selected
+                    if pkt.get("payload", pkt.get("raw_hex", ""))
+                ]
+                if len(all_packets) >= self._state_inferer.min_packets:
+                    psm = self._state_inferer.infer(all_packets)
                     if psm.n_states >= 2:
                         sm_path = _Path("shared/state_machine.json")
                         sm_path.write_text(_json.dumps(psm.to_dict()))

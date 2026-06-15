@@ -73,7 +73,7 @@ ip addr add 172.16.0.2/24 dev eth0\n\
 ip link set eth0 up\n\
 ip route add default via 172.16.0.1\n\
 echo "LIFA-Fuzz: LightFTP ready on 172.16.0.2:21 (ASAN enabled)"\n\
-export ASAN_OPTIONS=disable_coredump=1:abort_on_error=1:halt_on_error=0\n\
+export ASAN_OPTIONS=disable_coredump=1:abort_on_error=1:halt_on_error=0:detect_leaks=0\n\
 exec /usr/local/bin/fftp /etc/fftp.conf\n' > /init && chmod +x /init
 DEOF
 
