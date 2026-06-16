@@ -207,7 +207,12 @@ async def run_slow_loop(
         context_window=llm_cfg.get("context_window", 128_000),
         prompt_truncation_strategy=llm_cfg.get("prompt_truncation_strategy", "truncate"),
     )
-    agent.enable_thinking = llm_cfg.get("enable_thinking", True)
+    # H1 fix: default to False (matches LLMAgent.__init__ and the eval path).
+    # GLM models with enable_thinking=True route all tokens to reasoning_content
+    # and return an empty .content → every call fails → silent bootstrap
+    # fallback. A config that omits this key must NOT silently flip the bit to
+    # True; opt in explicitly instead.
+    agent.enable_thinking = llm_cfg.get("enable_thinking", False)
 
     # Cross-validate enable_thinking for cost-sensitive models
     if agent.enable_thinking and "glm" in agent.model.lower():

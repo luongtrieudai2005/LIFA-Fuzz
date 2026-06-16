@@ -1204,14 +1204,22 @@ class RulesOrchestrator:
         # Marker header (see docstring) + compact JSON body.
         return "## RESPONSE FEEDBACK\n\n" + _json.dumps(feedback, indent=2)
 
+    @staticmethod
     def _convert_field_rules(
-        self, field_rules: list[FieldRule]
+        field_rules: list[FieldRule]
     ) -> list[SemanticRule]:
         """Convert lightweight FieldRule objects into full SemanticRules.
 
         This is the bootstrap fallback path — when the LLM is unavailable,
         the math layer's FieldRules are converted directly so the fuzzer
         never starves for rules.
+
+        Pure function: uses no instance state (only the two staticmethod
+        helpers below). C2 fix — previously called via a fragile
+        ``RulesOrchestrator.__new__()`` hack in evaluation_runner that would
+        silently AttributeError if this method ever touched ``self``. Keeping
+        it static makes that contract explicit and lets callers invoke it
+        without constructing an orchestrator.
 
         Args:
             field_rules: FieldRule list from ``HeatmapResult.to_field_rules()``.
@@ -1249,12 +1257,12 @@ class RulesOrchestrator:
                         pass
 
             rule = SemanticRule(
-                rule_type=self._strategy_to_rule_type(fr.mutation_strategy),
+                rule_type=RulesOrchestrator._strategy_to_rule_type(fr.mutation_strategy),
                 target_field_name=fr.field_name,
-                mutation_type=self._strategy_to_rule_type(fr.mutation_strategy),
+                mutation_type=RulesOrchestrator._strategy_to_rule_type(fr.mutation_strategy),
                 offset_start=fr.offset,
                 offset_end=end,
-                field_type=self._infer_field_type(fr),
+                field_type=RulesOrchestrator._infer_field_type(fr),
                 preserve_bytes=preserve,
                 priority=fr.confidence,
                 description=fr.notes or f"Bootstrap rule from DifferentialAnalyzer",

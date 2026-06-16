@@ -74,8 +74,29 @@ def _load_llm_agent_config(config_path: str = "config.yaml") -> dict[str, Any]:
         path = _project_root / config_path
         with open(path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
-        return cfg.get("slow_loop", {}).get("llm_agent", {}) or {}
-    except Exception:
+        block = cfg.get("slow_loop", {}).get("llm_agent", {}) or {}
+        # H2 fix: an empty/missing block means baseline C would build its agent
+        # from all-``.get(default)`` values (provider=openai, model=gpt-4o,
+        # api_base="") → every call fails → silent bootstrap fallback → C
+        # silently degrades to B and the A/B/C comparison is invalid with no
+        # error signal. Surface this loudly instead of returning {}.
+        if not block:
+            print(
+                "WARNING: slow_loop.llm_agent block missing/empty in "
+                f"{config_path} — baseline C cannot use the REAL LLM and will "
+                "degrade to math-only (≈ baseline B). Fix the config before "
+                "trusting a C result.",
+                file=sys.stderr,
+            )
+        return block
+    except Exception as exc:
+        # H2 fix: do NOT swallow this silently. A malformed config used to
+        # return {} here, silently defeating baseline C.
+        print(
+            f"ERROR: failed to load slow_loop.llm_agent from {config_path} "
+            f"({exc!r}) — baseline C will degrade to math-only (≈ baseline B).",
+            file=sys.stderr,
+        )
         return {}
 
 
@@ -1269,6 +1290,27 @@ async def _start_slow_loop_subprocess():
         return None
 
 
+# M4 fix: the math-only and fusion background loops previously swallowed
+# every exception with a bare ``except Exception: continue``. A persistent
+# failure (e.g. update_rule_set raising after a refactor) would silently
+# produce zero rules for the whole baseline, degrading B/C to A with no signal.
+# Log the first occurrence of each unique error so the run isn't blind.
+_logged_loop_errors: set[str] = set()
+
+
+def _log_loop_error(loop_name: str, exc: BaseException) -> None:
+    key = f"{loop_name}:{type(exc).__name__}:{str(exc)[:80]}"
+    if key in _logged_loop_errors:
+        return
+    _logged_loop_errors.add(key)
+    print(
+        f"WARNING: {loop_name} raised {type(exc).__name__}: {exc} "
+        "(suppressed to keep the loop alive; logged once per unique error — "
+        "if this repeats the baseline may be degraded).",
+        file=sys.stderr,
+    )
+
+
 async def _run_math_only_loop(
     traffic_log: str,
     mutator: Any,
@@ -1332,10 +1374,11 @@ async def _run_math_only_loop(
                 # Use RulesOrchestrator._convert_field_rules() which correctly
                 # handles: STATIC → preserve_bytes, SKIP filtering,
                 # dictionary_values transfer, and field_type inference.
-                # NOTE: _convert_field_rules is an instance method that calls
-                # @staticmethod helpers via self — we must pass a real instance.
-                _orch = RulesOrchestrator.__new__(RulesOrchestrator)
-                rules = _orch._convert_field_rules(field_rules)
+                # C2 fix: _convert_field_rules is now a @staticmethod (pure
+                # function, no instance state) — call it directly on the class
+                # instead of the fragile __new__() hack that would silently
+                # AttributeError if the method ever touched self.
+                rules = RulesOrchestrator._convert_field_rules(field_rules)
 
                 # Assign deterministic rule_ids so the same field always gets
                 # the same ID → dedup works across math-only cycles.
@@ -1363,7 +1406,8 @@ async def _run_math_only_loop(
 
         except asyncio.CancelledError:
             break
-        except Exception:
+        except Exception as exc:
+            _log_loop_error("math-only loop (baseline B)", exc)
             continue
 
 
@@ -1453,7 +1497,8 @@ async def _run_fusion_loop(
 
         except asyncio.CancelledError:
             break
-        except Exception:
+        except Exception as exc:
+            _log_loop_error("fusion loop (baseline C)", exc)
             continue
 
 
