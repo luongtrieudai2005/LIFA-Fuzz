@@ -6,12 +6,17 @@
 
 ## What It Does
 
-LIFA-Fuzz captures live traffic between a client and a target server, then:
+LIFA-Fuzz finds bugs in network servers without needing the server's source code or protocol documentation. It works by watching real traffic between a client and the server, learning the protocol structure automatically, then sending mutated packets to trigger crashes.
 
-1. **Infers protocol grammar** (field offsets, types, mutation strategies) using LLM + Shannon entropy / Pearson correlation / Kendall τ — **F1 = 1.0** verified on both LIFA (binary) and FTP (RFC 959, independent).
-2. **Infers protocol state machine** using Veritas-inspired P-PSM (K-S test + PAM clustering + DFA construction) — pure statistical, black-box, no hardcoded keywords.
-3. **Fuzzes stateful** — replays the captured session prefix (e.g. USER→PASS auth) on a single TCP connection, then mutates the target command post-auth. **98% auth rate** on LightFTP.
-4. **Detects + confirms crashes** — Phase 2 confirmation replays prefix+target on a clean target to verify reproduction (reviewer can reproduce).
+The system does four things:
+
+1. **Learns the protocol format** by watching network traffic. It uses statistics to find fixed fields (magic numbers), variable fields (length, data), and command codes, then uses an LLM to name each field and pick the best mutation strategy. Verified at F1 = 1.0 on both a custom binary protocol and standard FTP.
+
+2. **Learns the protocol state machine** automatically from traffic patterns, with no hardcoded keywords. It discovers state transitions (e.g. server sends 220, client sends USER, server responds 331) and tracks which states the fuzzer has visited.
+
+3. **Fuzzes statefully** by replaying the real session prefix (e.g. complete USER then PASS authentication) on a single TCP connection before mutating the target command. This lets it reach post-auth code where deep bugs live. Achieves 98% auth rate on LightFTP.
+
+4. **Confirms each crash** by replaying the exact prefix and mutated command on a clean server instance, ensuring every finding is reproducible.
 
 All without source code, RFCs, or protocol-specific knowledge in the core engine.
 
@@ -60,22 +65,22 @@ IPC: file-based (JSON/JSONL), atomic rename-swap
 
 ### ProtocolModule: Black-Box Core + Opt-In Modules
 
-The Fast Loop core contains **zero hardcoded protocol knowledge**. All protocol-specific logic lives in pluggable `ProtocolModule` subclasses:
+The Fast Loop core has **zero hardcoded protocol knowledge**. All protocol-specific logic lives in pluggable `ProtocolModule` subclasses:
 
-- **`NullModule`** (default) — pure black-box: any reply = ACCEPTED, no framing, no state tracking. Relies on P-PSM (inferred) for state.
-- **Protocol-specific modules** (opt-in, disclosed case-study) — status code parsing, framing, protocol state tracker, protocol mutation operators.
+- **`NullModule`** (default). A pure black-box mode: every server reply is treated as accepted, no framing, no state tracking. Relies on the automatically inferred state machine for state awareness.
+- **Protocol-specific modules** (opt-in, for known protocols). Add status code parsing, framing, protocol state tracker, and protocol-specific mutation operators.
 
-**For unknown protocols:** `NullModule` + inferred P-PSM = automatic state tracking without any protocol knowledge. This is the generality claim.
+**For unknown protocols:** `NullModule` plus the inferred state machine gives automatic state tracking without any protocol knowledge. This is how the system handles novel protocols without modification.
 
 ### Stateful Sequence Replay
 
-LIFA-Fuzz captures real client traffic and groups packets by session ID into `SeedSequence` objects. The mutation engine:
+LIFA-Fuzz captures real client traffic and groups packets by session ID into `SeedSequence` objects. The mutation engine then:
 
-1. Splits each sequence into **Prefix** (verbatim, establishes state) + **Target** (fuzzed) + **Suffix**.
+1. Splits each sequence into **Prefix** (replayed verbatim to establish server state), **Target** (the packet to fuzz), and **Suffix** (remaining traffic).
 2. Opens **one TCP connection**, drains the server greeting, replays the prefix, then sends the mutated target.
 3. Reads and classifies the full response chain.
 
-This solves the **stateful reachability problem**: the fuzzer authenticates and reaches post-auth code where vulnerabilities live. Without this, mutations only hit the greeting (pre-auth) and never trigger deep bugs.
+This solves the core problem of stateful fuzzing: the fuzzer authenticates and reaches server logic beyond the login screen. Without this, every mutation only hits the pre-auth greeting and never triggers deeper code paths.
 
 ---
 
@@ -189,10 +194,10 @@ Server:       57%  ACCEPTED mutated commands (deep processing)
 
 ## Limitations (honest)
 
-- **Jaccard position-invariant** — byte-frequency similarity can't distinguish commands with same argument bytes (USER/PASS may merge). Inherent to Veritas, documented.
-- **No binary code coverage in Firecracker** — gcov↔snapshot-restore irreconcilable (snapshot discards counters). Coverage measured via Docker variant (decouple/replay deferred).
-- **Old A/B/C results invalid** — measured with broken fuzzer (stuck at greeting, no auth). Must re-run with fixed pipeline.
-- **0 crashes found so far** — pipeline newly fixed; overnight campaign needed.
+- **State inference can confuse similar commands.** The system uses byte-frequency similarity, so commands that share the same argument bytes (like USER and PASS) may be merged into one state. This is a known limitation of the approach.
+- **No binary code coverage inside the Firecracker VM.** Snapshots discard coverage counters, so gcov cannot work with snapshot-restore. Coverage is measured separately via a Docker variant.
+- **Old A/B/C benchmark data is invalid.** It was collected with a broken fuzzer that was stuck at the server greeting and never authenticated. Results must be re-run with the fixed pipeline.
+- **Zero crashes found so far.** The pipeline was only recently fixed; a longer overnight campaign is needed.
 
 ---
 

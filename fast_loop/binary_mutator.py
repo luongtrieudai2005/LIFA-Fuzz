@@ -92,14 +92,47 @@ ALL_STRATEGIES: list[str] = [
     "block_del",
     "block_truncate",
     "payload_extend",     # Grow payload + update length byte (triggers buffer overflows)
+    "magic_values",       # Phase 3: known-exploitable payloads (overflow / fmtstr / path)
     "ftp_token_inject",   # FTP: inject a random FTP command token
     "ftp_token_replace",  # FTP: replace the current command with a different FTP token
     "ftp_arg_fuzz",       # FTP: fuzz the argument after a command token
     "ftp_crlf_insert",    # FTP: inject extra CRLF delimiters
 ]
 
-# Binary-only strategies (no FTP awareness — used by non-FTP targets)
-BINARY_ONLY_STRATEGIES: list[str] = ALL_STRATEGIES[:15]  # Exclude FTP strategies
+# Binary-only strategies (no FTP awareness — used by non-FTP targets).
+# Generic operators = the 16 entries before the FTP strategies (indices 0..15).
+BINARY_ONLY_STRATEGIES: list[str] = ALL_STRATEGIES[:16]  # Exclude FTP strategies
+
+# Phase 3 / TASK 3 — known-exploitable "magic value" payloads.
+# Targets the confirmed memory-handling vuln class (e.g. LightFTP argument
+# handling): oversized strings for buffer overflows, %n format-string writes,
+# and path-traversal/logic payloads. Defined at module scope so the tuple is
+# built once.
+#
+# SIZE CAP (MAGIC_MAX_BYTES = 512): a stack/heap buffer overflow is tripped by
+# a few hundred bytes of overwrite — 8 KB buys nothing but exhausts LightFTP's
+# connection handlers on Firecracker, causing a TCP connection-refused storm
+# and an EPS collapse (see _strat_magic_values). Every payload is sliced to
+# MAGIC_MAX_BYTES at splice time, so the entries below may exceed it freely.
+MAGIC_MAX_BYTES: int = 512
+
+_MAGIC_PAYLOADS: tuple[bytes, ...] = (
+    # Buffer overflow (capped to MAGIC_MAX_BYTES at splice time)
+    b"A" * 512,
+    b"B" * 256,
+    b"C" * 128,
+    b"\x00" * 256,
+    b"\xff" * 512,
+    # Format string (user-specified core)
+    b"%s%s%s%s%n%n%n",
+    b"%x%p%n",
+    b"%n" * 64,
+    # Path / logic (user-specified core)
+    b"../../../etc/passwd\x00",
+    b"....//....//....//etc/passwd\x00",
+    # de Bruijn-ish pattern — makes the crash offset readable in a dump
+    (b"Aa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7Aa8Aa9" * 32),  # 960 B → capped to 512
+)
 
 
 class BinaryMutator:
@@ -168,6 +201,28 @@ class BinaryMutator:
         self._apply_strategy(data, strategy, sr, mutable)
         return data
 
+    def mutate_with(
+        self,
+        data: bytearray,
+        strategy: str,
+        field_groups: list[FieldGroup] | None = None,
+    ) -> bytearray:
+        """Apply a SINGLE named strategy to *data* (in-place).
+
+        Used by the MutationEngine exploitation path (Phase 3 / TASK 3) to
+        force the ``magic_values`` operator on argument fields with ~50%
+        probability. Computes static ranges / mutable offsets exactly like
+        ``mutate()``, then dispatches the one requested strategy.
+        """
+        if len(data) == 0:
+            return data
+        sr = _build_static_ranges(field_groups)
+        mutable = _compute_mutable_offsets(data, sr)
+        if not mutable:
+            return data
+        self._apply_strategy(data, strategy, sr, mutable)
+        return data
+
     # ===================================================================
     # Strategy dispatch
     # ===================================================================
@@ -196,6 +251,7 @@ class BinaryMutator:
             "block_del":        self._strat_block_del,
             "block_truncate":   self._strat_block_truncate,
             "payload_extend":   self._strat_payload_extend,
+            "magic_values":     self._strat_magic_values,
             "ftp_token_inject":  self._strat_ftp_token_inject,
             "ftp_token_replace": self._strat_ftp_token_replace,
             "ftp_arg_fuzz":      self._strat_ftp_arg_fuzz,
@@ -467,6 +523,47 @@ class BinaryMutator:
                 # E.g. payload_len=300 → data[5]=44 → server reads 44 bytes
                 # but 300 were actually sent → heap buffer overflow.
                 data[5] = new_payload_len & 0xFF
+
+    # ===================================================================
+    # Exploitation payloads (Phase 3 / TASK 3)
+    # ===================================================================
+
+    def _strat_magic_values(
+        self, data: bytearray, sr: list[tuple[int, int]], mutable: list[int]
+    ) -> None:
+        """Splice a known-exploitable payload into the argument region (in-place).
+
+        Targets the confirmed memory-handling vuln class (e.g. LightFTP
+        argument handling) that pure ``RANDOM_BYTES`` almost never
+        synthesizes: oversized strings for buffer overflows, ``%n`` format
+        strings, and path-traversal payloads.
+
+        Framing safety: if the packet ends with a CRLF (FTP framing), the
+        payload is inserted just before it so the command keyword and the
+        terminator remain parseable — the server still recognizes the
+        command and reaches the vulnerable argument-copy path with a
+        malicious argument. Without a trailing CRLF, the payload is inserted
+        at a mutable offset biased toward the tail (argument region).
+        """
+        if not mutable:
+            return
+        payload = self._rng.choice(_MAGIC_PAYLOADS)
+        # Hard size cap — keeps each mutated packet ≤ MAGIC_MAX_BYTES of magic
+        # data so we trip buffer overflows without overwhelming the target's
+        # connection handlers (see _MAGIC_PAYLOADS docstring).
+        payload = payload[:MAGIC_MAX_BYTES]
+        n = len(data)
+
+        if n >= 2 and data[-2:] == b"\r\n":
+            # Insert before the trailing CRLF — keeps "CMD ...\r\n" valid.
+            data[n - 2:n - 2] = payload
+            return
+
+        # No trailing CRLF: bias toward the tail (argument region), leaving
+        # any static framing at the head intact.
+        tail = sorted(o for o in mutable if o >= n // 2) or mutable
+        pos = self._rng.choice(tail)
+        data[pos:pos] = payload
 
     # ===================================================================
     # FTP-aware mutation strategies

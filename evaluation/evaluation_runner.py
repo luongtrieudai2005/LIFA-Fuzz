@@ -1388,6 +1388,19 @@ async def _run_fusion_loop(
     rule_gen = RuleGenerator(min_confidence=0.5, max_rules=200)
     parser = TrafficParser(log_path=traffic_log, read_interval_ms=2000)
 
+    # Phase 3 / TASK 4: read force-inference thresholds from config.yaml so the
+    # in-process campaign path honours the same force_inference keys as the
+    # run_slow_loop.py daemon (single source of truth). Falls back to 600s /
+    # 20000 mutations. NOTE: re_infer_interval_s=30 below is the dominant
+    # cadence driver (fires first); force_inference is a starvation backstop.
+    try:
+        import yaml as _yaml
+        with open(_project_root / "config.yaml", encoding="utf-8") as _f:
+            _sl_cfg = (_yaml.safe_load(_f) or {}).get("slow_loop", {}) or {}
+    except Exception:
+        _sl_cfg = {}
+    _force_cfg = _sl_cfg.get("force_inference", {}) or {}
+
     orchestrator = RulesOrchestrator(
         parser=parser,
         agent=agent,
@@ -1397,6 +1410,8 @@ async def _run_fusion_loop(
         min_packets_before_infer=2,
         crash_manager=crash_manager,
         re_infer_interval_s=30.0,
+        force_inference_time_s=_force_cfg.get("time_threshold_s", 600.0),
+        force_inference_mutations=_force_cfg.get("mutation_threshold", 20000),
     )
 
     while True:

@@ -269,6 +269,12 @@ async def run_slow_loop(
         ab_mode=slow_loop_cfg.get("ab_mode", "llm"),
         ewma_controller=ewma_controller,
         re_infer_interval_s=slow_loop_cfg.get("re_infer_interval_s", 300.0),
+        force_inference_time_s=slow_loop_cfg.get("force_inference", {}).get(
+            "time_threshold_s", 600.0
+        ),
+        force_inference_mutations=slow_loop_cfg.get("force_inference", {}).get(
+            "mutation_threshold", 20000
+        ),
     )
 
     # ── Shutdown signal ──────────────────────────────────────────────

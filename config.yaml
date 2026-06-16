@@ -185,6 +185,14 @@ slow_loop:
   # types (e.g., HTTP with only GET/POST/HEAD).
   re_infer_interval_s: 300     # Seconds between forced re-inferences (default: 5 min)
 
+  # Phase 3 / TASK 4 — force-inference cadence. Hard OR-condition that fires an
+  # LLM inference even when new-unique-packet count is low, breaking the
+  # 14-inferences/4h starvation seen in the 8h campaign. Mutation count is read
+  # cross-process from shared/runtime_state.json.
+  force_inference:
+    time_threshold_s: 600      # Force inference if >600s since last inference
+    mutation_threshold: 20000  # Force inference if >20000 new mutations
+
   # EWMA Adaptive Controller — coordinates Fast Loop recv() sampling
   ewma_controller:
     enabled: true
