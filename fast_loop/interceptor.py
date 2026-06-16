@@ -43,6 +43,13 @@ from shared.schemas import Direction, TrafficRecord
 logger = get_logger("fast_loop.interceptor")
 
 
+# H1 fix: hard cap on the append-only traffic log. Without it,
+# raw_traffic.jsonl grows unbounded (~1.6 GiB/4h @200EPS, ~40 GiB @5000EPS) and
+# fills the disk mid-campaign. When exceeded, the writer truncates and starts
+# fresh; both readers detect the shrinkage (byte-offset > file-size) and reset.
+_TRAFFIC_LOG_MAX_BYTES: int = 512 * 1024 * 1024  # 512 MiB
+
+
 class Interceptor:
     """Async TCP proxy with packet capture and mutation injection.
 
@@ -336,7 +343,25 @@ class Interceptor:
                 continue
 
             try:
-                with open(self.traffic_log_path, "a") as f:
+                # H1 fix: cap the traffic log size. raw_traffic.jsonl is
+                # append-only and otherwise grows unbounded (~1.6 GiB/4h
+                # @200EPS, far more at higher EPS) → disk-full mid-campaign.
+                # When it exceeds the cap, truncate to empty and start fresh.
+                # Both readers (slow_loop parser + eval seed-feeder) detect the
+                # shrinkage (their byte-offset > file-size) and reset, so no
+                # traffic is double-read; we lose at most one in-flight batch.
+                mode = "a"
+                try:
+                    if self.traffic_log_path.stat().st_size > _TRAFFIC_LOG_MAX_BYTES:
+                        logger.warning(
+                            f"Traffic log exceeded "
+                            f"{_TRAFFIC_LOG_MAX_BYTES // (1024 * 1024)}MB "
+                            f"— truncating to cap disk usage"
+                        )
+                        mode = "w"
+                except OSError:
+                    pass
+                with open(self.traffic_log_path, mode) as f:
                     for line in self._write_buffer:
                         f.write(line)
                         f.write("\n")

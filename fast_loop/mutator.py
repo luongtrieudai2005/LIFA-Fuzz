@@ -617,9 +617,13 @@ class MutationEngine:
         self._last_injected_packet: bytes = b""
         self._last_injected_rule_id: Optional[str] = None
 
-        # H3 fix: crash attribution window — stores last N sends so the
+        # H3/H5 fix: crash attribution window — stores last N sends so the
         # crash monitor can see recent history, not just the last packet.
-        self._crash_window: deque = deque(maxlen=100)
+        # Bumped 100→200 (H5): at sustained high EPS the detection lag
+        # (poll_interval + confirm_drain) can exceed 100 sends, evicting the
+        # real culprit before Phase 2 confirmation can replay it. 200 keeps
+        # ~2-4s of history at typical EPS; memory ~200KB worst case.
+        self._crash_window: deque = deque(maxlen=200)
 
         # Post-crash confirmation (Phase 1): when frozen, _send() stops
         # appending to the crash_window. crash_monitor freezes it on crash
