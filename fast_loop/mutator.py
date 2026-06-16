@@ -509,6 +509,13 @@ class MutationEngine:
         budget_per_field:     int   = 0,
         # P3-A: warm-up phase
         warmup_seconds:       float = 30.0,
+        # Phase 3.1 / TASK 1: post-resume grace window. After the CrashMonitor
+        # restarts the target (snapshot restore) and resumes the engine, the
+        # freshly-restored server may refuse connections for a few hundred ms
+        # while it re-arms its accept loop. Connection-refused during this
+        # window is a transient restart artifact, NOT a crash. See
+        # _in_restart_grace() / _classify_conn_refused.
+        restart_grace_s:      float = 0.5,
         # ProtocolModule: "null" (default, pure black-box core) or a registered
         # case-study module name (e.g. "ftp"). Resolved via shared registry —
         # the core never hardcodes a protocol.
@@ -530,6 +537,8 @@ class MutationEngine:
         self.use_weighted        = use_weighted
         self.budget_per_field    = budget_per_field
         self.warmup_seconds      = warmup_seconds
+        # Phase 3.1 / TASK 1: post-resume grace window length (seconds).
+        self.restart_grace_s     = restart_grace_s
 
         # Active scheduler — swapped atomically on mode change
         self._scheduler:    _BaseScheduler    = self._make_normal_scheduler()
@@ -613,6 +622,24 @@ class MutationEngine:
         # packet that actually reproduces the crash. See
         # docs/crash_attribution_plan.md. Hot-loop cost: one bool branch.
         self._window_frozen: bool = False
+
+        # Phase 3 / TASK 1: set True while the CrashMonitor is restarting the
+        # target (pause() sets it, resume() clears it). Any in-flight send that
+        # hits a refused/reset connection during this window is classified
+        # TIMEOUT, not CRASH — a transient side-effect of the target being
+        # briefly down, not an actionable vulnerability. Without this guard the
+        # restart stall produced a storm of false CRASH statuses that armed
+        # ONE_AT_A_TIME investigation on every send. See _classify_conn_refused.
+        self._target_restarting: bool = False
+
+        # Phase 3.1 / TASK 1: post-resume grace deadline. resume() stamps
+        # ``now + restart_grace_s`` here; _in_restart_grace() treats the engine
+        # as still in restart-grace until this deadline even though
+        # ``_target_restarting`` has cleared. This closes the gap between the
+        # target being back alive (is_target_alive() True) and actually
+        # accepting connections (accept loop re-armed) — the ~1.3/min phantom
+        # ONE_AT_A_TIME investigations in smoke #2 came from sends in that gap.
+        self._restart_grace_until: float = 0.0
 
         # Stats (initialized above with correct mode)
         self._mutation_signatures: set[str] = set()
@@ -852,12 +879,57 @@ class MutationEngine:
     def pause(self) -> None:
         """Temporarily suspend fuzzing (e.g. while target server restarts)."""
         self._paused = True
+        # Phase 3 / TASK 1: mark the target as restarting so any in-flight
+        # send that hits a refused/reset connection is classified TIMEOUT,
+        # not CRASH (prevents spurious ONE_AT_A_TIME investigation).
+        self._target_restarting = True
         log.info("MutationEngine PAUSED")
 
     def resume(self) -> None:
         """Resume fuzzing after a pause."""
         self._paused = False
+        self._target_restarting = False
+        # Phase 3.1 / TASK 1: arm the post-resume grace window. The target is
+        # back alive (is_target_alive() True) but its accept loop may not be
+        # ready for a few hundred ms; sends landing in that gap get
+        # connection-refused and would otherwise be classified CRASH, arming a
+        # phantom ONE_AT_A_TIME investigation (~1.3/min in smoke #2).
+        # _in_restart_grace() / _classify_conn_refused treat those as TIMEOUT.
+        self._restart_grace_until = time.monotonic() + self.restart_grace_s
         log.info("MutationEngine RESUMED")
+
+    def _in_restart_grace(self) -> bool:
+        """True while connection-refused is a transient restart artifact.
+
+        Covers two windows where a refused/reset connection is NOT a crash:
+        1. ``_target_restarting`` is set — the CrashMonitor paused us to
+           restart the target (it is briefly down).
+        2. The post-resume grace window — the target is back up but may not
+           have re-armed its accept loop yet.
+        """
+        if self._target_restarting:
+            return True
+        return time.monotonic() < self._restart_grace_until
+
+    def cancel_investigation(self) -> None:
+        """Cancel a spurious ONE_AT_A_TIME investigation.
+
+        Called by the CrashMonitor on a *non-actionable* (exit 0) restart: a
+        graceful shutdown cannot itself be a crash, so any ONE_AT_A_TIME
+        investigation armed by connection-refused sends that landed in the
+        ~poll-interval window between target-down and pause() is phantom. We
+        stage a revert via ``_revert_pending``; the hot loop is paused, so the
+        revert lands at the top of the first iteration after resume (line ~835).
+        A no-op if we are not in investigation mode, so it is always safe to
+        call.
+        """
+        if self._mode == MutationMode.ONE_AT_A_TIME:
+            self._revert_pending = True
+            self._stats.revert_pending = True
+            log.info(
+                "Cancelling phantom ONE_AT_A_TIME investigation "
+                "(armed by pre-pause connection-refused race)"
+            )
 
     # -------------------------------------------------------------------
     # Mode Control  (hook for Health Monitor / orchestrator)
@@ -1454,6 +1526,24 @@ class MutationEngine:
             purely random havoc mutation via BinaryMutator to maintain
             wide state-space coverage and prevent mode collapse.
         """
+        # ── Phase 3 / TASK 3: exploitation payloads ────────────────────
+        # With ~50% probability on FTP targets (the confirmed vuln is in
+        # argument handling), bypass every other path and inject a known
+        # "magic value" payload (buffer overflow / format string / path
+        # traversal) directly into the argument region. RANDOM_BYTES almost
+        # never synthesizes these, so this is what actually detonates the
+        # known memory-handling bug. The remaining ~50% keep the ε-greedy
+        # exploration + LLM-guided exploitation paths intact.
+        _MAGIC_PROB = 0.5 if getattr(self, "_is_ftp_target", False) else 0.0
+        if _MAGIC_PROB and random.random() < _MAGIC_PROB:
+            buf = bytearray(seed.raw_bytes)
+            self._binary_mutator.mutate_with(buf, "magic_values")
+            result = bytes(buf)
+            self._last_injected_rule_id = "magic_values"
+            self._current_rule_type = "magic_values"
+            self._mutation_signatures.add(f"magic:len:{len(result)}")
+            return result
+
         # ── ε-greedy: exploration vs exploitation ──────────────────────
         # Operators = generic 15 + module-supplied (FTPModule adds 4 FTP
         # strategies; NullModule adds none → pure black-box havoc, no FTP leak).
@@ -1579,13 +1669,163 @@ class MutationEngine:
         return self._module.ensure_framing(payload)
 
     # -------------------------------------------------------------------
+    # FTP connection-terminating command blacklist (Phase 3 / TASK 2)
+    # -------------------------------------------------------------------
+
+    def _is_ftp_quit_command(self, payload: bytes) -> bool:
+        """Return True if *payload* is an FTP connection-terminating command.
+
+        QUIT/BYE/EXIT make LightFTP shut down the session (and, on some
+        control paths, the process exits cleanly with exit_code=0). Sending
+        them wastes a ~2s VM restart and — before Phase 3 — every such
+        normal exit was treated as a crash, arming ONE_AT_A_TIME
+        investigation on phantom crashes. TASK 2 drops these commands
+        before they hit the wire.
+
+        Match is on the leading command token (case-insensitive), terminated
+        by a space / CR / LF / end-of-payload — so e.g. ``QUITX`` is NOT
+        matched, but ``QUIT\\r\\n`` / ``QUIT admin`` are.
+        """
+        if not payload or not getattr(self, "_is_ftp_target", False):
+            return False
+        try:
+            text = payload[:8].decode("ascii", errors="ignore").upper()
+        except Exception:
+            return False
+        for verb in ("QUIT", "BYE", "EXIT"):
+            if text.startswith(verb):
+                terminator = text[len(verb):len(verb) + 1]
+                if terminator in ("", " ", "\r", "\n"):
+                    return True
+        return False
+
+    def _drop_if_ftp_quit(self, payload: bytes, seed_id: str) -> bool:
+        """If *payload* is an FTP QUIT/BYE/EXIT, log ``[Drop]`` and return True.
+
+        Caller returns ``PacketStatus.REJECTED`` immediately (no socket send).
+        ``status_callback`` is notified REJECTED so the seed is neither
+        re-tried nor counted as a crash. Returns False for non-QUIT payloads
+        (caller continues normally).
+        """
+        if not self._is_ftp_quit_command(payload):
+            return False
+        log.info(
+            "[Drop] FTP QUIT/BYE/EXIT — skipping send to avoid target shutdown",
+            extra={"context": {
+                "payload_hex": payload.hex()[:48],
+                "len":         len(payload),
+                "seed":        (seed_id or "")[:8],
+            }},
+        )
+        if self.status_callback:
+            try:
+                self.status_callback(seed_id, PacketStatus.REJECTED)
+            except Exception:
+                pass
+        return True
+
+    # -------------------------------------------------------------------
     # Network Send
     # -------------------------------------------------------------------
+
+    async def _probe_target_alive(self) -> bool:
+        """Fast black-box probe: is the target accepting TCP connections now?
+
+        Three quick connect attempts, 50 ms apart, 0.2 s timeout each. If any
+        succeeds the target is up — a refused send that reached this probe was
+        a transient restart/overload artifact (phantom), NOT a real crash.
+
+        Pure black-box: a TCP connect is exactly the same observable the
+        fuzzer already uses to send; no source/protocol knowledge. Worst-case
+        cost ~150-200 ms, paid ONLY on a refused send that already passed the
+        restart-grace filter (rare), so the hot-path EPS is unaffected.
+        """
+        for attempt in range(3):
+            writer = None
+            try:
+                _reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(self.target_host, self.target_port),
+                    timeout=0.2,
+                )
+                return True  # connect succeeded → target is up
+            except (asyncio.TimeoutError, ConnectionRefusedError,
+                    ConnectionResetError, ConnectionAbortedError, OSError):
+                pass
+            finally:
+                if writer is not None:
+                    try:
+                        writer.close()
+                        await asyncio.wait_for(writer.wait_closed(), timeout=0.2)
+                    except Exception:
+                        pass
+            if attempt < 2:
+                await asyncio.sleep(0.05)
+        return False
+
+    async def _classify_conn_refused(
+        self,
+        payload: bytes,
+        label: str,
+        extra: dict | None = None,
+    ) -> PacketStatus:
+        """Classify a refused/reset/broken-pipe connection.
+
+        Three filters, cheapest first (Phase 3 / 3.1 / 3.2):
+
+        1. **restart-grace** (``_in_restart_grace()``): the target is known to
+           be restarting (paused) OR within the post-resume grace window.
+           A refusal here is a transient restart artifact → TIMEOUT.
+
+        2. **Fast target probe** (Phase 3.2): a refusal that slipped past
+           restart-grace may still be transient — the target is up but a single
+           accept/overload hiccup dropped us. Probe with 3 quick connect
+           attempts; if ANY succeeds, the target is alive → phantom → TIMEOUT.
+           No investigation, EPS preserved.
+
+        3. **Real crash**: only if both filters fail (target genuinely silent
+           across 3 probes) do we classify CRASH and let the hot loop arm the
+           ONE_AT_A_TIME investigation. ASAN aborts (exit 134) are caught
+           earlier by the CrashMonitor via the sandbox, not here.
+        """
+        # Filter 1: restart-grace.
+        if self._in_restart_grace():
+            log.debug(
+                f"Target unreachable during restart-grace ({label}) — "
+                f"classified TIMEOUT, not crash"
+            )
+            return PacketStatus.TIMEOUT
+
+        # Filter 2: fast probe — is the target actually up right now?
+        if await self._probe_target_alive():
+            log.debug(
+                f"Target reachable on probe after refused ({label}) — "
+                f"transient artifact, classified TIMEOUT, not crash"
+            )
+            return PacketStatus.TIMEOUT
+
+        # Filter 3: target genuinely down across 3 probes → real crash.
+        ctx = {
+            "payload_hex": payload.hex()[:48],
+            "len":         len(payload),
+        }
+        if extra:
+            ctx.update(extra)
+        log.error(f"Target CRASH ({label}) — confirmed down across 3 probes",
+                  extra={"context": ctx})
+        if self.crash_callback:
+            self.crash_callback(payload, "connection_refused")
+        return PacketStatus.CRASH
 
     async def _send(self, payload: bytes, seed_id: str) -> PacketStatus:
         """Open a fresh TCP connection and send one mutated payload."""
         # FTP CRLF enforcement: ensure packet ends with \r\n
         payload = self._ensure_ftp_crlf(payload)
+
+        # Phase 3 / TASK 2: drop connection-terminating commands (QUIT/BYE/EXIT)
+        # before they hit the wire — they make the target exit(0) and waste a
+        # restart. Return REJECTED (never CRASH) without opening a socket.
+        if self._drop_if_ftp_quit(payload, seed_id):
+            return PacketStatus.REJECTED
 
         status = PacketStatus.TIMEOUT
         writer = None
@@ -1630,16 +1870,7 @@ class MutationEngine:
                 status = PacketStatus.TIMEOUT
 
         except (ConnectionRefusedError, ConnectionResetError, BrokenPipeError):
-            status = PacketStatus.CRASH
-            log.error(
-                "Target CRASH (connection refused/reset)",
-                extra={"context": {
-                    "payload_hex": payload.hex()[:48],
-                    "len":         len(payload),
-                }},
-            )
-            if self.crash_callback:
-                self.crash_callback(payload, "connection_refused")
+            status = await self._classify_conn_refused(payload, "connection refused/reset")
 
         except asyncio.TimeoutError:
             status = PacketStatus.TIMEOUT
@@ -1680,6 +1911,10 @@ class MutationEngine:
         # FTP CRLF enforcement
         payload = self._ensure_ftp_crlf(payload)
 
+        # Phase 3 / TASK 2: drop QUIT/BYE/EXIT before sending.
+        if self._drop_if_ftp_quit(payload, seed_id):
+            return PacketStatus.REJECTED
+
         status = PacketStatus.TIMEOUT
         writer = None
 
@@ -1719,16 +1954,9 @@ class MutationEngine:
                 status = PacketStatus.TIMEOUT
 
         except (ConnectionRefusedError, ConnectionResetError, BrokenPipeError):
-            status = PacketStatus.CRASH
-            log.error(
-                "Target CRASH (stateful, connection refused/reset)",
-                extra={"context": {
-                    "payload_hex": payload.hex()[:48],
-                    "len":         len(payload),
-                }},
+            status = await self._classify_conn_refused(
+                payload, "stateful, connection refused/reset"
             )
-            if self.crash_callback:
-                self.crash_callback(payload, "connection_refused")
 
         except asyncio.TimeoutError:
             status = PacketStatus.TIMEOUT
@@ -1784,6 +2012,11 @@ class MutationEngine:
         """
         # FTP CRLF enforcement on the mutated target
         mutated_payload = self._ensure_ftp_crlf(mutated_payload)
+
+        # Phase 3 / TASK 2: drop QUIT/BYE/EXIT target commands before sending —
+        # they would terminate the session/target and waste a restart.
+        if self._drop_if_ftp_quit(mutated_payload, target.sequence_id):
+            return PacketStatus.REJECTED
 
         status = PacketStatus.TIMEOUT
         writer = None
@@ -1910,17 +2143,11 @@ class MutationEngine:
                     pass
 
         except (ConnectionRefusedError, ConnectionResetError, BrokenPipeError):
-            status = PacketStatus.CRASH
-            log.error(
-                "Target CRASH (sequence, connection refused/reset)",
-                extra={"context": {
-                    "payload_hex": mutated_payload.hex()[:48],
-                    "len":         len(mutated_payload),
-                    "target_idx":  target.target_index,
-                }},
+            status = await self._classify_conn_refused(
+                mutated_payload,
+                "sequence, connection refused/reset",
+                extra={"target_idx": target.target_index},
             )
-            if self.crash_callback:
-                self.crash_callback(mutated_payload, "connection_refused")
 
         except asyncio.TimeoutError:
             status = PacketStatus.TIMEOUT

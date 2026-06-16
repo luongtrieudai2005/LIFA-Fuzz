@@ -331,7 +331,31 @@ class CrashMonitor:
                 f"without recording. ({cls_detail})"
             )
             if self.auto_reset:
-                await self.restart_target()
+                # Phase 3 / TASK 1: pause the Interceptor + MutationEngine
+                # around the restart so the hot loop does NOT fire a barrage
+                # of sends at the dead target. Without this, every send during
+                # the restart stall got connection-refused → PacketStatus.CRASH
+                # → spurious ONE_AT_A_TIME investigation (29x in the 8h run),
+                # which burned budget on phantom crashes and collapsed EPS.
+                # settle=False skips the 2s restart_delay_s (Firecracker snapshot
+                # restore is <10ms; the settle is Docker-legacy and pure EPS
+                # drag here). Real crashes still use settle=True (actionable
+                # path below).
+                await self.pause_interceptor()
+                # Phase 3.1 / TASK 1: a graceful exit (exit 0) cannot itself be
+                # a crash, so any ONE_AT_A_TIME investigation armed by
+                # connection-refused sends that landed in the ~poll-interval
+                # window BETWEEN target-down and pause() is phantom. Cancel it
+                # so the engine reverts to normal mode on resume instead of
+                # burning isolation budget on ghosts (~1.3/min in smoke #2).
+                if self.mutator is not None:
+                    cancel = getattr(self.mutator, "cancel_investigation", None)
+                    if cancel is not None:
+                        cancel()
+                try:
+                    await self.restart_target(settle=False)
+                finally:
+                    await self.resume_interceptor()
             return record
 
         # ── Actionable crash below ───────────────────────────────────
@@ -765,7 +789,7 @@ class CrashMonitor:
     # Container Control
     # -----------------------------------------------------------------
 
-    async def restart_target(self) -> None:
+    async def restart_target(self, settle: bool = True) -> None:
         """Reset the crashed target via the sandbox abstraction.
 
         Delegates to ``sandbox.reset_state()``:
@@ -773,14 +797,25 @@ class CrashMonitor:
         - MicroVM: snapshot restore (< 10ms).
 
         After reset, waits for the target to become alive again.
-        """
-        logger.info(
-            f"Resetting target server (waiting {self.restart_delay_s}s "
-            f"before reset)..."
-        )
 
-        # Brief delay to let the crash settle (Docker daemon needs time)
-        await asyncio.sleep(self.restart_delay_s)
+        Args:
+            settle: When True, sleep ``restart_delay_s`` before resetting
+                (lets a Docker crash settle so the daemon is ready). When
+                False (e.g. a normal exit-code-0 restart on Firecracker),
+                skip the delay — snapshot restore is sub-10ms and the 2s
+                settle stall is pure EPS drag with no benefit.
+        """
+        if settle:
+            logger.info(
+                f"Resetting target server (waiting {self.restart_delay_s}s "
+                f"before reset)..."
+            )
+            # Brief delay to let the crash settle (Docker daemon needs time)
+            await asyncio.sleep(self.restart_delay_s)
+        else:
+            logger.info(
+                "Resetting target server (fast path — no settle delay)..."
+            )
 
         # Reset
         t0 = time.monotonic()

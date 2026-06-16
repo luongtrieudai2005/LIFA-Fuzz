@@ -43,6 +43,7 @@ from collections import OrderedDict
 from typing import Any, Optional
 
 from shared.logger import get_logger
+from shared.runtime_state import read_runtime_state
 from shared.schemas import FieldRule, MutationStrategy, ProtocolGrammar, RuleType, SemanticRule
 from slow_loop.llm_agent import LLMAgent, estimate_tokens
 from slow_loop.parser import InteractionSession, TrafficParser
@@ -358,6 +359,8 @@ class RulesOrchestrator:
         ab_mode: str = "llm",
         ewma_controller: Optional[EWMAController] = None,
         re_infer_interval_s: float = 30.0,
+        force_inference_time_s: float = 600.0,
+        force_inference_mutations: int = 20000,
     ) -> None:
         self.parser = parser
         self.agent = agent
@@ -378,6 +381,17 @@ class RulesOrchestrator:
         # types (e.g., HTTP with only GET/POST/HEAD).
         self._re_infer_interval_s: float = re_infer_interval_s
         self._last_inference_time: float = time.monotonic()
+
+        # Phase 3 / TASK 4: force-inference cadence. Even when the packet-based
+        # trigger starves (few new unique packets), force an LLM inference when
+        # EITHER enough time has passed OR enough mutations have run. This broke
+        # the 14-inferences/4h starvation seen in the 8h campaign. The mutation
+        # count is read cross-process from shared/runtime_state.json (the Fast
+        # Loop writes it; the Slow Loop is a separate process and cannot import
+        # the live MutationEngine).
+        self._force_inference_time_s: float = force_inference_time_s
+        self._force_inference_mutations: int = force_inference_mutations
+        self._mutations_at_last_inference: int = self._read_total_mutations()
 
         # Sliding window for dedup
         self._window = SlidingWindow(max_entries=window_size)
@@ -418,6 +432,59 @@ class RulesOrchestrator:
     # Main Pipeline
     # -----------------------------------------------------------------
 
+    # -----------------------------------------------------------------
+    # Phase 3 / TASK 4 — force-inference cadence helpers
+    # -----------------------------------------------------------------
+
+    def _read_total_mutations(self) -> int:
+        """Read the Fast Loop's cumulative mutation count cross-process.
+
+        The Slow Loop is a separate process, so it cannot import the live
+        MutationEngine. It reads ``mutator.total_sent`` from
+        ``shared/runtime_state.json`` (written by the Fast Loop). Returns 0
+        on any failure (missing file, malformed JSON, schema drift) — fail
+        safe so the time-based trigger still works.
+        """
+        try:
+            state = read_runtime_state()
+            if state is None:
+                return 0
+            mutator = getattr(state, "mutator", None)
+            if mutator is None:
+                return 0
+            return int(getattr(mutator, "total_sent", 0)) or 0
+        except Exception:
+            return 0
+
+    def _force_inference_due(self) -> bool:
+        """Return True if a forced LLM inference is due (Phase 3 / TASK 4).
+
+        Force when EITHER:
+          * ``> force_inference_time_s`` seconds elapsed since the last
+            inference, OR
+          * ``> force_inference_mutations`` new mutations ran since the last
+            inference.
+        Independent of new-unique-packet count — breaks starvation.
+        """
+        time_since_last = time.monotonic() - self._last_inference_time
+        if time_since_last > self._force_inference_time_s:
+            return True
+        mutations_since = (
+            self._read_total_mutations() - self._mutations_at_last_inference
+        )
+        if mutations_since > self._force_inference_mutations:
+            return True
+        return False
+
+    def _mark_inference_time(self) -> None:
+        """Record that an inference attempt just completed (success or error).
+
+        Resets both the time-based and mutation-based force-inference counters
+        so neither re-arms until another threshold elapses.
+        """
+        self._last_inference_time = time.monotonic()
+        self._mutations_at_last_inference = self._read_total_mutations()
+
     async def run_cycle(self) -> Optional[dict[str, Any]]:
         """Execute one inference cycle: read → dedup → math → LLM → rules.
 
@@ -447,7 +514,11 @@ class RulesOrchestrator:
         try:
             # ── 1. Read traffic log ─────────────────────────────────
             sessions = await self.parser.read_log()
-            if not sessions:
+            # Phase 3 / TASK 4: do NOT bail when there are no new sessions if a
+            # force-inference trigger is due — proceed using the buffered window
+            # packets instead. Returning early here (before the time/mutation
+            # triggers were ever checked) was the actual LLM-starvation cause.
+            if not sessions and not self._force_inference_due():
                 return None
 
             # Flatten all packets from all sessions
@@ -469,8 +540,15 @@ class RulesOrchestrator:
             # ── 3. Check minimum threshold ──────────────────────────
             time_since_last = time.monotonic() - self._last_inference_time
             re_infer_due = time_since_last >= self._re_infer_interval_s
+            # Phase 3 / TASK 4: force trigger (time OR mutations) — independent
+            # of new-unique-packet count, breaks LLM starvation.
+            force_due = self._force_inference_due()
 
-            if new_count < self.min_packets_before_infer and not re_infer_due:
+            if (
+                new_count < self.min_packets_before_infer
+                and not re_infer_due
+                and not force_due
+            ):
                 self._skipped_insufficient_data += 1
                 logger.debug(
                     f"Not enough new unique packets ({new_count} < "
@@ -489,14 +567,19 @@ class RulesOrchestrator:
                     "packets_available": self._window.size,
                 }
 
-            # Time-based re-inference trigger: even if new_count is below
-            # threshold, force inference when the timer fires. This ensures
-            # the LLM keeps running on protocols with few message types.
-            if new_count < self.min_packets_before_infer and re_infer_due:
+            # Forced re-inference trigger: even if new_count is below
+            # threshold, force inference when the time/mutation timer fires.
+            # This ensures the LLM keeps running on protocols with few message
+            # types (Phase 3 / TASK 4: time-based OR mutation-based).
+            if new_count < self.min_packets_before_infer and (re_infer_due or force_due):
+                muts_since = max(
+                    0, self._read_total_mutations() - self._mutations_at_last_inference
+                )
                 logger.info(
-                    f"Time-based re-inference triggered "
-                    f"({time_since_last:.0f}s since last inference, "
-                    f"{new_count} new unique packets). "
+                    f"Forced re-inference triggered "
+                    f"(time_since_last={time_since_last:.0f}s, "
+                    f"new_unique={new_count}, "
+                    f"mutations_since_last={muts_since}). "
                     f"Forcing cycle with {self._window.size} buffered packets."
                 )
 
@@ -749,7 +832,7 @@ class RulesOrchestrator:
                     response_feedback=response_feedback,
                 )
                 self._total_inferences += 1
-                self._last_inference_time = time.monotonic()  # Reset timer
+                self._mark_inference_time()  # Reset timer
             except (RuntimeError, ValueError) as llm_err:
                 # LLM failed → fall back to bootstrap rules from heatmap
                 self._errors += 1
@@ -757,7 +840,7 @@ class RulesOrchestrator:
                 # BUG 4 fix: reset inference timer so re_infer_due won't
                 # fire again immediately, causing an infinite full-buffer
                 # retransmit loop during LLM outages.
-                self._last_inference_time = time.monotonic()
+                self._mark_inference_time()
                 # BUG 3 fix: allow bootstrap fallback to activate again
                 # on next cycle so the fuzzer can recover from stale rules.
                 self._llm_rules_active = False
@@ -873,7 +956,7 @@ class RulesOrchestrator:
             # LLM parse errors — non-fatal, try bootstrap fallback
             self._errors += 1
             self._last_error = str(e)
-            self._last_inference_time = time.monotonic()
+            self._mark_inference_time()
             self._llm_rules_active = False
             logger.error(f"LLM parse error in cycle #{self._total_cycles}: {e}")
 
@@ -912,7 +995,7 @@ class RulesOrchestrator:
             # LLM API errors — non-fatal, try bootstrap fallback
             self._errors += 1
             self._last_error = str(e)
-            self._last_inference_time = time.monotonic()
+            self._mark_inference_time()
             self._llm_rules_active = False
             logger.error(f"LLM API error in cycle #{self._total_cycles}: {e}")
 
@@ -951,7 +1034,7 @@ class RulesOrchestrator:
             # Unexpected errors — log and continue
             self._errors += 1
             self._last_error = str(e)
-            self._last_inference_time = time.monotonic()
+            self._mark_inference_time()
             self._llm_rules_active = False
             logger.error(
                 f"Unexpected error in cycle #{self._total_cycles}: {e}",
