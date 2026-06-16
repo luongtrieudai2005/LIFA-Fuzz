@@ -145,24 +145,21 @@ class TrafficParser:
             logger.debug(f"Traffic log not found: {self.log_path}")
             return []
 
-        try:
-            with open(self.log_path, "r") as f:
-                lines = f.readlines()
-        except OSError as e:
-            logger.error(f"Failed to read traffic log: {e}")
-            return []
-
         # Detect file rotation/truncation — reset position if the file
         # was replaced or shrank. Without this, the parser silently
         # stops reading new packets after a rotation.
         try:
+            cur_size = self.log_path.stat().st_size
             cur_mtime = self.log_path.stat().st_mtime
         except OSError:
+            cur_size = 0
             cur_mtime = 0.0
 
         rotation_detected = False
-        if self._last_read_position > len(lines):
-            # File shrank — classic truncation/rotation
+        if self._last_read_position > cur_size and cur_size > 0:
+            # File shrank below our last read offset — classic
+            # truncation/rotation. (cur_size==0 is a freshly-truncated file,
+            # not a rotation; the read below just yields nothing.)
             rotation_detected = True
         elif self._last_file_mtime > 0 and cur_mtime < self._last_file_mtime - 1.0:
             # mtime went backwards — file was replaced (new inode).
@@ -172,7 +169,7 @@ class TrafficParser:
         if rotation_detected:
             logger.info(
                 f"Traffic log rotated/truncated "
-                f"(last_pos={self._last_read_position}, lines={len(lines)}, "
+                f"(last_pos={self._last_read_position}, size={cur_size}, "
                 f"mtime {self._last_file_mtime:.1f}→{cur_mtime:.1f}) "
                 f"— resetting read position"
             )
@@ -180,9 +177,22 @@ class TrafficParser:
 
         self._last_file_mtime = cur_mtime
 
-        # Parse new lines (incremental)
+        # H1 fix: incremental BYTE-seek read. The old code did f.readlines()
+        # on the ENTIRE file then sliced lines[pos:] — an OOM time-bomb over a
+        # long run, since raw_traffic.jsonl grows unbounded (~1.6 GiB/4h
+        # @200EPS). _last_read_position is now a BYTE offset; seek to it and
+        # read only the new tail.
         new_entries: list[dict[str, Any]] = []
-        for line in lines[self._last_read_position:]:
+        try:
+            with open(self.log_path, "r") as f:
+                f.seek(self._last_read_position)
+                new_lines = f.readlines()
+                self._last_read_position = f.tell()
+        except OSError as e:
+            logger.error(f"Failed to read traffic log: {e}")
+            return []
+
+        for line in new_lines:
             line = line.strip()
             if not line:
                 continue
@@ -193,7 +203,6 @@ class TrafficParser:
                 logger.warning(f"Skipping malformed JSONL line: {e}")
                 continue
 
-        self._last_read_position = len(lines)
         self._total_packets_read += len(new_entries)
 
         if not new_entries:

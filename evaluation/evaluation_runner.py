@@ -535,7 +535,7 @@ async def run_single_baseline(
             reached → "stuck at greeting". Grouping makes the real client
             traffic the state oracle (black-box: no protocol knowledge here).
             """
-            last_pos = 0
+            last_byte_offset = 0
             import json as _json
             import time as _time
             session_buffers: dict[str, dict] = {}
@@ -546,10 +546,25 @@ async def run_single_baseline(
                     if not p.exists():
                         await asyncio.sleep(1.0)
                         continue
+                    # H1 fix: incremental byte-seek read. f.readlines() on the
+                    # FULL file every poll was an OOM time-bomb over a 12h run
+                    # (raw_traffic.jsonl grows ~1.6 GiB/4h @200EPS, far more at
+                    # higher EPS). Seek to the last byte read, read only new
+                    # lines, remember the new offset. Mirrors main.py's feeder.
+                    try:
+                        file_size = p.stat().st_size
+                    except OSError:
+                        file_size = 0
+                    if last_byte_offset > file_size:
+                        # File shrank — interceptor rotated/truncated it.
+                        # Restart from the start so we don't miss traffic.
+                        last_byte_offset = 0
                     with open(p) as f:
-                        lines = f.readlines()
+                        f.seek(last_byte_offset)
+                        new_lines = f.readlines()
+                        last_byte_offset = f.tell()
                     now = _time.time()
-                    for line in lines[last_pos:]:
+                    for line in new_lines:
                         line = line.strip()
                         if not line:
                             continue
@@ -586,7 +601,8 @@ async def run_single_baseline(
                         buf = session_buffers.pop(sid)
                         await seed_queue.put(
                             SeedSequence(session_id=sid, packets=buf["packets"]))
-                    last_pos = len(lines)
+                    # last_byte_offset is advanced by f.tell() above (H1 fix);
+                    # no line-count bookkeeping needed.
                 except Exception:
                     pass
                 await asyncio.sleep(1.0)
