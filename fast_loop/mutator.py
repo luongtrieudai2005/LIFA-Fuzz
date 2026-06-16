@@ -129,6 +129,12 @@ _KILL_PAYLOAD_NAMES: list[str] = [
     "length_overflow_crash",
 ]
 
+# Phase 3.2 / BUG-2 fix: minimum gap between consecutive fast probes. A burst
+# of refused sends reuses the last probe result within this window instead of
+# re-opening up to 3 connections each — prevents self-amplifying overload on a
+# thread/fork-per-connection target.
+PROBE_COOLDOWN_S: float = 0.25
+
 
 # ===========================================================================
 # Mutation Mode
@@ -641,6 +647,15 @@ class MutationEngine:
         # ONE_AT_A_TIME investigations in smoke #2 came from sends in that gap.
         self._restart_grace_until: float = 0.0
 
+        # Phase 3.2 / BUG-2 fix: probe rate-limit state. Without a cooldown, a
+        # burst of refused sends (up to 5 before the hot-loop back-pressure
+        # kicks in) could each fire 3 fresh probe connections → 15 extra
+        # connections on a thread/fork-per-connection target, self-amplifying
+        # the very overload that caused the refusals. Reuse the last probe
+        # result within PROBE_COOLDOWN_S.
+        self._last_probe_monotonic: float = 0.0
+        self._last_probe_alive: bool = True
+
         # Stats (initialized above with correct mode)
         self._mutation_signatures: set[str] = set()
         self._current_rule_type: Optional[str] = None  # for _track_rule_response
@@ -942,6 +957,16 @@ class MutationEngine:
         instead of silently dropping the crash trigger.
         """
         async with self._sched_lock:
+            # BUG-1 fix: a freshly-armed real-crash investigation must supersede
+            # any _revert_pending staged by cancel_investigation() during a
+            # prior normal-exit (phantom pre-pause race). Without this, a stale
+            # cancel from the previous cycle would revert THIS real-crash
+            # investigation on the next hot-loop iteration, silently dropping
+            # crash isolation. Clear unconditionally — if no cancel was pending
+            # this is a no-op.
+            self._revert_pending = False
+            self._stats.revert_pending = False
+
             if self._mode == MutationMode.ONE_AT_A_TIME:
                 # P1-A: restart investigation from field 0 with fresh budget
                 if isinstance(self._scheduler, OneAtATimeScheduler):
@@ -1248,10 +1273,25 @@ class MutationEngine:
 
         Returns:
             Appropriate PacketStatus enum value.
+
+        BUG-4 fix: a protocol module's ``classify`` runs on arbitrary (often
+        mutated, malformed) bytes in the hot loop. If it ever raises, the
+        exception would propagate out of ``_send``/``_execute_sequence`` past
+        their connection-error-only handlers and kill the hot-loop task. Fall
+        back to ACCEPTED (we got non-empty bytes back = the server processed
+        something) and log once; never let a classifier crash take the engine
+        down.
         """
-        return self._module.classify(resp, payload)
-        # Default: got bytes back = accepted
-        return PacketStatus.ACCEPTED
+        try:
+            return self._module.classify(resp, payload)
+        except Exception as exc:
+            log.warning(
+                "protocol module classify() raised — falling back to ACCEPTED",
+                extra={"context": {"err": str(exc)[:120],
+                                   "resp_len": len(resp),
+                                   "payload_len": len(payload)}},
+            )
+            return PacketStatus.ACCEPTED
 
     def _track_rule_response(self, status: PacketStatus) -> None:
         """Track per-rule-type response stats for LLM feedback.
@@ -1739,7 +1779,19 @@ class MutationEngine:
         fuzzer already uses to send; no source/protocol knowledge. Worst-case
         cost ~150-200 ms, paid ONLY on a refused send that already passed the
         restart-grace filter (rare), so the hot-path EPS is unaffected.
+
+        BUG-2 fix: rate-limited via PROBE_COOLDOWN_S. A burst of refused sends
+        would otherwise each open up to 3 connections, self-amplifying overload
+        on a thread/fork-per-connection target. Within the cooldown we reuse
+        the last result — the target's liveness does not meaningfully change
+        in 250 ms, and a fresh probe then just re-opens connections we are
+        about to close.
         """
+        now = time.monotonic()
+        if now - self._last_probe_monotonic < PROBE_COOLDOWN_S:
+            return self._last_probe_alive
+
+        alive = False
         for attempt in range(3):
             writer = None
             try:
@@ -1747,7 +1799,8 @@ class MutationEngine:
                     asyncio.open_connection(self.target_host, self.target_port),
                     timeout=0.2,
                 )
-                return True  # connect succeeded → target is up
+                alive = True  # connect succeeded → target is up
+                break
             except (asyncio.TimeoutError, ConnectionRefusedError,
                     ConnectionResetError, ConnectionAbortedError, OSError):
                 pass
@@ -1760,7 +1813,10 @@ class MutationEngine:
                         pass
             if attempt < 2:
                 await asyncio.sleep(0.05)
-        return False
+
+        self._last_probe_monotonic = now
+        self._last_probe_alive = alive
+        return alive
 
     async def _classify_conn_refused(
         self,
