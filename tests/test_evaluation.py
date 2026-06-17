@@ -56,14 +56,14 @@ from shared.schemas import (
 class TestGroundTruth:
     """Tests for the LIFA protocol ground truth definition."""
 
-    def test_has_4_fields(self):
-        """Ground truth defines exactly 4 protocol fields."""
-        assert len(LIFA_GROUND_TRUTH) == 4
+    def test_has_5_fields(self):
+        """Ground truth defines exactly 5 protocol fields (v2: +version)."""
+        assert len(LIFA_GROUND_TRUTH) == 5
 
     def test_field_names(self):
-        """Field names match the vulnerable server protocol."""
+        """Field names match the vulnerable server v2 protocol."""
         names = [f.name for f in LIFA_GROUND_TRUTH]
-        assert names == ["magic", "opcode", "length", "payload"]
+        assert names == ["magic", "version", "opcode", "length", "payload"]
 
     def test_magic_is_static(self):
         """Magic field is marked as static with correct hex value."""
@@ -73,40 +73,51 @@ class TestGroundTruth:
         assert magic.offset_start == 0
         assert magic.offset_end == 4
 
+    def test_version_is_static(self):
+        """Version field (v2) at offset [4,5), static 0x01."""
+        version = LIFA_GROUND_TRUTH[1]
+        assert version.semantic_role == "static"
+        assert version.offset_start == 4
+        assert version.offset_end == 5
+        assert version.wire_type == "uint8"
+        assert version.static_hex == "01"
+
     def test_opcode_is_enum(self):
-        """Opcode field is marked as enum with valid values."""
-        opcode = LIFA_GROUND_TRUTH[1]
+        """Opcode field at [5,6) with 4 valid values (v2 opcodes)."""
+        opcode = LIFA_GROUND_TRUTH[2]
         assert opcode.semantic_role == "enum"
-        assert opcode.offset_start == 4
-        assert opcode.offset_end == 5
+        assert opcode.offset_start == 5
+        assert opcode.offset_end == 6
         assert 0x01 in opcode.valid_values
         assert 0x02 in opcode.valid_values
+        assert 0x03 in opcode.valid_values
+        assert 0x04 in opcode.valid_values
 
     def test_length_field(self):
-        """Length field at correct offset, uint8 type."""
-        length = LIFA_GROUND_TRUTH[2]
+        """Length field at [6,8), uint16_le (v2 widened length)."""
+        length = LIFA_GROUND_TRUTH[3]
         assert length.semantic_role == "length"
-        assert length.offset_start == 5
-        assert length.offset_end == 6
-        assert length.wire_type == "uint8"
+        assert length.offset_start == 6
+        assert length.offset_end == 8
+        assert length.wire_type == "uint16_le"
 
     def test_payload_is_variable(self):
-        """Payload field extends to end of packet (-1)."""
-        payload = LIFA_GROUND_TRUTH[3]
+        """Payload field extends to end of packet (-1), starting at byte 8."""
+        payload = LIFA_GROUND_TRUTH[4]
         assert payload.semantic_role == "variable"
-        assert payload.offset_start == 6
+        assert payload.offset_start == 8
         assert payload.offset_end == -1
         assert payload.length == -1
 
     def test_header_size(self):
-        """Header size is 6 bytes (magic + opcode + length)."""
-        assert LIFA_HEADER_SIZE == 6
+        """Header size is 8 bytes (magic + version + opcode + length_le16)."""
+        assert LIFA_HEADER_SIZE == 8
 
     def test_get_summary(self):
         """get_ground_truth_summary() returns a valid dict."""
         summary = get_ground_truth_summary()
         assert summary["protocol"] == "LIFA Binary Protocol"
-        assert len(summary["fields"]) == 4
+        assert len(summary["fields"]) == 5
         assert "vulnerability" in summary
 
 
@@ -141,11 +152,13 @@ class TestRQ1Accuracy:
         grammar = self._make_grammar([
             {"name": "magic",   "offset_start": 0, "offset_end": 4,
              "field_type": "bytes", "strategy": "static", "is_constant": True},
-            {"name": "opcode",  "offset_start": 4, "offset_end": 5,
+            {"name": "version", "offset_start": 4, "offset_end": 5,
+             "field_type": "uint8", "strategy": "static", "is_constant": True},
+            {"name": "opcode",  "offset_start": 5, "offset_end": 6,
              "field_type": "uint8", "strategy": "dictionary"},
-            {"name": "length",  "offset_start": 5, "offset_end": 6,
-             "field_type": "uint8", "strategy": "boundary_values"},
-            {"name": "payload", "offset_start": 6, "offset_end": -1,
+            {"name": "length",  "offset_start": 6, "offset_end": 8,
+             "field_type": "uint16_le", "strategy": "boundary_values"},
+            {"name": "payload", "offset_start": 8, "offset_end": -1,
              "field_type": "bytes", "strategy": "random_bytes"},
         ])
 
@@ -153,7 +166,7 @@ class TestRQ1Accuracy:
         assert result.precision == 1.0
         assert result.recall == 1.0
         assert result.f1_score == 1.0
-        assert result.true_positives == 4
+        assert result.true_positives == 5
         assert result.false_positives == 0
         assert result.false_negatives == 0
 
@@ -161,22 +174,24 @@ class TestRQ1Accuracy:
         """Missing the length field → lower recall."""
         grammar = self._make_grammar([
             {"name": "magic",   "offset_start": 0, "offset_end": 4, "strategy": "static"},
-            {"name": "opcode",  "offset_start": 4, "offset_end": 5, "strategy": "dictionary"},
-            {"name": "payload", "offset_start": 6, "offset_end": -1, "strategy": "random_bytes"},
+            {"name": "version", "offset_start": 4, "offset_end": 5, "strategy": "static"},
+            {"name": "opcode",  "offset_start": 5, "offset_end": 6, "strategy": "dictionary"},
+            {"name": "payload", "offset_start": 8, "offset_end": -1, "strategy": "random_bytes"},
         ])
 
         result = evaluate_grammar_accuracy(grammar)
-        assert result.true_positives == 3
+        assert result.true_positives == 4
         assert result.false_negatives == 1  # Missing length field
-        assert result.recall == 0.75
+        assert result.recall == 0.8
 
     def test_extra_field(self):
         """Extra inferred field → lower precision."""
         grammar = self._make_grammar([
             {"name": "magic",     "offset_start": 0,  "offset_end": 4,  "strategy": "static"},
-            {"name": "opcode",    "offset_start": 4,  "offset_end": 5,  "strategy": "dictionary"},
-            {"name": "length",    "offset_start": 5,  "offset_end": 6,  "strategy": "boundary_values"},
-            {"name": "payload",   "offset_start": 6,  "offset_end": -1, "strategy": "random_bytes"},
+            {"name": "version",   "offset_start": 4,  "offset_end": 5,  "strategy": "static"},
+            {"name": "opcode",    "offset_start": 5,  "offset_end": 6,  "strategy": "dictionary"},
+            {"name": "length",    "offset_start": 6,  "offset_end": 8,  "strategy": "boundary_values"},
+            {"name": "payload",   "offset_start": 8,  "offset_end": -1, "strategy": "random_bytes"},
             {"name": "checksum",  "offset_start": 20, "offset_end": 24, "strategy": "calculated"},
         ])
 
@@ -188,13 +203,14 @@ class TestRQ1Accuracy:
         """Fields within ±1 byte tolerance still match."""
         grammar = self._make_grammar([
             {"name": "magic",  "offset_start": 0, "offset_end": 4, "strategy": "static"},
-            {"name": "opcode", "offset_start": 5, "offset_end": 6, "strategy": "dictionary"},  # off by 1
-            {"name": "length", "offset_start": 5, "offset_end": 6, "strategy": "boundary_values"},
+            {"name": "version","offset_start": 4, "offset_end": 5, "strategy": "static"},
+            {"name": "opcode", "offset_start": 6, "offset_end": 7, "strategy": "dictionary"},  # off by 1
+            {"name": "length", "offset_start": 6, "offset_end": 8, "strategy": "boundary_values"},
         ])
 
         result = evaluate_grammar_accuracy(grammar, boundary_tolerance=1)
-        # With tolerance=1, opcode at [5,6) should still match ground truth opcode at [4,5)
-        assert result.true_positives >= 2
+        # With tolerance=1, opcode at [6,7) should still match ground truth opcode at [5,6)
+        assert result.true_positives >= 3
 
     def test_no_fields_at_all(self):
         """Empty grammar → 0 TP, all FN."""
@@ -203,7 +219,7 @@ class TestRQ1Accuracy:
         assert result.precision == 0.0
         assert result.recall == 0.0
         assert result.true_positives == 0
-        assert result.false_negatives == 4
+        assert result.false_negatives == 5
 
     def test_result_to_dict(self):
         """AccuracyResult serializes cleanly."""
