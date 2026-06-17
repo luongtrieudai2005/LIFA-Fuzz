@@ -119,6 +119,58 @@ class FTPModule(ProtocolModule):
         code = _extract_ftp_code(response)
         return {"ftp_status_code": code} if code != "000" else {}
 
+    def response_category(self, response: bytes, payload: bytes) -> str:
+        """SemFuzz 2-category oracle for FTP (paper Appendix C style).
+
+        1xx/2xx/3xx (positive completion / intermediate) ⇒ "normal".
+        4xx/5xx (transient/permanent error) ⇒ "error".
+        Empty/absent reply ⇒ "error".
+        """
+        if not response or len(response) < 3:
+            return "error"
+        try:
+            code = int(response[:3])
+        except ValueError:
+            return "normal" if response else "error"
+        if 100 <= code < 400:
+            return "normal"
+        return "error"
+
+    def violation_strategies(self) -> list:
+        """Disclosed RFC-959 FTP semantic-violation strategies (case study).
+
+        Each is a structural violation that an RFC-compliant server should
+        answer with an ERROR (or hang/timeout). A NORMAL answer is a
+        potential semantic bug. FTP commands end in CRLF; offsets are
+        relative-to-end (negative) so they apply to any command length.
+        """
+        from shared.schemas import (
+            ViolationAction, ViolationStrategy, ResponseCategory,
+        )
+        return [
+            ViolationStrategy(
+                action=ViolationAction.REMOVE,
+                target_offset=-2, target_length=2,
+                expected_category=ResponseCategory.ERROR,
+                description="Strip trailing CRLF — RFC 959 requires it; "
+                            "server should reject/hang, not accept",
+            ),
+            ViolationStrategy(
+                action=ViolationAction.ADD,
+                target_offset=-2, target_length=1, insert_value="00",
+                expected_category=ResponseCategory.ERROR,
+                description="Inject a NUL before CRLF — malformed command; "
+                            "server should error",
+            ),
+            ViolationStrategy(
+                action=ViolationAction.UPDATE,
+                target_offset=0, target_length=4, insert_value="00000000",
+                expected_category=ResponseCategory.ERROR,
+                description="Overwrite the 4-byte command verb with NULs — "
+                            "unknown command; server should 500",
+            ),
+        ]
+
 
 # Register so config `protocol_module: ftp` resolves to this. The default
 # remains "null" (NullModule) — the pure black-box core.

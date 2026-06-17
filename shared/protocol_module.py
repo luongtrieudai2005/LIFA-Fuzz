@@ -94,6 +94,25 @@ class ProtocolModule(ABC):
         """Extra fields to log when sampling a response (e.g. FTP status
         code). Empty dict for protocols with no such concept."""
 
+    @abstractmethod
+    def response_category(self, response: bytes, payload: bytes) -> str:
+        """SemFuzz-style 2-category response oracle (paper §3.4, Appendix C).
+
+        Map a server response to ``"normal"`` or ``"error"`` per the
+        protocol's response semantics (HTTP 200 vs 4xx/5xx, TLS
+        handshake-continue vs Alert, etc.). Used by the semantic-violation
+        oracle: a test that expects *error* but elicits *normal* is a
+        potential semantic bug. Default black-box behaviour: an empty/absent
+        reply ⇒ ``"error"``; any non-empty reply ⇒ ``"normal"`` (conservative).
+        """
+
+    @abstractmethod
+    def violation_strategies(self) -> list:
+        """Protocol-specific semantic-violation strategies (SemFuzz add/remove/
+        update actions, each with an expected response category). Disclosed
+        case-study content (e.g. RFC-959 FTP). Empty list ⇒ the core runs no
+        semantic-violation path (pure black-box)."""
+
 
 class NullModule(ProtocolModule):
     """The pure black-box core: NO protocol knowledge.
@@ -148,6 +167,14 @@ class NullModule(ProtocolModule):
 
     def response_sample_extra(self, response: bytes) -> dict[str, Any]:
         return {}
+
+    def response_category(self, response: bytes, payload: bytes) -> str:
+        """Black-box default: empty reply ⇒ error, any reply ⇒ normal."""
+        return "error" if not response else "normal"
+
+    def violation_strategies(self) -> list:
+        """No disclosed case-study violations — pure black-box."""
+        return []
 
 
 #: Registry of available module names → factory (populated by fast_loop modules).

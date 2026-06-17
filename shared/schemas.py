@@ -43,12 +43,65 @@ class RuleType(str, Enum):
     - ``boundary``      — Fuzz boundary values (0, MAX, MAX-1, MIN+1, etc.).
     - ``structural``   — Mutate a semantic field (length, checksum, enum value).
     - ``state``         — Sequence-level mutation (reorder, drop, duplicate).
+    - ``violation``     — Semantic-violation action (SemFuzz-style add/remove/update).
     """
 
     BIT_FLIP = "bit_flip"
     BOUNDARY = "boundary"
     STRUCTURAL = "structural"
     STATE = "state"
+    VIOLATION = "violation"
+
+
+class ViolationAction(str, Enum):
+    """Atomic structural action that violates a semantic construction rule.
+
+    Faithful to SemFuzz (Sun et al., 2026, §3.5.1) which defines exactly
+    ``add``, ``remove``, ``update``. (An earlier draft added ``reorder``;
+    that is dropped — the paper does not define it and a byte-range swap is
+    fragile on flat field models.)
+    """
+
+    ADD = "add"        # Insert bytes at an offset (then recompute length)
+    REMOVE = "remove"  # Delete a byte range (then recompute length)
+    UPDATE = "update"  # Overwrite a byte range in place
+
+
+class ResponseCategory(str, Enum):
+    """SemFuzz 2-category response oracle (paper §3.4, Appendix C).
+
+    A test that violates a construction rule expects an *error* response; if
+    the server answers *normal* instead, that divergence is a potential
+    semantic vulnerability. Categories are protocol-specific (HTTP 200 vs
+    4xx/5xx, TLS handshake-continue vs Alert, etc.).
+    """
+
+    NORMAL = "normal"
+    ERROR = "error"
+
+
+class ViolationStrategy(BaseModel):
+    """One concrete way to violate a semantic rule, with the expected response.
+
+    LIFA has no RFC, so the expected response is *inferred* ("a structural
+    violation should make the server answer *error*") rather than derived from
+    a specification — coarser than SemFuzz's RFC-grounded processing rule, and
+    a documented limitation.
+    """
+
+    action: ViolationAction
+    target_field: str = ""
+    target_offset: int = 0
+    target_length: int = 0
+    insert_value: Optional[str] = Field(
+        default=None,
+        description="Hex bytes for ADD/UPDATE. None ⇒ ADD inserts a single 0x00.",
+    )
+    expected_category: ResponseCategory = Field(
+        default=ResponseCategory.ERROR,
+        description="Expected server response category for this violation.",
+    )
+    description: str = ""
 
 
 class FieldType(str, Enum):
@@ -548,6 +601,16 @@ class SemanticRule(BaseModel):
             "If set, overrides the _rule_type_to_strategy() mapping for this "
             "rule. Enables strategies like FORMAT_STRING and TRUNCATE that "
             "don't have a dedicated RuleType enum value."
+        ),
+    )
+    violation_strategies: list[ViolationStrategy] = Field(
+        default_factory=list,
+        description=(
+            "SemFuzz-style structural violations (add/remove/update) attached "
+            "to this rule. Each carries an expected response category; the "
+            "oracle flags a divergence (actual ≠ expected) as a potential "
+            "semantic bug. Populated by case-study modules (e.g. FTP) now; "
+            "LLM generation is a later phase."
         ),
     )
 

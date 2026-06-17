@@ -457,6 +457,11 @@ class MutatorStats:
     # Rule count for dashboard / telemetry
     active_rule_count:         int                        = 0
     ewma_regime:               str                        = "sparse"
+    # SemFuzz-style semantic-violation oracle telemetry (potential semantic
+    # bugs, NOT crashes). Reported as raw counts — precision is bounded by the
+    # inferred (no-RFC) expected response; the paper itself reports 62.5%.
+    semantic_oracle_checks:    int                        = 0
+    semantic_violations_detected: int                      = 0
 
 
 # ===========================================================================
@@ -664,6 +669,11 @@ class MutationEngine:
         # Stats (initialized above with correct mode)
         self._mutation_signatures: set[str] = set()
         self._current_rule_type: Optional[str] = None  # for _track_rule_response
+        # SemFuzz-style semantic-violation oracle: when the current send is a
+        # structural violation, this holds the EXPECTED response category
+        # ("normal"/"error"). ``_classify_response`` compares it to the actual
+        # category and records a divergence as a potential semantic bug.
+        self._pending_violation_expected: Optional[str] = None
 
         # Rule file poller — bridges Slow Loop / Math-Only → Fast Loop
         rule_cfg = self._load_rules_path_from_config()
@@ -1288,7 +1298,7 @@ class MutationEngine:
         down.
         """
         try:
-            return self._module.classify(resp, payload)
+            status = self._module.classify(resp, payload)
         except Exception as exc:
             log.warning(
                 "protocol module classify() raised — falling back to ACCEPTED",
@@ -1296,7 +1306,35 @@ class MutationEngine:
                                    "resp_len": len(resp),
                                    "payload_len": len(payload)}},
             )
-            return PacketStatus.ACCEPTED
+            status = PacketStatus.ACCEPTED
+
+        # SemFuzz-style semantic-violation oracle. If this send was a
+        # structural violation, compare the ACTUAL response category to the
+        # EXPECTED one stashed in _build_mutant. A divergence (e.g. expected
+        # error, got normal) is a potential semantic bug — counted as a
+        # *potential* finding (paper precision 62.5%), NOT a crash.
+        if (
+            self._current_rule_type == "semantic_violation"
+            and self._pending_violation_expected is not None
+        ):
+            self._stats.semantic_oracle_checks += 1
+            try:
+                actual = self._module.response_category(resp, payload)
+            except Exception:
+                actual = "normal" if resp else "error"
+            expected = self._pending_violation_expected
+            self._pending_violation_expected = None
+            if actual != expected:
+                self._stats.semantic_violations_detected += 1
+                log.warning(
+                    "Semantic oracle: violation expected "
+                    f"{expected!r} but got {actual!r} — potential "
+                    "semantic bug",
+                    extra={"context": {"expected": expected,
+                                       "actual": actual,
+                                       "resp_len": len(resp)}},
+                )
+        return status
 
     def _track_rule_response(self, status: PacketStatus) -> None:
         """Track per-rule-type response stats for LLM feedback.
@@ -1654,6 +1692,38 @@ class MutationEngine:
 
         mutable = rule_set.get_mutable_fields()
         static  = rule_set.get_static_fields()
+
+        # ── Semantic-violation path (SemFuzz-style, paper-faithful) ──────────
+        # Apply a disclosed structural violation (add/remove/update) from the
+        # active ProtocolModule's case-study set (e.g. FTP CRLF removal). The
+        # deterministic engine recomputes the length field so the packet stays
+        # syntactically valid — a valid violation reaches deep parser logic
+        # (paper §3.5.2). The expected response category is stashed for the
+        # oracle in _classify_response. No protocol-specific logic in core:
+        # strategies come entirely from the module.
+        _VIOLATION_PROB = 0.08
+        try:
+            _vstrats = self._module.violation_strategies() if self._module else []
+        except Exception:
+            _vstrats = []
+        if _vstrats and random.random() < _VIOLATION_PROB:
+            try:
+                from fast_loop.violation_mutator import FlatFieldViolationMutator
+                strat = random.choice(_vstrats)
+                fields = list(mutable) + list(static)
+                vbuf = FlatFieldViolationMutator(fields).execute(
+                    bytearray(seed.raw_bytes), strat
+                )
+                result = bytes(vbuf)
+                self._last_injected_rule_id = f"violation:{strat.action.value}"
+                self._current_rule_type = "semantic_violation"
+                self._pending_violation_expected = strat.expected_category.value
+                self._mutation_signatures.add(
+                    f"violation:{strat.action.value}:off{strat.target_offset}"
+                )
+                return result
+            except Exception as exc:
+                log.debug(f"violation mutation failed: {exc}")
 
         # Apply STATIC fields first (always overwrite — preserve magic bytes)
         for f in static:
