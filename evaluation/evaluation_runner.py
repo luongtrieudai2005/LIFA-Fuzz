@@ -495,6 +495,8 @@ async def run_single_baseline(
         # returned "" → SEQ chains all empty → no state tracking → blind.
         if _protocol_module == "ftp":
             import fast_loop.ftp_module  # noqa: F401 (registers "ftp")
+        elif _protocol_module == "lifa":
+            import fast_loop.lifa_module  # noqa: F401 (registers "lifa")
 
         mutator = MutationEngine(
             target_host=target_host,
