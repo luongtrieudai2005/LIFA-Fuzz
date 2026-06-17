@@ -82,6 +82,21 @@ LIFA-Fuzz captures real client traffic and groups packets by session ID into `Se
 
 This solves the core problem of stateful fuzzing: the fuzzer authenticates and reaches server logic beyond the login screen. Without this, every mutation only hits the pre-auth greeting and never triggers deeper code paths.
 
+### Crash Discovery Reliability
+
+Several correctness fixes make crash discovery trustworthy on length-delimited targets:
+
+- **Length-aware payload growth** — when a variable-length payload grows, the dependent length field is recomputed so the packet stays valid. A length-clamping server computes the copy size as `min(declared, actual)`; growing actual bytes without updating the declared length leaves the old small value and masks the overflow.
+- **Crash-location dedup (σ₃)** — crashes are deduplicated by crash *site* (ASAN error type + backtrace offsets from the serial console), not by payload bytes. N random-payload crashes at the same site count as one vulnerability.
+- **Confirmation polling** — the replay confirmation polls target liveness for a few seconds so a slow crash chain (child abort → parent exit → guest kernel panic → VMM exit) is detected, and the hot loop is paused on a bounded time budget, not a fixed candidate count.
+- Every recorded crash is **reproducible**: `lifa_repro.sh` rebuilds the target from source and replays a fuzzer-saved PoC to an ASAN crash.
+
+### Semantic-Violation Oracle (experimental, Phase 1)
+
+A SemFuzz-inspired oracle (paper-faithful: add/remove/update actions, length recompute, 2-category normal/error response mapping) flags divergences where a structural violation elicits a "normal" reply instead of the expected "error".
+
+**Honest status:** the *mechanism* is correct and paper-faithful, but the *signal* is currently weak. On the disclosed FTP case-study strategies the oracle shows ~0% precision — LightFTP returns correct RFC-959 replies to commands the naive violation only mildly perturbed (server tolerance, not bugs). LIFA has no RFC ground truth, so the expected response is inferred, not specification-derived. Phase 2 (LLM-generated, grammar-targeted violations) and a richer response-content oracle are where real signal can come from; until then, the divergence counter must NOT be reported as findings.
+
 ---
 
 ## Evaluation Framework
@@ -92,7 +107,7 @@ This solves the core problem of stateful fuzzing: the fuzzer authenticates and r
 |----|----------|--------|--------|
 | RQ1 | How precisely does LIFA-Fuzz infer protocol grammar? | P/R/F1 vs ground truth | **F1 = 1.0** (REAL LLM, LIFA + FTP) |
 | RQ2 | Does the async architecture maintain throughput? | EPS over time | Pending re-run (old data invalid) |
-| RQ3 | Does full fusion find crashes? | Cumulative crashes, TTC | Pending re-run (old data invalid) |
+| RQ3 | Does full fusion find crashes? | Cumulative crashes, TTC | Verified on the LIFA-v2 positive-control target (see honesty note) |
 
 ### Three Baselines
 
@@ -141,17 +156,20 @@ python3 scripts/rq1_real.py --protocol ftp --self-consistent
 
 | File | Role |
 |------|------|
-| `fast_loop/mutator.py` | Mutation engine: stateful replay, scheduler, greeting drain, BinaryMutator |
-| `fast_loop/crash_monitor.py` | Crash detection + Phase 2 prefix+target confirmation |
+| `fast_loop/mutator.py` | Mutation engine: stateful replay, scheduler, greeting drain, BinaryMutator, length-aware growth |
+| `fast_loop/crash_monitor.py` | Crash detection + confirmation (bounded time budget) + σ₃ site dedup |
 | `fast_loop/binary_mutator.py` | 15 generic + 4 FTP mutation operators (BINARY_ONLY default) |
+| `fast_loop/violation_mutator.py` | SemFuzz-style structural-violation engine (add/remove/update, Phase 1) |
 | `fast_loop/state_machine_tracker.py` | InferredStateTracker — generic P-PSM state tracking |
 | `slow_loop/differential_analyzer.py` | Shannon entropy, Pearson, Kendall τ per byte offset |
 | `slow_loop/state_machine_inferer.py` | Veritas P-PSM: K-S test, PAM clustering, DFA |
 | `slow_loop/llm_agent.py` | LLM client (GLM-5-Turbo REAL), self-consistency |
 | `slow_loop/rules_orchestrator.py` | Slow Loop pipeline: math → LLM → P-PSM → rules |
 | `shared/protocol_module.py` | ProtocolModule interface + NullModule (black-box core) |
+| `shared/crash_manager.py` | Crash dedup (σ₁ payload + σ₃ crash-location) + PoC corpus |
 | `fast_loop/ftp_module.py` | FTPModule (disclosed case-study extension) |
 | `sandbox/firecracker_driver.py` | Firecracker MicroVM sandbox (snapshot/restore) |
+| `sandbox/target/vulnerable_server.c` | LIFA-v2 positive-control target (state machine + fork, ASAN) |
 | `evaluation/rq1_accuracy.py` | F1 evaluator (negative offsets, custom ground truth) |
 
 ---

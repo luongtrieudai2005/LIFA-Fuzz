@@ -104,18 +104,38 @@ class FlatFieldViolationMutator:
             # valid violation test, never a crash of the engine.
             pass
 
+    def _resolve_target(self, strategy: ViolationStrategy) -> tuple[int, int]:
+        """Resolve a strategy's target to (offset, length).
+
+        Preference order (paper §3.5.1: LLM emits high-level field intent, the
+        deterministic engine resolves bytes):
+          1. ``target_field`` name → FieldRule offset/length (LLM path).
+          2. explicit ``target_offset`` (case-study / relative-to-end path).
+        Returns (offset, length). length=-1 means "to end of buffer".
+        """
+        name = (strategy.target_field or "").strip()
+        if name and self._fields:
+            for f in self._fields:
+                fname = getattr(f, "field_name", "") or ""
+                if fname and fname == name:
+                    off = getattr(f, "offset", 0)
+                    flen = getattr(f, "length", 0)
+                    return off, flen
+        return strategy.target_offset, strategy.target_length
+
     def execute(self, buf: bytearray, strategy: ViolationStrategy) -> bytearray:
         """Dispatch a ViolationStrategy to its atomic action."""
+        offset, length = self._resolve_target(strategy)
         if strategy.action == ViolationAction.ADD:
             return self.add(
-                buf, strategy.target_offset,
+                buf, offset,
                 _coerce_value(strategy.insert_value, default=b"\x00"),
             )
         if strategy.action == ViolationAction.REMOVE:
-            return self.remove(buf, strategy.target_offset, strategy.target_length)
+            return self.remove(buf, offset, length)
         if strategy.action == ViolationAction.UPDATE:
             return self.update(
-                buf, strategy.target_offset,
+                buf, offset,
                 _coerce_value(strategy.insert_value, default=b"\x00"),
             )
         return buf
