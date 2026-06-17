@@ -1678,6 +1678,13 @@ class MutationEngine:
             if grow_fields:
                 f = random.choice(grow_fields)
                 grown = _apply_field(base, f, preserve_length=False)
+                # Length-aware growth: a grown payload with a stale declared
+                # length is clamped by the server (min(declared, actual)) and
+                # the overflow is masked. Rewrite the length field to the new
+                # payload size so the packet stays valid and reaches the copy.
+                grown = _recompute_length_fields(
+                    grown, list(mutable) + list(static)
+                )
                 self._last_injected_rule_id = f"payload_extend:{f.field_name}"
                 self._current_rule_type = "payload_extend"
                 start = f.offset
@@ -1729,6 +1736,14 @@ class MutationEngine:
         else:
             self._last_injected_rule_id = None
             self._current_rule_type = None
+
+        # Length-aware fixup: if a single-field mutation (multi=False) grew or
+        # shrank the packet, the declared length field is now stale and the
+        # server would clamp it — masking any overflow. Recompute the length
+        # field to the current payload size. Only when size changed (multi-field
+        # mode is length-preserving, so no fixup needed there).
+        if not multi and len(base) != len(seed.raw_bytes):
+            base = _recompute_length_fields(base, list(mutable) + list(static))
 
         return bytes(base)
 
@@ -2414,6 +2429,102 @@ def _endian_for_type(field_type: FieldType) -> str:
     if "_le" in field_type.value:
         return "little"
     return "big"
+
+
+def _recompute_length_fields(buf: bytearray, fields: list) -> bytearray:
+    """Recompute length field(s) so the packet stays length-consistent after a
+    payload grew or shrank.
+
+    A length-delimited server computes the copy size as ``min(declared_len,
+    actual_bytes)``. If a mutation grows the actual payload but leaves the
+    declared length field at its old (small) value, the server clamps to the
+    old value and the overflow is masked — the fuzzer would only ever crash by
+    accident (e.g. an A-flood overwriting the length bytes). Recomputing the
+    length field to the current payload size makes the grown packet VALID, so
+    the server trusts the declared length and reaches the vulnerable copy.
+
+    Length fields are identified STRUCTURALLY, not by LLM semantic label, so
+    this works for any length-delimited protocol and does not depend on the
+    LLM happenning to name a field "length":
+      - primary: a field marked ``calculation_source == "payload"`` (the math
+        analyzer sets this on the length field it detects);
+      - fallback: a numeric (uint*) field that immediately precedes the
+        variable-length payload (``offset + length == payload_offset``).
+
+    Args:
+        buf:    the mutated packet buffer (may have grown/shrunk).
+        fields: the field rules (mutable + static) for the active grammar.
+
+    Returns:
+        The same ``buf`` with length field(s) rewritten to the current
+        payload byte count.
+    """
+    if not fields:
+        return buf
+
+    # The payload field is the variable-length tail (length == -1), or — if
+    # none is marked variable — the highest-offset field (the trailing region).
+    payload_field = None
+    for f in fields:
+        if getattr(f, "length", 0) == -1:
+            payload_field = f
+            break
+    if payload_field is None:
+        payload_field = max(fields, key=lambda f: getattr(f, "offset", 0))
+    payload_start = getattr(payload_field, "offset", 0)
+    if payload_start >= len(buf):
+        return buf  # payload starts past the buffer — nothing to recompute
+
+    # Identify length field(s) to recompute. Two strategies:
+    #   (a) declared: a field marked calculation_source == "payload" (the math
+    #       analyzer sets this); OR
+    #   (b) structural fallback: the numeric (uint*) field with the largest
+    #       offset that still precedes the payload — i.e. the closest numeric
+    #       field before the payload. This tolerates static padding/reserved
+    #       fields sitting between the length field and the payload (a common
+    #       LLM-grammar artifact), so recompute still fires when the grammar is
+    #       not perfectly tight. It does NOT key off any protocol-specific
+    #       offset or label.
+    length_targets: list = []
+    declared = [
+        f for f in fields
+        if getattr(f, "calculation_source", None) == "payload"
+        and getattr(f, "length", 0) > 0
+        and getattr(f, "offset", 0) < payload_start
+    ]
+    if declared:
+        length_targets = declared
+    else:
+        numeric_before = [
+            f for f in fields
+            if getattr(f, "length", 0) > 0
+            and getattr(f, "offset", 0) < payload_start
+            and getattr(f, "data_type", None) is not None
+            and "uint" in getattr(f.data_type, "value", "")
+        ]
+        if numeric_before:
+            # closest numeric field before the payload (max offset)
+            length_targets = [
+                max(numeric_before, key=lambda f: getattr(f, "offset", 0))
+            ]
+
+    for f in length_targets:
+        flen = getattr(f, "length", 0)
+        foff = getattr(f, "offset", 0)
+        data_type = getattr(f, "data_type", None)
+        start = foff
+        end = foff + flen
+        if end > len(buf):
+            continue
+        payload_len = max(0, len(buf) - payload_start)
+        field_type = data_type or FieldType.UINT16_LE
+        byte_order = _endian_for_type(field_type)
+        try:
+            buf[start:end] = payload_len.to_bytes(flen, byte_order)
+        except (OverflowError, ValueError):
+            pass  # payload too large for the length field width — leave as-is
+    return buf
+
 
 def _apply_field(
     buf: bytearray,

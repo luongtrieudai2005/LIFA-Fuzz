@@ -54,6 +54,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import xxhash
 import os
 from dataclasses import asdict, dataclass, field
@@ -245,6 +246,51 @@ def get_structural_key(payload: bytes) -> str:
     return compute_sigma2(payload).hex()
 
 
+# ASAN / sanitizer error line, e.g. "==12345==ERROR: AddressSanitizer: stack-buffer-overflow"
+_ASAN_ERR_RE = re.compile(r"AddressSanitizer:\s*([A-Za-z][A-Za-z0-9_-]+)")
+# Backtrace frames, e.g. "#0 0x0000004ebc86 (...+0x4ebc86)". Prefer the
+# /binary+offset form (stable across runs / immune to ASLR) when present;
+# fall back to the raw frame address otherwise.
+_FRAME_OFF_RE = re.compile(r"#\d+\s+0x[0-9a-fA-F]+\s*\([^)]*\+0x([0-9a-fA-F]+)\)")
+_FRAME_RAW_RE = re.compile(r"#(\d+)\s+0x([0-9a-fA-F]+)")
+
+
+def compute_crash_location_sig(stack_trace: str) -> str:
+    """Crash-LOCATION fingerprint σ₃ from the stack trace.
+
+    Standard crash-mode deduplication groups crashes by WHERE they crash, not
+    by which input bytes triggered them: two different overflow payloads that
+    corrupt the same buffer and abort at the same ASAN site are ONE
+    vulnerability. Deduping by SHA256(payload) instead over-counts — a fuzzer
+    that grows a payload with random bytes reports every length/seed as a
+    distinct "unique crash", inflating RQ3.
+
+    This signature is built from:
+      - the sanitizer error type (e.g. ``stack-buffer-overflow``,
+        ``memcpy-param-overlap``), and
+      - the first few backtrace frame offsets (binary-relative, stable across
+        runs of the same binary, immune to ASLR).
+
+    Returns:
+        A 12-char hex string, or ``""`` when the trace carries no usable
+        crash-location signal (caller then falls back to σ₁/payload dedup).
+    """
+    if not stack_trace:
+        return ""
+    err = ""
+    m = _ASAN_ERR_RE.search(stack_trace)
+    if m:
+        err = m.group(1).lower()
+    # Prefer binary-relative offsets; they are stable for a given build.
+    offs = [o.lower() for o in _FRAME_OFF_RE.findall(stack_trace)[:4]]
+    if not offs:
+        # No symbolized offsets — use the raw frame addresses of the top frames.
+        offs = [a.lower() for _i, a in _FRAME_RAW_RE.findall(stack_trace)[:4]]
+    if not err and not offs:
+        return ""
+    return xxhash.xxh64((err + "|" + ",".join(offs)).encode()).hexdigest()[:12]
+
+
 def batch_process_crashes(crashes: list[bytes]) -> dict[str, dict]:
     """Two-level deduplication over a batch of crash payloads.
 
@@ -428,26 +474,36 @@ class CrashManager:
         notes:        str   = "",
         reproduced:   bool  = False,
         confirmation_method: str = "window_last",
+        crash_location_sig: Optional[str] = None,
     ) -> RecordResult:
         """
         Record a crash event and apply deduplication.
 
         Algorithm:
-            1. Compute primary_sig   = SHA256(payload)[0:16] (128-bit)
-            2. Compute struct_sig    = XXH64(head24‖len_be32‖fold)[0:6] (48-bit)
+            1. primary_sig = crash_location_sig (σ₃, dedup by crash SITE) when
+               available, else SHA256(payload)[0:16] (σ₁, byte-exact fallback).
+            2. struct_sig  = XXH64(head24‖len_be32‖fold)[0:6] (48-bit)
             3. If primary_sig in _index → duplicate: increment counter, return
             4. Else → new crash: save PoC, save report, update index + disk
+
+        Deduping by crash location (σ₃) is the standard fuzzer crash-mode
+        behaviour: distinct input payloads that abort at the same site are one
+        vulnerability. The byte-exact σ₁ fallback covers traces without a
+        usable stack-trace signal.
 
         Args:
             payload:     The exact mutated bytes that triggered the crash.
             crash_type:  Classification string ("connection_refused", etc.).
             rule_set_id: UUID of the SemanticRuleSet active at crash time.
             notes:       Free-text annotation (e.g. stack trace snippet).
+            crash_location_sig: σ₃ — crash-site fingerprint from the stack
+                       trace (see compute_crash_location_sig). When provided,
+                       it replaces σ₁ as the dedup key.
 
         Returns:
             RecordResult with is_new=True for unique crashes, False for dupes.
         """
-        primary_sig = self._compute_primary_sig(payload)
+        primary_sig = crash_location_sig or self._compute_primary_sig(payload)
         struct_sig  = self._compute_struct_sig(payload)
 
         async with self._lock:

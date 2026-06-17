@@ -867,6 +867,19 @@ async def run_single_baseline(
         summary["final_rules"] = final_stats["active_rules"]
         summary["final_coverage"] = final_stats["unique_offsets_fuzzed"]
 
+        # Honest crash breakdown: total detected events, unique crash SITES
+        # (σ₃ dedup — distinct vulnerabilities), and how many of those unique
+        # sites were REPRODUCED by replay on a clean target. Reporting all
+        # three separately keeps the RQ3 numbers transparent: a reader can see
+        # how many crashes were merely detected vs. confirmed reproducible.
+        try:
+            cs = await crash_manager.get_statistics()
+            summary["crash_total_detected"] = cs.total_hits
+            summary["crash_unique_sites"] = cs.unique_crashes
+            summary["crash_reproduced_sites"] = cs.reproduced_crashes
+        except Exception:
+            pass
+
         # Save summary
         with open(baseline_dir / "summary.json", "w") as f:
             json.dump(summary, f, indent=2, default=str)

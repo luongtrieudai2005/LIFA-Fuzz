@@ -466,8 +466,31 @@ class CrashMonitor:
         crash_type_str = (
             classification["type"] if classification else f"exit_{exit_code}"
         )
+        # Record EVERY detected crash — do NOT withhold unconfirmed ones. A
+        # crash detected by a fatal signal / ASAN marker is a real event even
+        # when the replay confirmation fails (e.g. the blamed packet was a
+        # misattributed later send, or the harness hit a transient error).
+        # Withholding detected crashes to inflate the reproduced ratio would
+        # be dishonest. Instead:
+        #   - σ₃ (crash-location) dedup groups crashes by crash SITE, so a
+        #     misattributed event whose serial still carries the real crash's
+        #     ASAN trace dedups WITH it rather than inflating the unique count.
+        #   - reproduced / confirmation_method are kept as transparent metadata
+        #     on every record so the reader can judge confidence per crash.
         if self.crash_manager is not None:
             try:
+                # σ₃: crash-LOCATION signature from the serial stack trace, so
+                # distinct overflow payloads that abort at the same site dedup
+                # to ONE vulnerability (standard crash-mode dedup). Computed
+                # from the captured serial_output (ASAN report + backtrace).
+                crash_location_sig = ""
+                try:
+                    from shared.crash_manager import compute_crash_location_sig
+                    crash_location_sig = compute_crash_location_sig(
+                        serial_output or ""
+                    )
+                except Exception:
+                    crash_location_sig = ""
                 result = await self.crash_manager.record(
                     payload=record.offending_packet,
                     crash_type=crash_type_str,
@@ -475,6 +498,7 @@ class CrashMonitor:
                     notes=classification.get("detail", "") if classification else "",
                     reproduced=reproduced,
                     confirmation_method=confirmation_method,
+                    crash_location_sig=crash_location_sig or None,
                 )
                 if result.is_new:
                     logger.info(
@@ -908,11 +932,26 @@ class CrashMonitor:
             _e = candidates[-1]
             return _e[1], _e[2], False
 
-        # Cap the confirmation cost: at most this many resets/replays per
-        # crash. Most-recent candidates are most likely, so we slice the tail.
-        max_attempts = min(len(candidates), 50)
+        # Bound the confirmation cost by WALL-CLOCK budget, not a fixed count.
+        # We search candidates most-recent-first (the culprit is usually among
+        # the latest sends) but a fixed count-cap would miss a culprit that
+        # sits a little further back in the window — at high EPS the blamed
+        # window[-1] and the real culprit can be many sends apart. A time
+        # budget instead lets a cheap replay (e.g. a unit-test mock, or a
+        # target that crashes fast) search the whole window, while a target
+        # whose crash chain is slow (~3s liveness poll per candidate) is still
+        # bounded so the hot loop is not paused for too long per crash.
+        import time as _time
+        _CONFIRM_BUDGET_S = 30.0
+        _deadline = _time.monotonic() + _CONFIRM_BUDGET_S
         tried = 0
-        for _entry in reversed(candidates[-max_attempts:]):
+        for _entry in reversed(candidates):
+            if _time.monotonic() > _deadline:
+                logger.debug(
+                    f"confirm: time budget ({_CONFIRM_BUDGET_S:.0f}s) reached "
+                    f"after {tried} candidates; stopping search"
+                )
+                break
             payload = _entry[1]
             rule_id = _entry[2]
             # PHASE 2: the session prefix (verbatim setup packets e.g. USER+PASS).
@@ -997,12 +1036,29 @@ class CrashMonitor:
             except Exception:
                 pass
         # Grace period for the crash to manifest, then check liveness.
-        await asyncio.sleep(0.2)
-        try:
-            alive = await self.sandbox.is_target_alive()
-        except Exception:
-            alive = True
-        return not alive
+        # A single short sleep is insufficient for targets whose crash chain
+        # is slow: e.g. a fork-per-connection server where the child aborts
+        # (ASAN), the parent's SIGCHLD handler exits (CRASH_THRESHOLD), the
+        # guest kernel panics on PID-1 death, and only then does the VMM
+        # process register an exit code — that chain routinely takes ~1-2s.
+        # A single 0.2s check reports the target as still alive and marks a
+        # REAL PoC as "not reproduced" → every real crash ends up
+        # "unconfirmed". Poll liveness for a few seconds instead so a slow
+        # crash chain still registers. General for any target with a slow
+        # crash-to-exit propagation.
+        _CONFIRM_DEADLINE_S = 3.0
+        _CONFIRM_POLL_S = 0.3
+        _elapsed = 0.0
+        while _elapsed < _CONFIRM_DEADLINE_S:
+            await asyncio.sleep(_CONFIRM_POLL_S)
+            _elapsed += _CONFIRM_POLL_S
+            try:
+                if not await self.sandbox.is_target_alive():
+                    return True  # target died after the replay → reproduced
+            except Exception:
+                # Transient check error — keep polling rather than assume alive.
+                continue
+        return False  # stayed alive for the whole window → not reproduced
 
     async def pause_interceptor(self) -> None:
         """Signal the Interceptor and MutationEngine to pause.

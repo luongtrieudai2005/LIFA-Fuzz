@@ -203,6 +203,7 @@ class RuleGenerator:
             # size so they are NOT silently dropped by _generate_rules_for_field().
             # The mutator's _apply_field() clamps to the actual packet size at
             # runtime, so using a generous upper bound here is safe.
+            was_variable = field.offset_end == -1  # capture before resolution
             if field.offset_end == -1:
                 resolved_end = min(
                     field.offset_start + 1024,
@@ -218,6 +219,38 @@ class RuleGenerator:
             field_rules = self._generate_rules_for_field(
                 field, grammar.confidence, magic_bytes
             )
+
+            # Structural growth guarantee for variable-length fields. A
+            # length-delimited field is where buffer overflows live (the #1
+            # memory-corruption class), so the fuzzer MUST test size
+            # escalation on it regardless of how the field is semantically
+            # labelled. The LLM legitimately assigns random_bytes (value
+            # mutation) to a payload it reads as "opaque data", but value
+            # mutation alone never grows the actual bytes — and a server that
+            # clamps the declared length to bytes-received is then immune. This
+            # appends a PAYLOAD_EXTEND rule independent of the LLM strategy so
+            # overflow coverage does not depend on the LLM happening to pick a
+            # growth strategy. General for any protocol with a variable-length
+            # tail field; the dedup step below collapses it if the LLM already
+            # produced one.
+            if was_variable:
+                field_rules.append(
+                    SemanticRule(
+                        rule_type=RuleType.STRUCTURAL,
+                        target_field_name=field.name,
+                        offset_start=field.offset_start,
+                        offset_end=field.offset_end,
+                        field_type=field.field_type,
+                        preserve_bytes=magic_bytes,
+                        priority=grammar.confidence * 0.80,
+                        mutation_strategy_override=MutationStrategy.PAYLOAD_EXTEND,
+                        description=(
+                            f"Structural growth rule for variable-length field "
+                            f"'{field.name}' (overflow-class coverage, "
+                            f"strategy-label-independent)"
+                        ),
+                    )
+                )
             rules.extend(field_rules)
 
         # Deduplicate by (field_name, rule_type, has_dictionary, strategy_override)

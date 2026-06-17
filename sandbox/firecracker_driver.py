@@ -899,12 +899,18 @@ class FirecrackerSandbox(BaseSandbox):
         exit_code = self._process.returncode
         crash_signal = self._map_exit_code_to_signal(exit_code)
 
-        # Collect serial output as stack trace
+        # Collect serial output as stack trace. The 0.5s read was too short to
+        # reliably capture a full ASAN report (error line + backtrace) flushed
+        # over the ttyS0 pipe at VM-exit; a truncated trace loses the
+        # backtrace frames, which destabilises the crash-location dedup key
+        # (σ₃) so the same crash site is recorded as two "unique" crashes.
+        # Read up to 2s — the process has already exited, so this only waits
+        # for the pipe to drain, not for new output.
         serial_output = ""
         if self._process.stdout:
             try:
                 remaining = await asyncio.wait_for(
-                    self._process.stdout.read(), timeout=0.5
+                    self._process.stdout.read(), timeout=2.0
                 )
                 serial_output = remaining.decode("utf-8", errors="replace")
             except (asyncio.TimeoutError, Exception):
@@ -917,7 +923,7 @@ class FirecrackerSandbox(BaseSandbox):
             exit_code=exit_code,
             signal=crash_signal,
             timestamp=self._last_exit_time or time.time(),
-            stack_trace=serial_output[-2000:] if serial_output else None,
+            stack_trace=serial_output[-8192:] if serial_output else None,
         )
 
     # -----------------------------------------------------------------
