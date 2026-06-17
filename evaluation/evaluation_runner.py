@@ -418,27 +418,44 @@ async def run_single_baseline(
                     raw_data=seed_data,
                 ))
         elif target == "lifa":
-            from shared.schemas import Direction, TrafficRecord
-            # Inject diverse LIFA protocol seeds — MUST include PROCESS_DATA
-            # with various payload sizes so mutations can trigger the overflow.
-            # LIFA header: MAGIC(4) + opcode(1) + length(1) + payload(N)
+            from shared.schemas import Direction, SeedSequence, TrafficRecord
+            import struct as _struct
+            # ── LIFA v2 seed injection (8-byte header, state machine) ──
+            # Protocol v2: MAGIC(4) + VERSION(0x01) + opcode(1) + len_le16(2) + payload.
+            # CRITICAL: PROCESS_DATA is the vulnerable opcode but is SILENTLY
+            # REJECTED (ERR_BAD_STATE) unless the connection is in AUTHENTICATED
+            # state. A single PING transitions INIT → AUTH. So a crash requires
+            # the SEQUENCE [new conn] → PING → PROCESS_DATA(overflow) sent in
+            # the SAME TCP session. We therefore inject multi-packet
+            # SeedSeences (prefix=PING, target=PROCESS). The mutator's
+            # `_execute_sequence` replays the prefix verbatim before fuzzing
+            # the target — exactly the auth-ordering the fuzzer must learn.
+            #
+            # PURE-DISCOVERY mode: PROCESS payloads stay well under the 64-byte
+            # buffer (8B / 15B), so the mutator must GROW the payload itself
+            # (buffer_overflow / payload_extend) to trigger the bug. This proves
+            # autonomous discovery, not a fed PoC.
             MAGIC = b"LIFA"
-            lifa_seeds = [
-                # PING packets (opcode 0x01)
-                MAGIC + bytes([0x01, 0x04]) + b"PONG",
-                MAGIC + bytes([0x01, 0x08]) + b"SEQ00001",
-                # PROCESS_DATA packets (opcode 0x02) — the vulnerable path
-                MAGIC + bytes([0x02, 0x08]) + bytes(range(8)),          # 8-byte payload (safe)
-                MAGIC + bytes([0x02, 0x0F]) + bytes(range(15)),         # 15-byte payload (safe)
-                MAGIC + bytes([0x02, 0x20]) + bytes(range(32)),         # 32-byte payload (edge)
-                MAGIC + bytes([0x02, 0x40]) + bytes(range(64)),         # 64-byte payload (OVERFLOW!)
-                MAGIC + bytes([0x02, 0x80]) + bytes(range(128)),        # 128-byte payload (OVERFLOW!)
+            VERSION = 0x01
+            OP_PING, OP_PROCESS = 0x01, 0x02
+
+            def _pkt(opcode: int, payload: bytes = b"") -> bytes:
+                return MAGIC + bytes([VERSION, opcode]) + _struct.pack("<H", len(payload)) + payload
+
+            lifa_seed_sessions = [
+                # (prefix packets, target packet)
+                ([_pkt(OP_PING, b"PONG")],                  _pkt(OP_PROCESS, bytes(range(8)))),
+                ([_pkt(OP_PING, b"SEQ00001")],              _pkt(OP_PROCESS, bytes(range(15)))),
+                # STATUS in the prefix enriches the state signal the LLM sees
+                # (state_byte 0x00→0x01 after PING), but is optional.
+                ([_pkt(OP_PING, b"hello"), _pkt(0x03)],     _pkt(OP_PROCESS, bytes(range(12)))),
             ]
-            for seed_data in lifa_seeds:
-                await seed_queue.put(TrafficRecord(
-                    direction=Direction.CLIENT_TO_SERVER,
-                    raw_data=seed_data,
-                ))
+            for prefix_pkts, target_pkt in lifa_seed_sessions:
+                packets = [
+                    TrafficRecord(direction=Direction.CLIENT_TO_SERVER, raw_data=p)
+                    for p in (prefix_pkts + [target_pkt])
+                ]
+                await seed_queue.put(SeedSequence(packets=packets, protocol_hint="LIFA"))
         elif target == "lightftp":
             # BLACK-BOX: do NOT inject hardcoded FTP seeds. The state oracle is
             # the REAL client (ftp_client.py) whose traffic the Interceptor
