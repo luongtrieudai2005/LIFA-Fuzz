@@ -450,3 +450,69 @@ class TestMutateTopLevel:
         original = bytearray(data)
         m._apply_strategy(data, "nonexistent_strategy", [], [0])
         assert data == original
+
+
+class TestFtpFilenameAndCredentialFuzz:
+    """Targeted filename/path + credential fuzzers (Phase 3.3).
+
+    These operators mutate only the argument of filename commands (RETR/STOR/
+    CWD/...) and auth commands (USER/PASS), leaving the command verb and CRLF
+    framing intact so the packet still reaches the server's parser.
+    """
+
+    def test_filename_fuzz_mutates_retr_argument(self):
+        m = BinaryMutator(seed=1)
+        data = bytearray(b"RETR /etc/passwd\r\n")
+        m._strat_ftp_filename_fuzz(data, [], list(range(len(data))))
+        # Verb prefix preserved, argument changed
+        assert data[:5] == b"RETR "
+        assert data != bytearray(b"RETR /etc/passwd\r\n")
+
+    def test_filename_fuzz_noop_for_non_filename_command(self):
+        """PWD/SYST (no filename arg) must be left untouched by filename_fuzz."""
+        m = BinaryMutator(seed=3)
+        original = bytearray(b"PWD\r\n")
+        data = bytearray(original)
+        m._strat_ftp_filename_fuzz(data, [], list(range(len(data))))
+        assert data == original
+
+    def test_credential_fuzz_mutates_pass_argument(self):
+        m = BinaryMutator(seed=2)
+        data = bytearray(b"PASS admin\r\n")
+        m._strat_ftp_credential_fuzz(data, [], list(range(len(data))))
+        assert data[:5] == b"PASS "
+        assert data != bytearray(b"PASS admin\r\n")
+
+    def test_credential_fuzz_noop_for_non_auth_command(self):
+        m = BinaryMutator(seed=4)
+        original = bytearray(b"RETR file.txt\r\n")
+        data = bytearray(original)
+        m._strat_ftp_credential_fuzz(data, [], list(range(len(data))))
+        assert data == original
+
+    def test_filename_fuzz_respects_size_cap(self):
+        """Even oversized generators stay within MAGIC_MAX_BYTES (512)."""
+        from fast_loop.binary_mutator import MAGIC_MAX_BYTES
+        m = BinaryMutator(seed=1)
+        # Run many times to hit the oversized generator branch
+        for s in range(50):
+            mm = BinaryMutator(seed=s)
+            data = bytearray(b"RETR file.txt\r\n")
+            mm._strat_ftp_filename_fuzz(data, [], list(range(len(data))))
+            # Verb preserved
+            assert data[:5] == b"RETR "
+            # The injected argument portion ≤ MAGIC_MAX_BYTES
+            assert len(data) <= len(b"RETR ") + MAGIC_MAX_BYTES + len(b"\r\n\r\n")
+
+    def test_filename_and_credential_in_all_strategies_and_dispatch(self):
+        """The two new operators are registered for the FTP module path."""
+        from fast_loop.binary_mutator import ALL_STRATEGIES, BinaryMutator
+        from fast_loop.ftp_module import FTPModule
+        assert "ftp_filename_fuzz" in ALL_STRATEGIES
+        assert "ftp_credential_fuzz" in ALL_STRATEGIES
+        assert "ftp_filename_fuzz" in FTPModule().binary_operators()
+        assert "ftp_credential_fuzz" in FTPModule().binary_operators()
+        # And excluded from BINARY_ONLY (non-FTP targets must stay generic)
+        from fast_loop.binary_mutator import BINARY_ONLY_STRATEGIES
+        assert "ftp_filename_fuzz" not in BINARY_ONLY_STRATEGIES
+        assert "ftp_credential_fuzz" not in BINARY_ONLY_STRATEGIES

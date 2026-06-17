@@ -54,7 +54,7 @@ if [ ! -f .env ]; then
     echo "WARNING: no .env found — baseline C (REAL LLM) needs OPENAI_API_KEY." >&2
 fi
 
-DASH_FLAG="--no-dashboard"
+DASH_FLAG=""
 [ "${DASHBOARD}" = "1" ] && DASH_FLAG=""
 
 echo "============================================================"
