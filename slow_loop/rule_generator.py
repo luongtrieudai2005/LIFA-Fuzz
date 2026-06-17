@@ -288,7 +288,68 @@ class RuleGenerator:
             f"Generated {len(unique)} rules from grammar "
             f"'{grammar.protocol_name}' (confidence={grammar.confidence:.2f})"
         )
+
+        # Attach grammar-targeted semantic violations (SemFuzz-inspired). For
+        # each inferred field, attach 1-2 structural violations (remove /
+        # update) that target THAT field. Unlike the naive case-study
+        # violations (mild CRLF/verb perturbation a lenient server tolerates),
+        # these target the field's actual role: nuke the magic, drop the
+        # length field, set an enum to an invalid value. A spec-compliant
+        # server should answer "error"; a "normal" answer is the divergence
+        # the oracle flags. This is deterministic and grammar-driven (no LLM
+        # cost, no protocol-specific hardcoding) — a cheap first test of
+        # whether grammar-targeting beats naive violations. LLM-generated
+        # violations remain a later phase.
+        self._attach_grammar_violations(unique, grammar)
+
         return unique
+
+    def _attach_grammar_violations(
+        self, rules: list[SemanticRule], grammar: ProtocolGrammar
+    ) -> None:
+        """Attach grammar-targeted ViolationStrategy to each field's rule."""
+        from shared.schemas import (
+            ViolationAction, ViolationStrategy, ResponseCategory, FieldType,
+        )
+        # Map field name → the rule that owns it (by target_field_name).
+        by_field = {r.target_field_name: r for r in rules if r.target_field_name}
+        for field in grammar.fields:
+            name = field.name or ""
+            rule = by_field.get(name)
+            if rule is None:
+                continue
+            ftype = field.field_type
+            flen = (field.offset_end - field.offset_start) if field.offset_end and field.offset_end > 0 else 1
+            vstrats: list[ViolationStrategy] = []
+            # Magic/static header: overwrite with NULs ⇒ server should reject
+            # (no/unknown framing). Expected error.
+            if field.is_constant or ftype == FieldType.BYTES:
+                vstrats.append(ViolationStrategy(
+                    action=ViolationAction.UPDATE, target_field=name,
+                    target_length=max(1, flen),
+                    insert_value="00",
+                    expected_category=ResponseCategory.ERROR,
+                    description=f"Null the {name} field — server should reject",
+                ))
+            # Numeric/length/enum: set an out-of-band value ⇒ error.
+            elif ftype.value.startswith(("uint", "int")) or field.mutation_strategy.value == "enum":
+                vstrats.append(ViolationStrategy(
+                    action=ViolationAction.UPDATE, target_field=name,
+                    target_length=max(1, flen),
+                    insert_value="ff",
+                    expected_category=ResponseCategory.ERROR,
+                    description=f"Set {name} to max value — server should error",
+                ))
+            # Always also offer a REMOVE of the field (missing mandatory field).
+            if flen and flen > 0:
+                vstrats.append(ViolationStrategy(
+                    action=ViolationAction.REMOVE, target_field=name,
+                    target_length=flen,
+                    expected_category=ResponseCategory.ERROR,
+                    description=f"Drop the {name} field — server should reject",
+                ))
+            if vstrats:
+                rule.violation_strategies = vstrats
 
     # -----------------------------------------------------------------
     # Field Cross-Validation

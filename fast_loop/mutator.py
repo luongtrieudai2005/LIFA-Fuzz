@@ -1710,10 +1710,21 @@ class MutationEngine:
         # oracle in _classify_response. No protocol-specific logic in core:
         # strategies come entirely from the module.
         _VIOLATION_PROB = 0.08
+        # Collect violation strategies from TWO sources (paper §3.4 mutation
+        # strategies + disclosed case-study):
+        #   (a) grammar-targeted: SemanticRule.violation_strategies attached
+        #       by the rule generator (target real inferred fields).
+        #   (b) case-study: module.violation_strategies() (e.g. FTP CRLF).
         try:
-            _vstrats = self._module.violation_strategies() if self._module else []
+            _vstrats = list(self._module.violation_strategies()) if self._module else []
         except Exception:
             _vstrats = []
+        for _r in rule_set.rules:
+            try:
+                if _r.violation_strategies:
+                    _vstrats.extend(_r.violation_strategies)
+            except Exception:
+                pass
         if _vstrats and random.random() < _VIOLATION_PROB:
             try:
                 from fast_loop.violation_mutator import FlatFieldViolationMutator
