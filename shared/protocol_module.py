@@ -107,6 +107,21 @@ class ProtocolModule(ABC):
         """
 
     @abstractmethod
+    def response_signature(self, response: bytes, payload: bytes) -> str:
+        """A compact, stable signature of a server response for the
+        differential-baseline oracle (Phase 3).
+
+        Two replies that "mean the same thing" to the server should map to
+        the SAME signature; a meaningfully different reply should differ.
+        Protocol-specific (no RFC needed): FTP → 3-digit status code, a
+        binary protocol → the response opcode byte, the black-box default →
+        hex_prefix + a coarse length bucket. The oracle flags a structural
+        violation whose response signature matches the BASELINE (the normal
+        signature seen for that command/state) — i.e. the server did not
+        react to the violation.
+        """
+
+    @abstractmethod
     def violation_strategies(self) -> list:
         """Protocol-specific semantic-violation strategies (SemFuzz add/remove/
         update actions, each with an expected response category). Disclosed
@@ -171,6 +186,19 @@ class NullModule(ProtocolModule):
     def response_category(self, response: bytes, payload: bytes) -> str:
         """Black-box default: empty reply ⇒ error, any reply ⇒ normal."""
         return "error" if not response else "normal"
+
+    def response_signature(self, response: bytes, payload: bytes) -> str:
+        """Black-box default: hex prefix + coarse length bucket.
+
+        Coarse on purpose — the differential oracle only needs "did the
+        reply change meaningfully", and without protocol knowledge the
+        first bytes + a length bucket are the cheapest stable proxy.
+        """
+        if not response:
+            return "empty"
+        prefix = response[:8].hex()
+        bucket = "S" if len(response) < 32 else ("M" if len(response) < 256 else "L")
+        return f"{prefix}:{bucket}"
 
     def violation_strategies(self) -> list:
         """No disclosed case-study violations — pure black-box."""

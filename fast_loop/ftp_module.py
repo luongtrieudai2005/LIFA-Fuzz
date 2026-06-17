@@ -136,6 +136,17 @@ class FTPModule(ProtocolModule):
             return "normal"
         return "error"
 
+    def response_signature(self, response: bytes, payload: bytes) -> str:
+        """FTP response signature = the 3-digit status code (RFC 959).
+
+        Two FTP replies "mean the same thing" iff they share a status code
+        class+value (e.g. two "331" are both "user-ok-need-password"). A
+        structural violation that leaves the status code unchanged is one
+        the server did not react to.
+        """
+        code = _extract_ftp_code(response)
+        return code or "000"
+
     def violation_strategies(self) -> list:
         """Disclosed RFC-959 FTP semantic-violation strategies (case study).
 

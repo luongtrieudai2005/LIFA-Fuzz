@@ -74,6 +74,7 @@ from shared.logger import get_logger
 # of the old single-bit-flip _dumb_mutate(), ensuring Baseline A is a fair
 # comparison against B (math-only) and C (full fusion).
 from fast_loop.binary_mutator import BinaryMutator, BINARY_ONLY_STRATEGIES
+from fast_loop.baseline_tracker import ResponseBaselineTracker
 
 # StateTransitionGraph: Step 3 — State-Coverage Expansion.
 # Tracks unique (prev_code, command, new_code) edges to reward the fuzzer
@@ -674,6 +675,12 @@ class MutationEngine:
         # ("normal"/"error"). ``_classify_response`` compares it to the actual
         # category and records a divergence as a potential semantic bug.
         self._pending_violation_expected: Optional[str] = None
+        # Differential-baseline oracle (Phase 3): normal response signatures
+        # per (command, state), built from accepted non-violation traffic.
+        self._baseline = ResponseBaselineTracker()
+        # Last server state code observed (for the baseline key). Updated by
+        # the send path after state-tracker record_edge.
+        self._last_state_code: str = ""
 
         # Rule file poller — bridges Slow Loop / Math-Only → Fast Loop
         rule_cfg = self._load_rules_path_from_config()
@@ -1308,40 +1315,63 @@ class MutationEngine:
             )
             status = PacketStatus.ACCEPTED
 
-        # SemFuzz-style semantic-violation oracle. If this send was a
-        # structural violation, compare the ACTUAL response category to the
-        # EXPECTED one stashed in _build_mutant. A divergence (e.g. expected
-        # error, got normal) is a potential semantic bug — counted as a
-        # *potential* finding (paper precision 62.5%), NOT a crash.
-        if (
-            self._current_rule_type == "semantic_violation"
-            and self._pending_violation_expected is not None
-        ):
-            self._stats.semantic_oracle_checks += 1
-            try:
-                actual = self._module.response_category(resp, payload)
-            except Exception:
-                actual = "normal" if resp else "error"
-            expected = self._pending_violation_expected
+        # Track the latest server state code (for the baseline key) from the
+        # response we just classified.
+        try:
+            self._last_state_code = self._module.extract_state_code(resp) or ""
+        except Exception:
+            pass
+
+        # ── Differential-baseline oracle (Phase 3) ─────────────────────────
+        # Replaces the Phase-1/2 inferred "expected error" oracle, which had
+        # ~0% precision (server tolerance was indistinguishable from bugs).
+        # The baseline is BEHAVIOURAL: the response signatures a command
+        # normally gets, recorded from accepted non-violation sends. A
+        # structural violation whose response signature MATCHES the baseline
+        # is one the server did not react to ⇒ a potential semantic bug.
+        #
+        # No RFC/ground-truth: only observed behaviour. On a strict, correct
+        # target (LIFA v2) every violation yields a distinct ERROR signature,
+        # so nothing matches the ACK baseline ⇒ 0 false positives. That
+        # zero-FP result is the oracle's precision proof.
+        is_violation = self._current_rule_type == "semantic_violation"
+        try:
+            bkey = self._baseline.make_key(self._module, payload, self._last_state_code)
+        except Exception:
+            bkey = None
+        # A response's category: only "normal" (success-class) replies form the
+        # baseline. An error reply (e.g. FTP 501) IS the server reacting to a
+        # bad input, so it must never be recorded as "normal" nor flag a match.
+        try:
+            rcat = self._module.response_category(resp, payload)
+        except Exception:
+            rcat = "normal" if resp else "error"
+
+        if is_violation:
             self._pending_violation_expected = None
-            if actual != expected:
-                self._stats.semantic_violations_detected += 1
-                # Capture a text-safe snippet of the actual response + the
-                # offending payload so a divergence can be triaged against the
-                # RFC by hand (the oracle only flags POTENTIAL bugs; paper
-                # precision 62.5%, so manual confirmation is required).
-                _resp_snip = resp[:80].decode("ascii", "replace").replace("\r", "\\r").replace("\n", "\\n")
-                _pay_snip = payload[:40].decode("ascii", "replace").replace("\r", "\\r").replace("\n", "\\n")
-                log.warning(
-                    "Semantic oracle: violation expected "
-                    f"{expected!r} but got {actual!r} — potential "
-                    "semantic bug",
-                    extra={"context": {"expected": expected,
-                                       "actual": actual,
-                                       "resp_len": len(resp),
-                                       "resp": _resp_snip,
-                                       "payload": _pay_snip}},
-                )
+            if self._baseline.has_baseline(bkey):
+                self._stats.semantic_oracle_checks += 1
+                # Only a NORMAL reply that matches the baseline is suspicious —
+                # the server treated the violation as a valid message. An error
+                # reply means the server reacted correctly ⇒ never flagged.
+                if rcat == "normal":
+                    vsig = self._baseline.signature(self._module, resp, payload)
+                    if self._baseline.is_baseline(bkey, vsig):
+                        self._stats.semantic_violations_detected += 1
+                        _resp_snip = resp[:80].decode("ascii", "replace").replace("\r", "\\r").replace("\n", "\\n")
+                        _pay_snip = payload[:40].decode("ascii", "replace").replace("\r", "\\r").replace("\n", "\\n")
+                        log.warning(
+                            "Differential oracle: violation got a NORMAL "
+                            f"baseline reply (sig={vsig!r}) — server accepted "
+                            "the violation; potential semantic bug",
+                            extra={"context": {"sig": vsig, "resp_len": len(resp),
+                                               "resp": _resp_snip, "payload": _pay_snip}},
+                        )
+        elif status == PacketStatus.ACCEPTED and rcat == "normal":
+            # Build the baseline from NORMAL accepted traffic only (not errors).
+            self._baseline.record(
+                bkey, self._baseline.signature(self._module, resp, payload)
+            )
         return status
 
     def _track_rule_response(self, status: PacketStatus) -> None:
