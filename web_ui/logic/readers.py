@@ -41,6 +41,32 @@ RUNTIME_STATE = DATA_DIR / "shared" / "runtime_state.json"
 EPS_HISTORY_LEN = 120  # ~10 min at 5s refresh
 
 
+def _crash_search_dirs() -> list[Path]:
+    """All directories that may hold crash artifacts.
+
+    Production (main.py) writes to ``./crashes/``; evaluation_runner writes to
+    per-baseline ``evaluation/results/<baseline>/crashes/``. Search both so
+    the dashboard reflects crashes regardless of which path produced them
+    (otherwise the crash table shows empty during/after an eval campaign).
+    """
+    dirs: list[Path] = [CRASHES_DIR]
+    eval_results = DATA_DIR / "evaluation" / "results"
+    if eval_results.is_dir():
+        dirs.extend(sorted(p for p in eval_results.glob("*/crashes") if p.is_dir()))
+    # de-dup by resolved path while preserving order
+    seen: set[str] = set()
+    out: list[Path] = []
+    for d in dirs:
+        try:
+            key = str(d.resolve())
+        except OSError:
+            key = str(d)
+        if key not in seen:
+            seen.add(key)
+            out.append(d)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Data Readers
 # ---------------------------------------------------------------------------
@@ -113,13 +139,41 @@ def read_traffic_stats() -> dict[str, Any]:
             total_accepted = mut_state.get("total_accepted", 0)
             total_rejected_rs = mut_state.get("total_rejected", 0)
             total_timeout = mut_state.get("total_timeout", 0)
-            total_crashes_rs = mut_state.get("total_crashes", 0)
+            # FIX: crash count comes from the DETECTION counters, not the
+            # send-side mutator.total_crashes. The send-side counter only
+            # increments when a send returns PacketStatus.CRASH; crashes
+            # detected by CrashMonitor liveness polling (the common case,
+            # incl. all kernel_panic/ASAN crashes) never touch it, so it
+            # stays 0 and the dashboard showed 0 despite real crashes.
+            # Prefer evaluation.unique_crashes (crash_manager dedup) →
+            # evaluation.total_crash_hits (CrashMonitor liveness), both
+            # written by main.py and evaluation_runner; fall back to the
+            # send-side counter for older state files.
+            eval_state = state.get("evaluation", {})
+            total_crashes_rs = (
+                eval_state.get("unique_crashes")
+                or eval_state.get("total_crash_hits")
+                or mut_state.get("total_crashes", 0)
+            )
             # Also use runtime_state timestamp if fresher than traffic log
             rt_ts = state.get("timestamp", 0)
             if rt_ts and (latest_ts is None or rt_ts > latest_ts):
                 latest_ts = rt_ts
         except (json.JSONDecodeError, OSError):
             pass
+
+    # FIX: the crash count header must never show fewer crashes than the
+    # crash table below it. runtime_state.json is overwritten each run, so a
+    # stale state file (e.g. a 0-crash run) can report 0 while crash
+    # artifacts from an earlier run still sit on disk. Floor the count at the
+    # number of crash records actually found on disk so header and table stay
+    # consistent regardless of which run last wrote state.
+    try:
+        on_disk = len(read_crash_records())
+    except Exception:
+        on_disk = 0
+    if on_disk > total_crashes_rs:
+        total_crashes_rs = on_disk
 
     return {
         "total_packets": total,
@@ -171,17 +225,20 @@ def read_crash_records() -> list[dict]:
     FIX: supports BOTH naming conventions:
     - CrashMonitor: crash_YYYYMMDD_HHMMSS_<uuid>.json
     - CrashManager: <sha256_sig>.report.json
+
+    FIX: searches every crash dir — production ``./crashes/`` AND each
+    per-baseline ``evaluation/results/<baseline>/crashes/`` — so the table
+    shows crashes from an eval campaign, not just a main.py run.
     """
-    if not CRASHES_DIR.exists():
-        return []
     records = []
-    # Match both CrashMonitor (crash_*.json) and CrashManager (*.report.json)
-    for json_file in sorted(
-        list(CRASHES_DIR.glob("crash_*.json"))
-        + list(CRASHES_DIR.glob("*.report.json")),
-        key=_safe_mtime,
-        reverse=True,
-    ):
+    files = []
+    for d in _crash_search_dirs():
+        if not d.is_dir():
+            continue
+        # Match both CrashMonitor (crash_*.json) and CrashManager (*.report.json)
+        files.extend(d.glob("crash_*.json"))
+        files.extend(d.glob("*.report.json"))
+    for json_file in sorted(files, key=_safe_mtime, reverse=True):
         try:
             data = json.loads(json_file.read_text(encoding="utf-8"))
             data["_source_file"] = json_file.name
@@ -201,35 +258,41 @@ def delete_crash_artifacts(source_filename: str) -> bool:
 
     Returns:
         True if at least one file was deleted, False otherwise.
+
+    FIX: searches every crash dir (production + per-baseline eval) for the
+    file by name, since the artifact may live in either.
     """
     deleted = False
-    json_path = CRASHES_DIR / source_filename
-    bin_path = CRASHES_DIR / source_filename.replace(".json", ".bin")
-
-    for path in (json_path, bin_path):
-        try:
-            if path.exists():
-                path.unlink()
-                deleted = True
-        except OSError:
-            pass
+    for d in _crash_search_dirs():
+        json_path = d / source_filename
+        bin_path = d / source_filename.replace(".json", ".bin")
+        for path in (json_path, bin_path):
+            try:
+                if path.exists():
+                    path.unlink()
+                    deleted = True
+            except OSError:
+                pass
     return deleted
 
 
 def delete_all_crashes() -> int:
-    """Delete ALL crash artifacts (.json + .bin) from the crashes directory.
+    """Delete ALL crash artifacts (.json + .bin) from every crashes directory.
 
     Returns:
         Number of files deleted.
     """
     count = 0
-    for pattern in ("crash_*.json", "crash_*.bin", "*.report.json"):
-        for path in CRASHES_DIR.glob(pattern):
-            try:
-                path.unlink()
-                count += 1
-            except OSError:
-                pass
+    for d in _crash_search_dirs():
+        if not d.is_dir():
+            continue
+        for pattern in ("crash_*.json", "crash_*.bin", "*.report.json"):
+            for path in d.glob(pattern):
+                try:
+                    path.unlink()
+                    count += 1
+                except OSError:
+                    pass
     return count
 
 
