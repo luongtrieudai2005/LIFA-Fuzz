@@ -139,8 +139,16 @@ def run_one_session(seq: int) -> None:
             logger.info(f"[seq={seq}] STATUS {status_resp.hex()}")
 
         # ── Step 3: PROCESS_DATA (safe payload ≤ 64B) ────────────────
+        # Payload bytes are RANDOM (varied per packet), not a fixed ramp like
+        # bytes(range(N)). A fixed ramp makes byte 0 of the payload constant
+        # (always 0x00) across samples, which the statistical analyzer then
+        # misclassifies as a static "separator", splitting the payload field.
+        # Random bytes give every offset real variance → the payload is seen
+        # as one high-entropy variable-length tail field. Payload stays short
+        # (8–15 B, well under the 64 B buffer) so it never crashes the honest
+        # client; the fuzzer grows it.
         data_size = 8 + (seq % 8)            # 8–15 bytes, safe
-        process_payload = bytes(range(data_size))  # 0x00, 0x01, 0x02, ...
+        process_payload = os.urandom(data_size)
         process_pkt = build_process_packet(process_payload)
         logger.info(f"[seq={seq}] PROC  {process_pkt.hex()} "
                     f"(opcode=0x{process_pkt[5]:02x}, len={process_pkt[6]})")

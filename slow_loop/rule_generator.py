@@ -747,6 +747,31 @@ class RuleGenerator:
             )
         )
 
+        # Payload-extend rule for VARIABLE-LENGTH byte fields (overflow class).
+        # Only added when the field is variable-length (offset_end == -1 at
+        # grammar level — resolved to a concrete bound by grammar_to_rules()
+        # before reaching here, so we key on the strategy the analyzer/LLM
+        # assigned). Grows the actual payload bytes via op_buffer_overflow, the
+        # only operator that defeats a server which clamps the declared length
+        # to the bytes received. General for any length-delimited protocol.
+        if field.mutation_strategy == MutationStrategy.PAYLOAD_EXTEND:
+            rules.append(
+                SemanticRule(
+                    rule_type=RuleType.STRUCTURAL,
+                    target_field_name=field.name,
+                    offset_start=field.offset_start,
+                    offset_end=field.offset_end,
+                    field_type=field.field_type,
+                    preserve_bytes=magic_bytes,
+                    priority=priority * 0.80,
+                    mutation_strategy_override=MutationStrategy.PAYLOAD_EXTEND,
+                    description=(
+                        f"Grow variable-length payload field {field.name} "
+                        f"(overflow class)"
+                    ),
+                )
+            )
+
         return rules
 
     # -----------------------------------------------------------------

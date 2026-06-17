@@ -1255,6 +1255,14 @@ class RulesOrchestrator:
                         preserve = bytes.fromhex(fr.static_value)
                     except ValueError:
                         pass
+            elif fr.mutation_strategy == MutationStrategy.PAYLOAD_EXTEND:
+                # Variable-length tail field: carry PAYLOAD_EXTEND across the
+                # FieldRule→SemanticRule bridge so _apply_field() reaches the
+                # grow branch (op_buffer_overflow). Without this override the
+                # SemanticRule defaults to RANDOM_BYTES and the payload is
+                # only ever rewritten in place, never grown — so a server
+                # that length-clamps to bytes-received is never overflowed.
+                strategy_override = MutationStrategy.PAYLOAD_EXTEND
 
             rule = SemanticRule(
                 rule_type=RulesOrchestrator._strategy_to_rule_type(fr.mutation_strategy),
@@ -1323,6 +1331,7 @@ class RulesOrchestrator:
             MutationStrategy.CALCULATED: RuleType.BOUNDARY,
             MutationStrategy.DICTIONARY: RuleType.STRUCTURAL,
             MutationStrategy.FORMAT_STRING: RuleType.STRUCTURAL,
+            MutationStrategy.PAYLOAD_EXTEND: RuleType.STRUCTURAL,
             MutationStrategy.TRUNCATE: RuleType.STRUCTURAL,
             MutationStrategy.SKIP: RuleType.BIT_FLIP,
         }

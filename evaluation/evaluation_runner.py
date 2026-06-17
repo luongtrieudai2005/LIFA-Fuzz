@@ -438,17 +438,25 @@ async def run_single_baseline(
             MAGIC = b"LIFA"
             VERSION = 0x01
             OP_PING, OP_PROCESS = 0x01, 0x02
+            import os as _os
 
             def _pkt(opcode: int, payload: bytes = b"") -> bytes:
                 return MAGIC + bytes([VERSION, opcode]) + _struct.pack("<H", len(payload)) + payload
 
+            # PROCESS payloads use RANDOM bytes (not bytes(range(N))). A fixed
+            # ramp makes byte 0 of the payload constant (always 0x00) across
+            # samples, which the analyzer misclassifies as a static separator
+            # and splits the payload field. Random bytes give every offset
+            # variance → the payload is one variable-length tail field.
+            # Payloads stay short (≤ 15 B, well under the 64 B buffer) so the
+            # fuzzer must GROW them itself — pure discovery, not a fed PoC.
             lifa_seed_sessions = [
                 # (prefix packets, target packet)
-                ([_pkt(OP_PING, b"PONG")],                  _pkt(OP_PROCESS, bytes(range(8)))),
-                ([_pkt(OP_PING, b"SEQ00001")],              _pkt(OP_PROCESS, bytes(range(15)))),
+                ([_pkt(OP_PING, b"PONG")],                  _pkt(OP_PROCESS, _os.urandom(8))),
+                ([_pkt(OP_PING, b"SEQ00001")],              _pkt(OP_PROCESS, _os.urandom(15))),
                 # STATUS in the prefix enriches the state signal the LLM sees
                 # (state_byte 0x00→0x01 after PING), but is optional.
-                ([_pkt(OP_PING, b"hello"), _pkt(0x03)],     _pkt(OP_PROCESS, bytes(range(12)))),
+                ([_pkt(OP_PING, b"hello"), _pkt(0x03)],     _pkt(OP_PROCESS, _os.urandom(12))),
             ]
             for prefix_pkts, target_pkt in lifa_seed_sessions:
                 packets = [

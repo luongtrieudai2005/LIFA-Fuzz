@@ -132,8 +132,16 @@ class MutationStrategy(str, Enum):
     CALCULATED      → Derived from another field (e.g. length = len(payload))
     DICTIONARY      → Pick from a list of known-interesting hex values
     FORMAT_STRING   → Inject C-style format-string payloads (%s%s%s%n etc.)
+    PAYLOAD_EXTEND  → Grow a variable-length field with extra bytes (overflow class)
     TRUNCATE        → Truncate the packet at or near the field offset
     SKIP            → Leave field unchanged for this mutation round
+
+    PAYLOAD_EXTEND is assigned to variable-length tail fields (offset_end == -1).
+    Buffer overflows live in length-delimited payloads — the most common
+    memory-corruption class — so the fuzzer must periodically GROW the actual
+    payload bytes, not just rewrite them in place. A server that clamps the
+    declared length to bytes-received is immune to a bare length-field overflow;
+    only growing real bytes reaches the vulnerable memcpy/strcpy.
     """
 
     STATIC          = "static"
@@ -144,6 +152,7 @@ class MutationStrategy(str, Enum):
     CALCULATED      = "calculated"
     DICTIONARY      = "dictionary"
     FORMAT_STRING   = "format_string"
+    PAYLOAD_EXTEND  = "payload_extend"
     TRUNCATE        = "truncate"
     SKIP            = "skip"
 

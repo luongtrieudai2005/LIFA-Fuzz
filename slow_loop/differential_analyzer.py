@@ -170,7 +170,17 @@ class FieldGroup:
 
     @property
     def suggested_strategy(self) -> MutationStrategy:
-        """Map OffsetLabel → MutationStrategy for SemanticRuleSet generation."""
+        """Map OffsetLabel → MutationStrategy for SemanticRuleSet generation.
+
+        Variable-length tail fields (``end == -1``) get PAYLOAD_EXTEND
+        regardless of per-byte label: a length-delimited payload is where
+        buffer overflows live, and growing the actual bytes is what reaches
+        them. This is independent of entropy — a payload whose first byte
+        happens to be constant across samples (low variance) is still a
+        variable-length payload, not a static separator.
+        """
+        if self.end == -1:
+            return MutationStrategy.PAYLOAD_EXTEND
         mapping = {
             OffsetLabel.STATIC:       MutationStrategy.STATIC,
             OffsetLabel.CALCULATED:   MutationStrategy.CALCULATED if self.sub_type == CalcSubType.LENGTH_FIELD else MutationStrategy.RANDOM_BYTES,
@@ -737,17 +747,27 @@ class DifferentialAnalyzer:
         # P2-E: Merge split multi-byte CALCULATED fields
         groups = self._merge_calculated_neighbors(groups, all_stats)
 
-        # Mark the final group as variable-length if max_len > min_len
+        # Mark the final group as variable-length when packets vary in length.
+        # Packet-length variance (max_len > min_len) is a STRUCTURAL signal that
+        # is independent of per-byte entropy: if some packets are longer than
+        # others, the bytes from min_len onward can only belong to a
+        # variable-length field (the fixed header is identical across packets).
+        # We therefore mark the trailing group variable-length REGARDLESS of its
+        # per-byte label. The previous HIGH_ENTROPY-only gate misclassified a
+        # payload whose first byte was constant across samples (e.g. a counter
+        # starting at 0, or a length-prefixed run beginning with 0x00) as a
+        # static "separator", splitting the payload and suppressing growth.
         if groups and max_len > min_len:
             last = groups[-1]
-            if last.label == OffsetLabel.HIGH_ENTROPY:
+            if last.start < max_len:
+                # The trailing group reaches into the variable region.
                 # H9 fix: set end=-1 so to_field_rules() produces length=-1
-                # for variable-length payloads (previously only notes were set,
-                # making the g.end != -1 check in to_field_rules() dead code).
+                # and suggested_strategy() returns PAYLOAD_EXTEND.
                 last.end = -1
                 last.notes = (
-                    f"Variable-length payload. "
-                    f"Observed range: {min_len - last.start}–{max_len - last.start} B"
+                    f"Variable-length payload (packet-length variance "
+                    f"{min_len}–{max_len} B). Observed span: "
+                    f"{min_len - last.start}–{max_len - last.start} B."
                 )
 
         result = HeatmapResult(

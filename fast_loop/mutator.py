@@ -350,6 +350,7 @@ class AllFieldsScheduler(_BaseScheduler):
 _STRATEGY_WEIGHTS: dict[MutationStrategy, float] = {
     MutationStrategy.BOUNDARY_VALUES: 4.0,   # length fields: #1 bug source
     MutationStrategy.DICTIONARY:      3.0,   # opcodes: triggers different code paths
+    MutationStrategy.PAYLOAD_EXTEND:  3.5,   # variable-length payloads: overflow class
     MutationStrategy.INCREMENT:       2.5,   # sequence numbers: state confusion
     MutationStrategy.BIT_FLIP:        1.5,   # flags/enums: subtle state bugs
     MutationStrategy.CALCULATED:      2.0,   # derived fields: recalculation bugs
@@ -1658,6 +1659,38 @@ class MutationEngine:
         for f in static:
             base = _apply_field(base, f)
 
+        # ── Size-escalation mode (AFL-style growth bias) ───────────────
+        # Variable-length payloads are where buffer overflows live, and a
+        # length-clamping server can only be overflowed by GROWING the actual
+        # bytes — not by rewriting the length field. With multiple fields the
+        # scheduler must keep mutations length-preserving, so payload growth
+        # is only reachable when the variable field is mutated alone. Sample
+        # that single-field growth path explicitly and periodically so the
+        # fuzzer does not starve the overflow bug class. This is GENERAL: it
+        # keys off the PAYLOAD_EXTEND strategy the analyzer assigns to ANY
+        # variable-length tail field, not any protocol-specific offset.
+        _PAYLOAD_GROW_PROB = 0.15
+        if random.random() < _PAYLOAD_GROW_PROB:
+            grow_fields = [
+                f for f in mutable
+                if f.mutation_strategy == MutationStrategy.PAYLOAD_EXTEND
+            ]
+            if grow_fields:
+                f = random.choice(grow_fields)
+                grown = _apply_field(base, f, preserve_length=False)
+                self._last_injected_rule_id = f"payload_extend:{f.field_name}"
+                self._current_rule_type = "payload_extend"
+                start = f.offset
+                length = f.length if f.length != -1 else len(grown) - start
+                for off in range(start, min(start + length, len(grown))):
+                    self._mutation_signatures.add(
+                        f"rule:{f.field_name}:payload_extend:{off}"
+                    )
+                self._mutation_signatures.add(
+                    f"grow:{f.field_name}:len:{len(grown)}"
+                )
+                return bytes(grown)
+
         # Ask scheduler which fields to mutate this round
         async with self._sched_lock:
             chosen = self._scheduler.select(mutable)
@@ -2460,6 +2493,22 @@ def _apply_field(
                     buf = op_buffer_overflow(buf, start, end, field_type, constraints)
                 else:
                     buf[start:end] = os.urandom(actual_len)
+
+    elif s == MutationStrategy.PAYLOAD_EXTEND:
+        # Grow a variable-length payload field with extra bytes (overflow
+        # class). Only the single-field path (preserve_length=False) actually
+        # grows — growing inside a multi-field mutation would corrupt the
+        # offsets of subsequent fields. In multi-field mode we fall back to an
+        # in-place rewrite so the field is still exercised this round; the
+        # dedicated size-escalation path in _build_mutant guarantees that
+        # single-field growth happens periodically.
+        if preserve_length:
+            buf[start:end] = os.urandom(actual_len)
+        else:
+            if len(buf) <= 65536:
+                buf = op_buffer_overflow(buf, start, end, field_type, constraints)
+            else:
+                buf = op_random_byte_injection(buf, start, end, field_type, constraints)
 
     elif s == MutationStrategy.BIT_FLIP:
         # Always length-preserving — safe for multi-field.
