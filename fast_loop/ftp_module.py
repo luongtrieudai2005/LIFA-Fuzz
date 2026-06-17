@@ -33,6 +33,8 @@ _FTP_BINARY_OPERATORS = [
     "ftp_token_replace",
     "ftp_arg_fuzz",
     "ftp_crlf_insert",
+    "ftp_filename_fuzz",
+    "ftp_credential_fuzz",
 ]
 
 
