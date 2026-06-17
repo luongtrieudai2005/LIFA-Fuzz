@@ -1326,13 +1326,21 @@ class MutationEngine:
             self._pending_violation_expected = None
             if actual != expected:
                 self._stats.semantic_violations_detected += 1
+                # Capture a text-safe snippet of the actual response + the
+                # offending payload so a divergence can be triaged against the
+                # RFC by hand (the oracle only flags POTENTIAL bugs; paper
+                # precision 62.5%, so manual confirmation is required).
+                _resp_snip = resp[:80].decode("ascii", "replace").replace("\r", "\\r").replace("\n", "\\n")
+                _pay_snip = payload[:40].decode("ascii", "replace").replace("\r", "\\r").replace("\n", "\\n")
                 log.warning(
                     "Semantic oracle: violation expected "
                     f"{expected!r} but got {actual!r} — potential "
                     "semantic bug",
                     extra={"context": {"expected": expected,
                                        "actual": actual,
-                                       "resp_len": len(resp)}},
+                                       "resp_len": len(resp),
+                                       "resp": _resp_snip,
+                                       "payload": _pay_snip}},
                 )
         return status
 
