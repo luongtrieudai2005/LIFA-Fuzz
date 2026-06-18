@@ -711,6 +711,22 @@ class CrashMonitor:
         ]
         for marker in panic_markers:
             if marker in serial_lower:
+                # exit_code=0 = PID 1 exited NORMALLY (e.g. LightFTP QUIT →
+                # clean shutdown, or maxcmds/maxusers limit reached). This is
+                # NOT a crash — the kernel panics because init died, but the
+                # death is benign. Only exit_code ≠ 0 (ASAN abort=134,
+                # SIGSEGV=139) indicates a real crash.
+                if exit_code == 0:
+                    return {
+                        "type": "normal_exit",
+                        "confidence": 0.90,
+                        "detail": (
+                            "Server exited(0) — normal shutdown (QUIT, "
+                            "maxcmds, or maxusers limit). Kernel panic "
+                            "on PID-1 death is benign, NOT a crash."
+                        ),
+                        "is_actionable": False,
+                    }
                 return {
                     "type": "kernel_panic",
                     "confidence": 0.80,
