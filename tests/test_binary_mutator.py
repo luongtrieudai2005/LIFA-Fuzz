@@ -491,8 +491,8 @@ class TestFtpFilenameAndCredentialFuzz:
         assert data == original
 
     def test_filename_fuzz_respects_size_cap(self):
-        """Even oversized generators stay within MAGIC_MAX_BYTES (512)."""
-        from fast_loop.binary_mutator import MAGIC_MAX_BYTES
+        """Oversized generators stay within FTP_ARG_MAX_BYTES (8192)."""
+        from fast_loop.binary_mutator import FTP_ARG_MAX_BYTES
         m = BinaryMutator(seed=1)
         # Run many times to hit the oversized generator branch
         for s in range(50):
@@ -501,8 +501,8 @@ class TestFtpFilenameAndCredentialFuzz:
             mm._strat_ftp_filename_fuzz(data, [], list(range(len(data))))
             # Verb preserved
             assert data[:5] == b"RETR "
-            # The injected argument portion ≤ MAGIC_MAX_BYTES
-            assert len(data) <= len(b"RETR ") + MAGIC_MAX_BYTES + len(b"\r\n\r\n")
+            # The injected argument portion ≤ FTP_ARG_MAX_BYTES
+            assert len(data) <= len(b"RETR ") + FTP_ARG_MAX_BYTES + len(b"\r\n\r\n")
 
     def test_filename_and_credential_in_all_strategies_and_dispatch(self):
         """The two new operators are registered for the FTP module path."""

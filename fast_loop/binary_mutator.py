@@ -111,12 +111,19 @@ BINARY_ONLY_STRATEGIES: list[str] = ALL_STRATEGIES[:16]  # Exclude FTP strategie
 # and path-traversal/logic payloads. Defined at module scope so the tuple is
 # built once.
 #
-# SIZE CAP (MAGIC_MAX_BYTES = 512): a stack/heap buffer overflow is tripped by
-# a few hundred bytes of overwrite — 8 KB buys nothing but exhausts LightFTP's
-# connection handlers on Firecracker, causing a TCP connection-refused storm
-# and an EPS collapse (see _strat_magic_values). Every payload is sliced to
-# MAGIC_MAX_BYTES at splice time, so the entries below may exceed it freely.
+# SIZE CAP (MAGIC_MAX_BYTES = 512): magic-value payloads (format strings,
+# path-traversal tokens) are short by nature; 512 bytes is enough. The old
+# comment about "connection-refused storm" was due to a full stdout PIPE (no
+# serial drain), now fixed by commit 2c0dbb7. Kept at 512 because magic
+# payloads are precision tools, not oversized-argument generators.
 MAGIC_MAX_BYTES: int = 512
+
+# FTP ARGUMENT CAP: oversized-argument generators for buffer-overflow testing.
+# 8192 = 2 × PATH_MAX (4096 on Linux) — the minimum that covers any C buffer
+# up to PATH_MAX bytes, the most common buffer size in network code (e.g.,
+# char path[PATH_MAX], char dir[PATH_MAX]). This is a GENERAL constant keyed
+# to the OS, not to any specific target's buffer sizes.
+FTP_ARG_MAX_BYTES: int = 8192
 
 _MAGIC_PAYLOADS: tuple[bytes, ...] = (
     # Buffer overflow (capped to MAGIC_MAX_BYTES at splice time)
@@ -802,10 +809,10 @@ class BinaryMutator:
             # No argument yet — inject one if it won't shift static bytes.
             if not can_grow:
                 return
-            data[arg_start:arg_start] = bad[:MAGIC_MAX_BYTES] + CRLF
+            data[arg_start:arg_start] = bad[:FTP_ARG_MAX_BYTES] + CRLF
             return
         if can_grow:
-            data[arg_start:arg_end] = bad[: min(len(bad), MAGIC_MAX_BYTES)] + CRLF
+            data[arg_start:arg_end] = bad[: min(len(bad), FTP_ARG_MAX_BYTES)] + CRLF
         else:
             data[arg_start:arg_end] = bad[:arg_end - arg_start]
 
@@ -828,15 +835,15 @@ class BinaryMutator:
         if arg_start >= arg_end:
             if not can_grow:
                 return
-            data[arg_start:arg_start] = bad[:MAGIC_MAX_BYTES] + CRLF
+            data[arg_start:arg_start] = bad[:FTP_ARG_MAX_BYTES] + CRLF
             return
         if can_grow:
-            data[arg_start:arg_end] = bad[: min(len(bad), MAGIC_MAX_BYTES)] + CRLF
+            data[arg_start:arg_end] = bad[: min(len(bad), FTP_ARG_MAX_BYTES)] + CRLF
         else:
             data[arg_start:arg_end] = bad[:arg_end - arg_start]
 
     def _ftp_fuzz_filename(self) -> bytes:
-        """Generate a filename/path-focused bad string (≤ MAGIC_MAX_BYTES).
+        """Generate a filename/path-focused bad string (≤ FTP_ARG_MAX_BYTES).
 
         Filename parsers are classic overflow/traversal/CRLF-injection sites:
         path traversal, encoded traversal, oversized names, null-in-path,
@@ -846,9 +853,9 @@ class BinaryMutator:
             lambda: b"../../../../../../etc/passwd",
             lambda: b"..%2f..%2f..%2fetc%2fpasswd",
             lambda: b"..\\..\\..\\..\\windows\\system32\\config\\sam",
-            lambda: b"/" * 200 + b"AAAA",
+            lambda: b"/" * self._rng.randint(200, FTP_ARG_MAX_BYTES),
             lambda: b"." * 200,
-            lambda: b"A" * self._rng.randint(256, 512),  # oversized name (≤ cap)
+            lambda: b"A" * self._rng.randint(512, FTP_ARG_MAX_BYTES),  # oversized name
             lambda: b"file\x00name.txt",                 # null in path
             lambda: b"file.txt\r\nRETR /etc/shadow\r\n",  # CRLF command injection
             lambda: b"%s%s%s%n",                          # format string in name
@@ -859,13 +866,13 @@ class BinaryMutator:
         return self._rng.choice(gens)()
 
     def _ftp_fuzz_credential(self) -> bytes:
-        """Generate a credential-focused bad string (≤ MAGIC_MAX_BYTES).
+        """Generate a credential-focused bad string (≤ FTP_ARG_MAX_BYTES).
 
         Auth parsers frequently over-read/overflow on long credentials or
         choke on empty/control/metaspecial values.
         """
         gens = [
-            lambda: b"A" * self._rng.randint(256, 512),  # oversized credential
+            lambda: b"A" * self._rng.randint(512, FTP_ARG_MAX_BYTES),  # oversized credential
             lambda: b"",                                  # empty
             lambda: b"\x00",                              # lone null
             lambda: b"admin\x00root",
