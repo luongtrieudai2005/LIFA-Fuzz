@@ -208,7 +208,7 @@ async def run_single_baseline(
     # ── Target configuration ─────────────────────────────────────────
     TARGET_CONFIGS = {
         "lifa": {
-            "image": "lifa-fuzz-server:latest",
+            "image": "lifa-target-server:latest",
             "build_context": "sandbox/target",
             "port": 9000,
             "container": "lifa-target-server",
@@ -222,7 +222,7 @@ async def run_single_baseline(
             "client_script": "sandbox/client/http_client.py",
         },
         "lightftp": {
-            "image": "lifa-fuzz-server:latest",  # not used with firecracker
+            "image": "lifa-lightftp-complete:latest",  # not used with firecracker
             "build_context": "sandbox/firecracker_env",
             "port": 21,
             "container": "lifa-lightftp-server",
