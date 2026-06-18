@@ -1635,7 +1635,7 @@ class MutationEngine:
         # never synthesizes these, so this is what actually detonates the
         # known memory-handling bug. The remaining ~50% keep the ε-greedy
         # exploration + LLM-guided exploitation paths intact.
-        _MAGIC_PROB = 0.5 if getattr(self, "_is_ftp_target", False) else 0.0
+        _MAGIC_PROB = 0.2 if getattr(self, "_is_ftp_target", False) else 0.0
         if _MAGIC_PROB and random.random() < _MAGIC_PROB:
             buf = bytearray(seed.raw_bytes)
             self._binary_mutator.mutate_with(buf, "magic_values")
@@ -1768,7 +1768,7 @@ class MutationEngine:
         # fuzzer does not starve the overflow bug class. This is GENERAL: it
         # keys off the PAYLOAD_EXTEND strategy the analyzer assigns to ANY
         # variable-length tail field, not any protocol-specific offset.
-        _PAYLOAD_GROW_PROB = 0.15
+        _PAYLOAD_GROW_PROB = 0.25
         if random.random() < _PAYLOAD_GROW_PROB:
             grow_fields = [
                 f for f in mutable
