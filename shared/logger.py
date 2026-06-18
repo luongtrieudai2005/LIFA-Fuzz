@@ -246,6 +246,14 @@ def setup_logging(
     logging.getLogger("litellm").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    # Suppress Docker SDK / urllib3 debug spam (one line per is_target_alive
+    # poll when using the Docker driver — floods the log with container JSON
+    # GETs that are not actionable).
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)
+    logging.getLogger("docker").setLevel(logging.WARNING)
+    logging.getLogger("docker.auth").setLevel(logging.WARNING)
+    logging.getLogger("docker.utils").setLevel(logging.WARNING)
 
     _initialized = True
     _boot_log = logging.getLogger("lifa_fuzz.shared.logger")
