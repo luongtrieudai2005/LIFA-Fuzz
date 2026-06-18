@@ -319,7 +319,7 @@ class RuleGenerator:
             if rule is None:
                 continue
             ftype = field.field_type
-            flen = (field.offset_end - field.offset_start) if field.offset_end and field.offset_end > 0 else 1
+            flen = (field.offset_end - field.offset_start) if field.offset_end and field.offset_end > 0 else (1024 if field.offset_end < 0 else 1)
             vstrats: list[ViolationStrategy] = []
             # Magic/static header: overwrite with NULs ⇒ server should reject
             # (no/unknown framing). Expected error.

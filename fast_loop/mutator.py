@@ -1795,6 +1795,15 @@ class MutationEngine:
                 self._mutation_signatures.add(
                     f"grow:{f.field_name}:len:{len(grown)}"
                 )
+                # Text-protocol delimiter preservation: if the original seed
+                # ended with a CRLF (FTP/HTTP/SMTP/POP3/IMAP) and the growth
+                # destroyed it (op_buffer_overflow replaces [start:end] which
+                # overlaps the trailing CRLF), re-append it. Without this the
+                # server never sees a complete command → timeout → no crash.
+                # GENERAL: checks for \r\n on the original seed, not any
+                # protocol name or field label.
+                if seed.raw_bytes.endswith(b"\r\n") and not grown.endswith(b"\r\n"):
+                    grown += b"\r\n"
                 return bytes(grown)
 
         # Ask scheduler which fields to mutate this round
@@ -1843,6 +1852,11 @@ class MutationEngine:
         # mode is length-preserving, so no fixup needed there).
         if not multi and len(base) != len(seed.raw_bytes):
             base = _recompute_length_fields(base, list(mutable) + list(static))
+            # Text-protocol CRLF preservation (same rationale as size-escalation
+            # path above): if the seed ended with \r\n and growth destroyed it,
+            # re-append so the server sees a complete command.
+            if seed.raw_bytes.endswith(b"\r\n") and not base.endswith(b"\r\n"):
+                base += b"\r\n"
 
         return bytes(base)
 
