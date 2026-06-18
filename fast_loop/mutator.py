@@ -1773,8 +1773,8 @@ class MutationEngine:
         if self._stats.total_mutations % 100 < 2:
             _pe_count = sum(1 for f in mutable if f.mutation_strategy == MutationStrategy.PAYLOAD_EXTEND)
             _strats = [f.mutation_strategy.value for f in mutable if hasattr(f, 'mutation_strategy')]
-            log.debug(
-                f"mutable={len(mutable)} PAYLOAD_EXTEND_fields={_pe_count} "
+            log.info(
+                f"DIAG mutable={len(mutable)} PAYLOAD_EXTEND_fields={_pe_count} "
                 f"strategies={_strats}",
             )
         if random.random() < _PAYLOAD_GROW_PROB:
