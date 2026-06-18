@@ -118,12 +118,19 @@ BINARY_ONLY_STRATEGIES: list[str] = ALL_STRATEGIES[:16]  # Exclude FTP strategie
 # payloads are precision tools, not oversized-argument generators.
 MAGIC_MAX_BYTES: int = 512
 
-# FTP ARGUMENT CAP: oversized-argument generators for buffer-overflow testing.
-# 8192 = 2 × PATH_MAX (4096 on Linux) — the minimum that covers any C buffer
-# up to PATH_MAX bytes, the most common buffer size in network code (e.g.,
-# char path[PATH_MAX], char dir[PATH_MAX]). This is a GENERAL constant keyed
-# to the OS, not to any specific target's buffer sizes.
-FTP_ARG_MAX_BYTES: int = 8192
+# FTP ARGUMENT SIZE TIERS: standard fuzzing size schedule for oversized-
+# argument generators. Covers common C buffer sizes without tuning to any
+# specific target — each tier targets a different buffer-size class:
+#   64    → small stack buffers (char buf[64], temp[128])
+#   256   → medium buffers (char text[256], char line[512])
+#   1024  → large buffers (char path[1024], char url[2048])
+#   4096  → PATH_MAX on Linux (char dir[PATH_MAX])
+#   16384 → very large buffers (heap allocations, GPBuffer-style)
+# The generator picks a RANDOM tier, then a random size within [tier/2, tier].
+# This is how AFL (block_dup) and libFuzzer (max_len schedule) work — they
+# do not pick one magic size; they probe across a DISTRIBUTION of sizes.
+FTP_ARG_SIZE_TIERS: tuple[int, ...] = (64, 256, 1024, 4096, 16384)
+FTP_ARG_MAX_BYTES: int = max(FTP_ARG_SIZE_TIERS)  # 16384 — cap for slicing
 
 _MAGIC_PAYLOADS: tuple[bytes, ...] = (
     # Buffer overflow (capped to MAGIC_MAX_BYTES at splice time)
@@ -855,7 +862,7 @@ class BinaryMutator:
             lambda: b"..\\..\\..\\..\\windows\\system32\\config\\sam",
             lambda: b"/" * self._rng.randint(200, FTP_ARG_MAX_BYTES),
             lambda: b"." * 200,
-            lambda: b"A" * self._rng.randint(512, FTP_ARG_MAX_BYTES),  # oversized name
+            lambda: b"A" * self._rng.randint(32, self._rng.choice(FTP_ARG_SIZE_TIERS)),  # tiered oversized
             lambda: b"file\x00name.txt",                 # null in path
             lambda: b"file.txt\r\nRETR /etc/shadow\r\n",  # CRLF command injection
             lambda: b"%s%s%s%n",                          # format string in name
@@ -872,7 +879,7 @@ class BinaryMutator:
         choke on empty/control/metaspecial values.
         """
         gens = [
-            lambda: b"A" * self._rng.randint(512, FTP_ARG_MAX_BYTES),  # oversized credential
+            lambda: b"A" * self._rng.randint(32, self._rng.choice(FTP_ARG_SIZE_TIERS)),  # tiered oversized
             lambda: b"",                                  # empty
             lambda: b"\x00",                              # lone null
             lambda: b"admin\x00root",
