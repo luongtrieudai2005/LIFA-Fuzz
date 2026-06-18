@@ -898,26 +898,39 @@ async def run_single_baseline(
 
     finally:
         # ── Cleanup ────────────────────────────────────────────────
+        # Wrap ENTIRE cleanup in a hard 45s deadline. If any step hangs
+        # (litellm thread, aiohttp session close, Docker daemon unresponsive),
+        # the deadline fires and we continue to the next baseline (or exit).
+        import time as _cleanup_time
+        _cleanup_deadline = _cleanup_time.monotonic() + 45.0
+
+        print(f"  ⏭ Baseline {baseline_id} done — cleaning up...", flush=True)
+
         for task in background_tasks:
             if not task.done():
                 task.cancel()
         for task in background_tasks:
+            if _cleanup_time.monotonic() > _cleanup_deadline:
+                print(f"  ⚠ Cleanup deadline exceeded — skipping remaining tasks", flush=True)
+                break
             try:
-                await asyncio.wait_for(task, timeout=3.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+                _remaining = max(1.0, _cleanup_deadline - _cleanup_time.monotonic())
+                await asyncio.wait_for(task, timeout=min(3.0, _remaining))
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 pass
 
-        try:
-            if client_proc is not None:
-                await asyncio.wait_for(client_proc.stop(), timeout=5.0)
-        except (Exception, asyncio.TimeoutError):
-            pass
+        if _cleanup_time.monotonic() <= _cleanup_deadline:
+            try:
+                if client_proc is not None:
+                    await asyncio.wait_for(client_proc.stop(), timeout=5.0)
+            except (Exception, asyncio.TimeoutError):
+                pass
 
-        try:
-            if interceptor is not None:
-                await asyncio.wait_for(interceptor.stop(), timeout=5.0)
-        except (Exception, asyncio.TimeoutError):
-            pass
+            try:
+                if interceptor is not None:
+                    await asyncio.wait_for(interceptor.stop(), timeout=5.0)
+            except (Exception, asyncio.TimeoutError):
+                pass
 
         # Collect gcov coverage ONLY in --coverage mode. In crash-finding mode
         # (auto_reset/snapshot) gcov counters are discarded on every snapshot
