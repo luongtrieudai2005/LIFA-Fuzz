@@ -56,6 +56,7 @@ import os
 import signal
 import socket
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Optional
 
@@ -441,6 +442,11 @@ class FirecrackerSandbox(BaseSandbox):
         self._last_exit_code: Optional[int] = None
         self._last_exit_time: float = 0.0
         self._serial_output: str = ""
+        # Continuous serial drain: keeps the Firecracker stdout pipe from
+        # filling (which would block the VM → EPS stall) and retains serial
+        # history (including ASAN reports) for get_last_crash_info.
+        self._serial_buffer: deque = deque(maxlen=2000)  # ~64KB of text lines
+        self._serial_task: Optional[asyncio.Task] = None
 
     def _apply_target_defaults(self) -> None:
         """Re-apply target-aware defaults after config overrides.
@@ -686,6 +692,56 @@ class FirecrackerSandbox(BaseSandbox):
             )
 
         logger.info("Firecracker sandbox started successfully")
+        # Start continuous serial drain to prevent pipe-full stalls and
+        # retain serial history (ASAN reports) for crash diagnostics.
+        self._start_serial_drain()
+
+    # -----------------------------------------------------------------
+    # Serial drain — prevents pipe-full VM stalls + preserves ASAN trace
+    # -----------------------------------------------------------------
+
+    def _start_serial_drain(self) -> None:
+        """Launch (or relaunch) the async serial drain task."""
+        self._cancel_serial_drain()
+        if self._process is not None and self._process.stdout is not None:
+            self._serial_buffer.clear()
+            self._serial_task = asyncio.create_task(
+                self._drain_serial(), name="fc_serial_drain"
+            )
+
+    def _cancel_serial_drain(self) -> None:
+        """Cancel the serial drain task if running."""
+        if self._serial_task is not None and not self._serial_task.done():
+            self._serial_task.cancel()
+        self._serial_task = None
+
+    async def _drain_serial(self) -> None:
+        """Continuously read Firecracker stdout (VM serial console) into a
+        rolling buffer.
+
+        Without this, the stdout PIPE buffer (64KB on Linux) fills up with
+        boot logs + connection logs → Firecracker blocks on write → VM
+        stalls → EPS drops to 0. Additionally, the ASAN report (written at
+        crash time) is the LAST thing flushed; if the pipe is already full,
+        it never makes it through → ``get_last_crash_info`` reads stale/empty
+        data → σ₃ dedup fails.
+
+        This task drains the pipe line-by-line into ``_serial_buffer`` (deque,
+        maxlen=2000 ≈ 64KB). The buffer is then the source for crash
+        diagnostics.
+        """
+        try:
+            while True:
+                line = await self._process.stdout.readline()
+                if not line:
+                    break  # EOF — process exited
+                self._serial_buffer.append(
+                    line.decode("utf-8", errors="replace").rstrip("\n\r")
+                )
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass  # Never crash the driver over serial drain
 
     # -----------------------------------------------------------------
     # BaseSandbox: stop()
@@ -701,6 +757,9 @@ class FirecrackerSandbox(BaseSandbox):
             4. Clean up UDS socket and API session.
         """
         logger.info("Stopping Firecracker sandbox...")
+
+        # Cancel serial drain before killing process
+        self._cancel_serial_drain()
 
         # Try graceful shutdown via API
         if self._api is not None:
@@ -769,7 +828,8 @@ class FirecrackerSandbox(BaseSandbox):
             return
 
         try:
-            # 1. Kill the crashed process
+            # 1. Cancel serial drain + kill the crashed process
+            self._cancel_serial_drain()
             await self._kill_process()
             await self._api.close() if self._api else None
             self._api = None
@@ -820,6 +880,8 @@ class FirecrackerSandbox(BaseSandbox):
                 f"reset_state() complete ({elapsed_total * 1000:.1f}ms total, "
                 f"target ready at {self.vm_ip}:{self.target_port})"
             )
+            # Restart serial drain for the new process
+            self._start_serial_drain()
 
         except SandboxResetError:
             raise
@@ -899,20 +961,24 @@ class FirecrackerSandbox(BaseSandbox):
         exit_code = self._process.returncode
         crash_signal = self._map_exit_code_to_signal(exit_code)
 
-        # Collect serial output as stack trace. The 0.5s read was too short to
-        # reliably capture a full ASAN report (error line + backtrace) flushed
-        # over the ttyS0 pipe at VM-exit; a truncated trace loses the
-        # backtrace frames, which destabilises the crash-location dedup key
-        # (σ₃) so the same crash site is recorded as two "unique" crashes.
-        # Read up to 2s — the process has already exited, so this only waits
-        # for the pipe to drain, not for new output.
-        serial_output = ""
+        # Collect serial output from the continuous drain buffer. The drain
+        # task reads Firecracker stdout line-by-line into ``_serial_buffer``
+        # throughout the VM's lifetime, so the ASAN report flushed at crash
+        # time IS captured (unlike the old approach which read the pipe only
+        # AFTER exit — by then the pipe was often full/stale and the ASAN
+        # report was lost, leaving σ₃ empty → over-counting).
+        # Cancel the drain task FIRST to avoid a race where both the drain
+        # task and this read() compete for the same pipe, splitting data.
+        self._cancel_serial_drain()
+        serial_output = "\n".join(self._serial_buffer)
         if self._process.stdout:
             try:
                 remaining = await asyncio.wait_for(
-                    self._process.stdout.read(), timeout=2.0
+                    self._process.stdout.read(), timeout=1.0
                 )
-                serial_output = remaining.decode("utf-8", errors="replace")
+                if remaining:
+                    tail = remaining.decode("utf-8", errors="replace")
+                    serial_output = serial_output + "\n" + tail if serial_output else tail
             except (asyncio.TimeoutError, Exception):
                 pass
 

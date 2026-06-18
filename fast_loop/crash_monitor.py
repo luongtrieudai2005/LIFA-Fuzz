@@ -942,7 +942,7 @@ class CrashMonitor:
         # whose crash chain is slow (~3s liveness poll per candidate) is still
         # bounded so the hot loop is not paused for too long per crash.
         import time as _time
-        _CONFIRM_BUDGET_S = 30.0
+        _CONFIRM_BUDGET_S = 15.0
         _deadline = _time.monotonic() + _CONFIRM_BUDGET_S
         tried = 0
         for _entry in reversed(candidates):
