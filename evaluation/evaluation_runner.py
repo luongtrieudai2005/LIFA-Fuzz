@@ -1837,6 +1837,22 @@ Examples:
     if dashboard_proc:
         _stop_dashboard(dashboard_proc)
 
+    # ── Force-cancel any lingering asyncio tasks ──────────────────
+    # C baseline runs the slow loop IN-PROCESS as asyncio tasks. If any
+    # task (LLM API session, state writer, interceptor drain) survived
+    # the per-baseline finally block, asyncio.run() will hang here forever
+    # waiting for them. Cancel everything explicitly so the process exits.
+    current = asyncio.current_task()
+    for task in asyncio.all_tasks():
+        if task is not current and not task.done():
+            task.cancel()
+    for task in asyncio.all_tasks():
+        if task is not current and not task.done():
+            try:
+                await asyncio.wait_for(task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
+
 
 if __name__ == "__main__":
     load_dotenv(override=False)
