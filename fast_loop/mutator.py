@@ -1769,6 +1769,14 @@ class MutationEngine:
         # keys off the PAYLOAD_EXTEND strategy the analyzer assigns to ANY
         # variable-length tail field, not any protocol-specific offset.
         _PAYLOAD_GROW_PROB = 0.25
+        # Debug: log grow_fields count every ~100 mutations
+        if self._stats.total_mutations % 100 < 2:
+            _pe_count = sum(1 for f in mutable if f.mutation_strategy == MutationStrategy.PAYLOAD_EXTEND)
+            _strats = [f.mutation_strategy.value for f in mutable if hasattr(f, 'mutation_strategy')]
+            log.debug(
+                f"mutable={len(mutable)} PAYLOAD_EXTEND_fields={_pe_count} "
+                f"strategies={_strats}",
+            )
         if random.random() < _PAYLOAD_GROW_PROB:
             grow_fields = [
                 f for f in mutable
