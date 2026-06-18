@@ -1839,9 +1839,22 @@ Examples:
             # The interceptor.stop() in the baseline's finally already freed
             # the port; the VM/TAP/socket orphans are what we still need to catch.
             t0 = time.monotonic()
-            cleanup_orphaned_resources(free_port_8001=False)
+            # Run cleanup in a SEPARATE THREAD with a hard 30s timeout.
+            # subprocess.run(timeout=10) inside cleanup can still hang if the
+            # Docker daemon socket is unresponsive in WSL2 — the SIGKILL
+            # targets the docker CLI, not the daemon. A thread + future.result
+            # (timeout=30) abandons the cleanup entirely if it exceeds 30s.
+            import concurrent.futures
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(cleanup_orphaned_resources, free_port_8001=False)
+                    future.result(timeout=30)
+            except concurrent.futures.TimeoutError:
+                print("  ⚠ Inter-baseline cleanup timed out after 30s — "
+                      "orphaned resources may remain, continuing anyway.",
+                      flush=True)
             print(f"  ⏭ Inter-baseline cleanup took {time.monotonic() - t0:.1f}s, "
-                  f"sleeping 10s, then starting next baseline.")
+                  f"sleeping 10s, then starting next baseline.", flush=True)
             await asyncio.sleep(10)
 
     # Write comparison
