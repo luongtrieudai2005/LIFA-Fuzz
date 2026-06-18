@@ -63,7 +63,7 @@ COPY --from=builder /tmp/LightFTP /opt/lightftp-build
 # [ftpconfig] section + interface=0.0.0.0 (else fftp binds 127.0.0.1 and is
 # unreachable), plus an [admin] user so the fuzzer can log in.
 RUN mkdir -p /tmp/ftp_root && \
-    printf '[ftpconfig]\nport=21\ninterface=0.0.0.0\nexternal_ip=172.16.0.2\nlocal_mask=255.255.255.0\nminport=1024\nmaxport=65535\nmaxusers=100\nmaxcmds=999999\n\n[admin]\npswd=*\naccs=admin\nroot=/tmp/ftp_root\n' > /etc/fftp.conf
+    printf '[ftpconfig]\nport=21\ninterface=0.0.0.0\nexternal_ip=172.16.0.2\nlocal_mask=255.255.255.0\nminport=1024\nmaxport=65535\nmaxusers=10\nmaxcmds=999999\n\n[admin]\npswd=*\naccs=admin\nroot=/tmp/ftp_root\n' > /etc/fftp.conf
 
 # Create /init script — starts fftp directly (no SSH needed!)
 RUN printf '#!/bin/sh\n\
