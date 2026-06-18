@@ -1693,8 +1693,8 @@ Examples:
              "like B,C (default: all). Runs in the given order.",
     )
     parser.add_argument(
-        "--driver", choices=["docker", "firecracker"], default="docker",
-        help="Sandbox driver (default: docker)",
+        "--driver", choices=["docker", "firecracker"], default="firecracker",
+        help="Sandbox driver (default: firecracker)",
     )
     parser.add_argument(
         "--target", default="lifa", choices=["lifa", "lighttpd", "lightftp"],
