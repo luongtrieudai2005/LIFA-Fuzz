@@ -307,6 +307,39 @@ def _reconstruct_format_messages(
     return results
 
 
+def _frequency_candidate_units(
+    packets: list[bytes], min_packets: int = 2
+) -> set[bytes]:
+    """Frequency-based candidate units — a black-box fallback when the KS
+    filter over-prunes on a small or unbalanced sample.
+
+    A unit is a candidate if it appears in the header of at least
+    ``min_packets`` distinct packets. Frequency is a protocol-agnostic
+    structural signal (a real framing unit recurs; random noise does not),
+    so this needs no protocol knowledge. We additionally boost units that
+    appear at offset 0 of any packet, because format messages start at the
+    beginning — a position prior, not a protocol-specific constant.
+    """
+    from collections import defaultdict
+    per_packet: dict[bytes, set[int]] = defaultdict(set)
+    for idx, pkt in enumerate(packets):
+        header = pkt[:_HEADER_BYTES]
+        seen: set[bytes] = set()
+        for i in range(len(header) - _MESSAGE_UNIT_LEN + 1):
+            unit = header[i : i + _MESSAGE_UNIT_LEN]
+            if unit not in seen:  # count once per packet
+                per_packet[unit].add(idx)
+                seen.add(unit)
+    candidates = {u for u, pkts in per_packet.items() if len(pkts) >= min_packets}
+    # Position prior: always keep units that sit at offset 0 of ≥1 packet —
+    # those are the only units the greedy reconstruct can start from.
+    for pkt in packets:
+        header = pkt[:_HEADER_BYTES]
+        if len(header) >= _MESSAGE_UNIT_LEN:
+            candidates.add(header[:_MESSAGE_UNIT_LEN])
+    return candidates
+
+
 # ===========================================================================
 # Step 2: PAM clustering + Dunn index (Veritas §3.2)
 # ===========================================================================
@@ -539,9 +572,34 @@ class StateMachineInferer:
         units = _extract_message_units(packets)
         candidate_units = _ks_test_filter(units, packets)
         fmt_results = _reconstruct_format_messages(packets, candidate_units)
+        fmt_source = "ks"
         if len(fmt_results) < 3:
-            log.debug("StateMachineInferer: too few format messages, skipping")
+            # Frequency fallback. The KS filter (Veritas) can over-prune on a
+            # small / unbalanced sample: the protocol units that sit at offset
+            # 0 (where format messages start) get dropped as "unbalanced"
+            # between the two packet halves, so the greedy reconstruct cannot
+            # even begin and yields < 3. Frequency is a protocol-agnostic
+            # structural signal; combined with an offset-0 prior it recovers
+            # those start units. Used only when KS under-produces, never
+            # replacing KS on healthy samples.
+            for _min_pkts in (2, 1):
+                cand = _frequency_candidate_units(packets, min_packets=_min_pkts)
+                fmt_results = _reconstruct_format_messages(packets, cand)
+                if len(fmt_results) >= 3:
+                    fmt_source = f"frequency-fallback(min_pkts={_min_pkts})"
+                    break
+        if len(fmt_results) < 3:
+            log.debug(
+                "StateMachineInferer: too few format messages after KS + "
+                "frequency fallback, skipping"
+            )
             return ProbabilisticStateMachine()
+        if fmt_source != "ks":
+            log.info(
+                f"StateMachineInferer: KS filter under-produced format "
+                f"messages; inferred via {fmt_source} "
+                f"({len(fmt_results)} format messages)"
+            )
 
         # Step 2: Feature extraction from ORIGINAL packet headers (12B),
         # NOT from short format messages. This ensures label_packet() —
