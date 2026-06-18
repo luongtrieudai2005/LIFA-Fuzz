@@ -164,7 +164,7 @@ class FieldGroup:
     @property
     def length(self) -> int:
         """Byte length of the group. Returns -1 for variable-length groups."""
-        if self.end == -1:
+        if self.end < 0:
             return -1
         return self.end - self.start
 
@@ -172,14 +172,14 @@ class FieldGroup:
     def suggested_strategy(self) -> MutationStrategy:
         """Map OffsetLabel → MutationStrategy for SemanticRuleSet generation.
 
-        Variable-length tail fields (``end == -1``) get PAYLOAD_EXTEND
+        Variable-length tail fields (``end < 0``) get PAYLOAD_EXTEND
         regardless of per-byte label: a length-delimited payload is where
         buffer overflows live, and growing the actual bytes is what reaches
         them. This is independent of entropy — a payload whose first byte
         happens to be constant across samples (low variance) is still a
         variable-length payload, not a static separator.
         """
-        if self.end == -1:
+        if self.end < 0:
             return MutationStrategy.PAYLOAD_EXTEND
         mapping = {
             OffsetLabel.STATIC:       MutationStrategy.STATIC,

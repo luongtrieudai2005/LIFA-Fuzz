@@ -190,9 +190,9 @@ class RuleGenerator:
                     f"offset that has no absolute position)."
                 )
                 continue
-            # Treat offset_end <= offset_start (other than -1, handled below)
-            # as an empty/invalid range and skip it.
-            if field.offset_end != -1 and field.offset_end <= field.offset_start:
+            # Treat offset_end <= offset_start (other than negative = variable-length,
+            # handled below) as an empty/invalid range and skip it.
+            if field.offset_end >= 0 and field.offset_end <= field.offset_start:
                 logger.warning(
                     f"Dropping field '{field.name}': empty/inverted range "
                     f"[{field.offset_start}, {field.offset_end})."
@@ -203,8 +203,8 @@ class RuleGenerator:
             # size so they are NOT silently dropped by _generate_rules_for_field().
             # The mutator's _apply_field() clamps to the actual packet size at
             # runtime, so using a generous upper bound here is safe.
-            was_variable = field.offset_end == -1  # capture before resolution
-            if field.offset_end == -1:
+            was_variable = field.offset_end < 0  # any negative = variable-length (with trailing delimiter)
+            if field.offset_end < 0:
                 resolved_end = min(
                     field.offset_start + 1024,
                     grammar.max_packet_size,
@@ -394,7 +394,7 @@ class RuleGenerator:
         for i, field in enumerate(fields):
             # Rule 4: OOB clamping (always applies, no heatmap needed)
             if (
-                field.offset_end != -1
+                field.offset_end >= 0
                 and field.offset_end > grammar.max_packet_size > 0
             ):
                 old_end = field.offset_end
@@ -413,7 +413,7 @@ class RuleGenerator:
             # Collect ALL heatmap groups covering this field's byte range,
             # not just the first byte.  A multi-byte field should only be
             # overridden to STATIC if ALL its bytes are STATIC in the heatmap.
-            field_end = field.offset_end if field.offset_end != -1 else field.offset_start + 1
+            field_end = field.offset_end if field.offset_end >= 0 else field.offset_start + 1
             covering_groups: list[Any] = []
             for off in range(field.offset_start, field_end):
                 g = heatmap_map.get(off)
@@ -474,7 +474,7 @@ class RuleGenerator:
                 if fj.mutation_strategy == MutationStrategy.SKIP:
                     continue
                 # -1 means "rest of packet" — skip overlap check for it
-                if fi.offset_end == -1 or fj.offset_end == -1:
+                if fi.offset_end < 0 or fj.offset_end < 0:
                     continue
                 # Check [offset_start, offset_end) overlap
                 if fi.offset_start < fj.offset_end and fj.offset_start < fi.offset_end:
@@ -842,7 +842,7 @@ class RuleGenerator:
         )
 
         # Payload-extend rule for VARIABLE-LENGTH byte fields (overflow class).
-        # Only added when the field is variable-length (offset_end == -1 at
+        # Only added when the field is variable-length (offset_end < 0 at
         # grammar level — resolved to a concrete bound by grammar_to_rules()
         # before reaching here, so we key on the strategy the analyzer/LLM
         # assigned). Grows the actual payload bytes via op_buffer_overflow, the
