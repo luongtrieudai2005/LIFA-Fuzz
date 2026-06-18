@@ -1853,6 +1853,14 @@ Examples:
             except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                 pass
 
+    # litellm spawns a non-daemon LoggingWorker thread that blocks
+    # asyncio.run()'s clean shutdown (the thread tries to use the
+    # already-closed event loop → deadlock). All real work is done at
+    # this point — comparison written, dashboard stopped, tasks cancelled.
+    # Force-exit to skip atexit handlers that would re-enter the deadlock.
+    import os as _os
+    _os._exit(0)
+
 
 if __name__ == "__main__":
     load_dotenv(override=False)
