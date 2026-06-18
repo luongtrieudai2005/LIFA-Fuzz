@@ -677,19 +677,18 @@ class DifferentialAnalyzer:
         min_len        = min(lengths)
         max_len        = max(lengths)
 
-        # Bug #2 fix: use P10 percentile instead of min() so that a single
-        # short ACK/keepalive packet cannot destroy the entire analysis.
-        # _MIN_COVERAGE already filters offsets present in < 60% of packets,
-        # so using a percentile is safe — rare offsets get None from
-        # _analyze_offset() and are excluded.
-        #
-        # Edge case: for n < 10 packets, int(n*0.1) = 0, which is just min().
-        # To avoid this, use max(1, ...) so at least the 2nd shortest packet
-        # is used, which still tolerates 1 outlier in small corpora.
+        # Analysis depth: use P75 percentile instead of P10.
+        # P10 was too aggressive for text protocols (FTP, HTTP, SMTP) where
+        # short commands (PWD\r\n = 6B) are COMMON, not outliers. With P10=5,
+        # the analyzer only sees the command verb — never the argument bytes
+        # where buffer overflows live. P75 captures most argument content
+        # while still ignoring extreme outliers (mutated 8KB packets).
+        # The P75 choice is GENERAL: it balances depth vs noise for any
+        # protocol with naturally varying command lengths.
         sorted_lens = sorted(lengths)
-        p10_idx = min(max(1, int(len(sorted_lens) * 0.1)), len(sorted_lens) - 1)
-        p10_len = sorted_lens[p10_idx]
-        analysis_depth = min(p10_len, self.max_depth)
+        p75_idx = min(len(sorted_lens) - 1, max(1, int(len(sorted_lens) * 0.75)))
+        p75_len = sorted_lens[p75_idx]
+        analysis_depth = min(p75_len, self.max_depth)
 
         log.info(
             "Starting differential analysis",
