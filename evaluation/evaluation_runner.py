@@ -348,6 +348,7 @@ async def run_single_baseline(
                 kernel_args=kernel_args,
                 target_port=fc_cfg["target_port"],
                 target_name=target,  # Pass target name for driver-level defaults
+                mem_size_mb=fc_cfg.get("mem_size_mb", 512),
             )
 
         await sandbox.start()
