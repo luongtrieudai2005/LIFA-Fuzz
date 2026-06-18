@@ -584,8 +584,15 @@ class RulesOrchestrator:
                 )
 
             # ── 4a. Select FULL diverse samples (for math analysis) ──
+            # The DifferentialAnalyzer needs MANY samples for reliable
+            # statistics (entropy, variance, Pearson). With only 20 packets,
+            # byte-level variance is too noisy → 1 collapsed field group
+            # → no PAYLOAD_EXTEND → no overflow discovery. Use 100 samples
+            # for the math path; the LLM still gets max_packets_per_inference
+            # (token-efficient) from full_selected below.
+            _MATH_SAMPLE_SIZE = max(100, self.max_packets_per_inference * 5)
             full_selected = self._window.get_diverse_sample(
-                self.max_packets_per_inference
+                _MATH_SAMPLE_SIZE
             )
 
             if not full_selected:
