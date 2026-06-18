@@ -257,19 +257,31 @@ class DockerSandbox(BaseSandbox):
         """Poll container until it's running or timeout."""
         client = self._docker()
         deadline = time.time() + timeout_s
+        last_status = "unknown"
 
         while time.time() < deadline:
             try:
                 container = client.containers.get(name)
                 container.reload()
+                last_status = container.status
                 if container.status == "running":
                     return
             except NotFound:
-                pass
+                last_status = "not_found"
             time.sleep(0.2)
 
+        # Collect diagnostics before failing
+        diag = ""
+        try:
+            container = client.containers.get(name)
+            logs = container.logs(tail=20).decode("utf-8", errors="replace")
+            diag = f" status={container.status} logs={logs[:500]}"
+        except Exception:
+            pass
+
         raise SandboxStartError(
-            f"Container '{name}' did not reach 'running' within {timeout_s}s",
+            f"Container '{name}' did not reach 'running' within {timeout_s}s "
+            f"(last_status={last_status}).{diag}",
             driver="docker",
         )
 
