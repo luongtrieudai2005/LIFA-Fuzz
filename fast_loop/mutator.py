@@ -1250,38 +1250,18 @@ class MutationEngine:
                 "ts": round(time.time(), 3),
             }
 
-            # Protocol-specific sample extras (e.g. FTP status code) via the
-            # module. NullModule ⇒ empty dict ⇒ pure black-box (no parsing).
-            entry.update(self._module.response_sample_extra(response))
+            # Protocol-specific extras (e.g. FTP status code) → sub-dict
+            # ``_extra`` so they don't leak into the top-level keys the EWMA
+            # core reads. NullModule ⇒ empty dict ⇒ key omitted (pure black-box).
+            extra = self._module.response_sample_extra(response)
+            if extra:
+                entry["_extra"] = extra
 
             line = json.dumps(entry) + "\n"
             with open(path, "a") as f:
                 f.write(line)
         except Exception:
             pass  # Never crash hot loop for IPC write failure
-
-    @staticmethod
-    def _extract_ftp_code(response: bytes) -> str:
-        """Extract 3-digit FTP status code from server response bytes.
-
-        Reuses the validation pattern from _record_response_sample():
-        3 ASCII digits in range 100-599 followed by space or hyphen.
-
-        Args:
-            response: Raw bytes from the FTP server.
-
-        Returns:
-            Zero-padded 3-digit code string (e.g. ``"220"``),
-            or ``"000"`` if the response is not a valid FTP status line.
-        """
-        if len(response) >= 4 and response[:3].isdigit():
-            try:
-                code_val = int(response[:3])
-                if 100 <= code_val <= 599 and response[3:4] in (b" ", b"-"):
-                    return f"{code_val:03d}"
-            except ValueError:
-                pass
-        return "000"
 
     def _classify_response(self, resp: bytes, payload: bytes) -> PacketStatus:
         """Classify server response by protocol-specific status codes.

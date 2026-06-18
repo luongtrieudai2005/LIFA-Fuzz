@@ -87,5 +87,10 @@ class LifaModule(ProtocolModule):
         # rule generator (Phase 2) and are field-name resolved by the engine.
         return []
 
+    def response_diversity_multiplier(self, extra_fields: list) -> float:
+        """LIFA binary diversity is already captured by hex-prefix count.
+        No auth-depth analogue — return 1.0 (no bonus)."""
+        return 1.0
+
 
 register_protocol_module("lifa", LifaModule)

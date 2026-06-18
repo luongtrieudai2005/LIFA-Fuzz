@@ -25,6 +25,36 @@ from typing import Any, Optional
 from shared.protocol_module import ProtocolModule, register_protocol_module
 from shared.schemas import PacketStatus
 from fast_loop.state_transition_graph import StateTransitionGraph
+from enum import IntEnum
+
+
+class _FTPAuthDepth(IntEnum):
+    """Auth-depth tiers for the EWMA diversity bonus (RFC 959)."""
+    PRE_AUTH = 0
+    USER_ACCEPTED = 1
+    AUTHENTICATED = 2
+
+
+def _infer_ftp_depth(code: str) -> _FTPAuthDepth:
+    """Map an FTP status code to an auth-depth tier.
+
+    Covers all RFC 959 codes without copying a ~40-entry table:
+    220 → PRE_AUTH (the greeting — always pre-auth),
+    230 / other 2xx → AUTHENTICATED (positive completion, post-auth in a
+      normal session: 200 TYPE, 215 SYST, 257 PWD, 230 logged-in),
+    3xx → USER_ACCEPTED (intermediate: 331 need password),
+    else → PRE_AUTH (4xx/5xx errors, typically from malformed commands).
+    """
+    if not code:
+        return _FTPAuthDepth.PRE_AUTH
+    if code.startswith("220"):
+        return _FTPAuthDepth.PRE_AUTH
+    if code[0] == "2":
+        return _FTPAuthDepth.AUTHENTICATED
+    if code[0] == "3":
+        return _FTPAuthDepth.USER_ACCEPTED
+    return _FTPAuthDepth.PRE_AUTH
+
 
 #: The 4 FTP-specific BinaryMutator strategy names (implemented in
 #: binary_mutator.py). The core never selects these unless a module offers them.
@@ -181,6 +211,26 @@ class FTPModule(ProtocolModule):
                             "unknown command; server should 500",
             ),
         ]
+
+    def response_diversity_multiplier(self, extra_fields: list) -> float:
+        """EWMA diversity bonus: reward reaching deep FTP auth states."""
+        codes: set[str] = set()
+        for d in extra_fields:
+            code = d.get("ftp_status_code", "")
+            if code:
+                codes.add(code)
+        if not codes:
+            return 1.0
+        max_depth = _FTPAuthDepth.PRE_AUTH
+        for code in codes:
+            depth = _infer_ftp_depth(code)
+            if depth > max_depth:
+                max_depth = depth
+        return {
+            _FTPAuthDepth.PRE_AUTH: 1.0,
+            _FTPAuthDepth.USER_ACCEPTED: 2.0,
+            _FTPAuthDepth.AUTHENTICATED: 3.0,
+        }.get(max_depth, 1.0)
 
 
 # Register so config `protocol_module: ftp` resolves to this. The default

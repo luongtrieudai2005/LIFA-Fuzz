@@ -128,6 +128,17 @@ class ProtocolModule(ABC):
         case-study content (e.g. RFC-959 FTP). Empty list ⇒ the core runs no
         semantic-violation path (pure black-box)."""
 
+    @abstractmethod
+    def response_diversity_multiplier(self, extra_fields: list) -> float:
+        """Diversity multiplier for the EWMA response-coverage proxy.
+
+        The core EWMA controller counts unique response hex-prefixes as a
+        coverage signal. A module may boost that count to reward reaching
+        deep protocol states (e.g. FTP auth depth: a 230 reply means deeper
+        code than a 220). Receives the list of ``_extra`` dicts that
+        ``response_sample_extra`` produced. Returns ≥ 1.0; 1.0 = no bonus
+        (black-box default — the count stands as-is)."""
+
 
 class NullModule(ProtocolModule):
     """The pure black-box core: NO protocol knowledge.
@@ -203,6 +214,10 @@ class NullModule(ProtocolModule):
     def violation_strategies(self) -> list:
         """No disclosed case-study violations — pure black-box."""
         return []
+
+    def response_diversity_multiplier(self, extra_fields: list) -> float:
+        """Black-box default: no protocol-specific bonus."""
+        return 1.0
 
 
 #: Registry of available module names → factory (populated by fast_loop modules).

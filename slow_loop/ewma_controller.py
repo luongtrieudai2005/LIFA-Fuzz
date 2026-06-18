@@ -26,16 +26,10 @@ from pathlib import Path
 from typing import Optional
 
 from shared.logger import get_logger
+from shared.protocol_module import ProtocolModule
+from typing import Optional
 
 log = get_logger("slow_loop.ewma_controller")
-
-# FTP Response Analyzer — rewards deep auth states with higher recv intensity
-from slow_loop.ftp_response_analyzer import (
-    FTPResponseAnalyzer,
-    FTPAuthDepth,
-    _FTP_STATUS_MAP,
-    extract_ftp_status_codes,
-)
 
 
 class EWMAController:
@@ -62,6 +56,7 @@ class EWMAController:
         weight_A: float = 0.3,
         weight_B: float = 0.7,
         response_buf_path: str = "shared/response_buffer.jsonl",
+        protocol_module: Optional[ProtocolModule] = None,
     ) -> None:
         self.output_path = Path(output_path)
         self.response_buf_path = Path(response_buf_path)
@@ -70,6 +65,7 @@ class EWMAController:
         self.K_max = K_max
         self.k_min = k_min
         self.weight_A = weight_A
+        self._protocol_module = protocol_module
         self.weight_B = weight_B
 
         # EWMA state — persists across epochs
@@ -152,18 +148,19 @@ class EWMAController:
     # ------------------------------------------------------------------
 
     def _read_and_truncate_response_buffer(self) -> int:
-        """Read response_buffer.jsonl, count unique hex_prefix + FTP auth depth, then truncate.
+        """Read response_buffer.jsonl, count unique hex_prefix, then truncate.
 
         Uses atomic rename-swap to prevent data loss: first renames the live
         file to a staging name, then reads from staging. Any new Fast Loop
         writes during processing go to a fresh file (open("a") creates it).
 
-        For FTP targets: additionally parses response bytes for 3-digit FTP
-        status codes and boosts proxy_B proportionally to auth depth reached.
-        Deep authentication (code 230) yields 3× reward vs pre-auth (code 220).
+        If a ProtocolModule is attached, it may boost the diversity count via
+        ``response_diversity_multiplier`` to reward reaching deep protocol
+        states (e.g. post-auth replies). The core itself is protocol-agnostic;
+        the module owns all protocol-specific logic.
 
         Returns:
-            Effective response diversity score (unique prefixes × auth bonus).
+            Effective response diversity score (unique prefixes × module bonus).
         """
         buf_path = self.response_buf_path
         if not buf_path.exists():
@@ -189,9 +186,9 @@ class EWMAController:
                 pass
             return 0
 
-        # Step 3: Count unique hex_prefix values + FTP auth depth
+        # Step 3: Count unique hex_prefix values + collect protocol extras
         unique_prefixes: set[str] = set()
-        ftp_codes_seen: set[str] = set()
+        extra_fields: list[dict] = []
 
         for line in lines:
             line = line.strip()
@@ -202,47 +199,30 @@ class EWMAController:
                 hp = entry.get("hex_prefix", "")
                 if hp:
                     unique_prefixes.add(hp)
-
-                # FTP status code extraction — boost reward for deep auth states
-                ftp_code = entry.get("ftp_status_code", "")
-                if ftp_code:
-                    ftp_codes_seen.add(ftp_code)
+                extra = entry.get("_extra")
+                if extra:
+                    extra_fields.append(extra)
             except (json.JSONDecodeError, AttributeError):
                 continue
 
-        # Step 4: Compute effective diversity with FTP auth depth bonus
+        # Step 4: Compute effective diversity with protocol-specific bonus
         diversity = len(unique_prefixes)
 
-        if ftp_codes_seen:
-            # Parse each FTP status code and find the maximum auth depth
-            # (modules already imported at file top)
-            max_depth = FTPAuthDepth.PRE_AUTH
-            for code in ftp_codes_seen:
-                if code in _FTP_STATUS_MAP:
-                    depth = _FTP_STATUS_MAP[code][0]
-                else:
-                    # Unknown code — infer from class (first digit)
-                    depth = FTPResponseAnalyzer._infer_depth_from_class(code)
-                if depth > max_depth:
-                    max_depth = depth
-
-            # Auth depth multiplier:
-            #   PRE_AUTH (0) → 1.0× (no bonus)
-            #   USER_ACCEPTED (1) → 2.0× (doubled — USER handler exercised)
-            #   AUTHENTICATED (2) → 3.0× (tripled — deep code paths exercised)
-            auth_multiplier = {
-                FTPAuthDepth.PRE_AUTH: 1.0,
-                FTPAuthDepth.USER_ACCEPTED: 2.0,
-                FTPAuthDepth.AUTHENTICATED: 3.0,
-            }.get(max_depth, 1.0)
-
-            diversity = round(diversity * auth_multiplier)
-
-            log.debug(
-                f"FTP auth depth bonus: max_depth={max_depth.name}, "
-                f"codes={ftp_codes_seen}, multiplier={auth_multiplier:.1f}×, "
-                f"effective_diversity={diversity}"
+        if self._protocol_module is not None and extra_fields:
+            multiplier = self._protocol_module.response_diversity_multiplier(
+                extra_fields
             )
+            if multiplier != 1.0:
+                diversity = round(diversity * multiplier)
+                log.debug(
+                    "EWMA diversity multiplier applied",
+                    extra={"context": {
+                        "module": self._protocol_module.name,
+                        "multiplier": multiplier,
+                        "diversity_before": len(unique_prefixes),
+                        "diversity_after": diversity,
+                    }},
+                )
 
         # Step 5: Delete staging file (data has been consumed)
         try:

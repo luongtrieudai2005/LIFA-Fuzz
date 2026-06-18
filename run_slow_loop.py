@@ -242,6 +242,19 @@ async def run_slow_loop(
     ewma_controller = None
     if ewma_enabled:
         from slow_loop.ewma_controller import EWMAController
+        # Resolve ProtocolModule (Issue A: config under fast_loop:, Issue C: import to register).
+        import os as _os
+        _pm_name = _os.environ.get(
+            "LIFA_PROTOCOL_MODULE",
+            config.get("fast_loop", {}).get("protocol_module", "null"),
+        )
+        if _pm_name == "ftp":
+            import fast_loop.ftp_module  # noqa: F401 (registers "ftp")
+        elif _pm_name == "lifa":
+            import fast_loop.lifa_module  # noqa: F401 (registers "lifa")
+        from shared.protocol_module import get_protocol_module
+        _pm = get_protocol_module(_pm_name)
+
         ewma_controller = EWMAController(
             output_path=ewma_cfg.get("output_path", "shared/adaptive_k.json"),
             delta=ewma_cfg.get("delta", 0.1),
@@ -253,10 +266,12 @@ async def run_slow_loop(
             response_buf_path=ewma_cfg.get(
                 "response_buf_path", "shared/response_buffer.jsonl"
             ),
+            protocol_module=_pm,
         )
         logger.info(
             f"  EWMA Controller: enabled (theta={ewma_controller.theta}, "
-            f"K_max={ewma_controller.K_max}, k_min={ewma_controller.k_min})"
+            f"K_max={ewma_controller.K_max}, k_min={ewma_controller.k_min}, "
+            f"module={_pm_name})"
         )
     else:
         logger.info("  EWMA Controller: disabled")

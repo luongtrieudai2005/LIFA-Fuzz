@@ -1319,6 +1319,7 @@ async def _start_slow_loop_subprocess():
             stdout=log_fh,
             stderr=sp.STDOUT,  # Merge stderr into stdout → log file
             cwd=str(_project_root),
+            env=os.environ.copy(),  # propagate LIFA_PROTOCOL_MODULE → slow loop
         )
 
         # Close file handle in parent — child process inherited the fd
