@@ -696,8 +696,11 @@ class CrashMonitor:
                 return {
                     "type": "oom_kill",
                     "confidence": 0.85,
-                    "detail": "OOM killer terminated process",
-                    "is_actionable": True,
+                    "detail": "OOM killer terminated process "
+                              "(infrastructure issue — VM ran out of memory, "
+                              "not a target bug). Increase VM mem_size or "
+                              "reduce maxusers/max_connections.",
+                    "is_actionable": False,
                 }
 
         # ── Check for kernel panic ────────────────────────────────

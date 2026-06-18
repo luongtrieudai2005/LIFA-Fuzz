@@ -31,7 +31,7 @@ sandbox:
     rootfs_path: "sandbox/firecracker_env/rootfs.ext4"
     snapshot_dir: "sandbox/firecracker_env/snapshots"
     kernel_args: "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/bin/vulnerable_server ip=172.16.0.2::172.16.0.1:255.255.255.0::eth0:off"
-    mem_size_mb: 256
+    mem_size_mb: 512
     vcpu_count: 2
     tap_name: "tap-lifa0"
     host_ip: "172.16.0.1"         # Host-side IP on the TAP bridge
