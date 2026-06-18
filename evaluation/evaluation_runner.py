@@ -1862,28 +1862,11 @@ Examples:
     if dashboard_proc:
         _stop_dashboard(dashboard_proc)
 
-    # ── Force-cancel any lingering asyncio tasks ──────────────────
-    # C baseline runs the slow loop IN-PROCESS as asyncio tasks. If any
-    # task (LLM API session, state writer, interceptor drain) survived
-    # the per-baseline finally block, asyncio.run() will hang here forever
-    # waiting for them. Cancel everything explicitly so the process exits.
-    current = asyncio.current_task()
-    for task in asyncio.all_tasks():
-        if task is not current and not task.done():
-            task.cancel()
-    for task in asyncio.all_tasks():
-        if task is not current and not task.done():
-            try:
-                await asyncio.wait_for(task, timeout=2.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                pass
-
-    # litellm spawns a non-daemon LoggingWorker thread that blocks
-    # asyncio.run()'s clean shutdown (the thread tries to use the
-    # already-closed event loop → deadlock). All real work is done at
-    # this point — comparison written, dashboard stopped, tasks cancelled.
-    # Force-exit to skip atexit handlers that would re-enter the deadlock.
+    # All work is done — force-exit immediately. litellm spawns a non-daemon
+    # LoggingWorker thread + asyncio cleanup can hang indefinitely. We have the
+    # results (comparison printed, files written); nothing useful remains.
     import os as _os
+    print("  ✅ Campaign complete — exiting.")
     _os._exit(0)
 
 
