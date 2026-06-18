@@ -1630,13 +1630,38 @@ def _start_dashboard(port: int = 8501) -> Optional[object]:
         ]
 
     try:
+        # Kill any stale dashboard on the same port first (silent conflict
+        # would make the new process exit immediately with no error output).
+        import subprocess as _sp
+        try:
+            _sp.run(
+                ["fuser", "-k", f"{port}/tcp"],
+                capture_output=True, timeout=3,
+            )
+        except Exception:
+            pass  # fuser may not be available
+
         proc = sp.Popen(
             cmd,
             stdout=sp.DEVNULL,
             stderr=sp.DEVNULL,
             cwd=str(_project_root),
         )
-        print(f"  ✓ Dashboard started (PID={proc.pid}) → http://localhost:{port}")
+        # Health check: wait up to 8s for Streamlit to start serving HTTP.
+        import urllib.request
+        for _ in range(16):
+            if proc.poll() is not None:
+                print(f"  ⚠ Dashboard process exited early (rc={proc.returncode})")
+                return None
+            try:
+                urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/", timeout=0.5
+                )
+                print(f"  ✓ Dashboard started (PID={proc.pid}) → http://localhost:{port}")
+                return proc
+            except Exception:
+                time.sleep(0.5)
+        print(f"  ⚠ Dashboard started but health check timed out (PID={proc.pid})")
         return proc
     except FileNotFoundError:
         print("  ⚠ streamlit not found — install with: pip install streamlit")
