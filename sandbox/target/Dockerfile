@@ -21,12 +21,16 @@ WORKDIR /app
 
 COPY vulnerable_server.c .
 
-# Compile with stack protections DISABLED for exploitability:
+# Compile with stack protections DISABLED + ASAN for crash detection:
 #   -O0               — no optimization (predictable stack layout)
 #   -fno-stack-protector — remove stack canary
 #   -z execstack       — mark stack as executable
 #   -no-pie            — disable position-independent executable
+#   -fsanitize=address — ASAN: catches buffer overflows at memcpy, prints
+#                        report, aborts (abort_on_error baked in via source).
+#                        Matches the Firecracker rootfs build for consistency.
 RUN gcc -O0 -fno-stack-protector -z execstack -no-pie \
+        -fsanitize=address -static-libasan -g \
         -o server vulnerable_server.c
 
 EXPOSE 9000
