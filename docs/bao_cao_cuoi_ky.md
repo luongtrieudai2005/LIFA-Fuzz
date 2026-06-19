@@ -1,5 +1,5 @@
 ---
-title: "LIFA-Fuzz: Framework Fuzzing Black-box cho giao thức mạng dựa trên suy diễn ngữ pháp bằng Large Language Model"
+title: "LIFA-Fuzz: Framework Fuzzing cho giao thức mạng dựa trên suy diễn ngữ pháp bằng Large Language Model"
 subtitle: "Báo cáo cuối kỳ — Môn Dự án Công Nghệ Thông Tin"
 author: "Lương Triều Đại"
 institution: "Khoa Công nghệ Thông tin"
@@ -12,11 +12,13 @@ date: "Tháng 6, 2026"
 
 Khi kiểm thử các dịch vụ mạng dùng giao thức độc quyền, người làm bảo mật thường không có mã nguồn, không có tài liệu, và chỉ có thể nhìn thấy luồng dữ liệu qua đường truyền. Fuzzing kiểu mù (đảo bit ngẫu nhiên) trong tình huống này rất kém hiệu quả: hầu hết gói tin đều bị server từ chối ngay từ đầu, không chạm tới những đoạn mã xử lý logic sâu nơi lỗi thực sự tồn tại.
 
-LIFA-Fuzz là một framework fuzzing hộp đen giải quyết vấn đề này bằng cách kết hợp mô hình ngôn ngữ lớn (LLM) với các phương pháp thống kê để suy diễn cấu trúc giao thức từ chính luồng traffic thực tế. Hệ thống có kiến trúc hai vòng lặp bất đồng bộ: Fast Loop chịu trách nhiệm gửi gói tin đột biến ở tốc độ cao, Slow Loop đảm nhiệm việc phân tích traffic và gọi LLM. Hai vòng này không bao giờ chặn nhau, nhờ đó tốc độ fuzzing không bị ảnh hưởng bởi độ trễ của LLM. Một bộ điều khiển thích nghi tự động điều chỉnh tần suất lấy mẫu phản hồi của server, cân bằng giữa thông lượng và khả năng quan sát trạng thái.
+LIFA-Fuzz là một framework fuzzing giải quyết vấn đề này bằng cách kết hợp mô hình ngôn ngữ lớn (LLM) với các phương pháp thống kê để suy diễn cấu trúc giao thức từ chính luồng traffic thực tế. Hệ thống có kiến trúc hai vòng lặp bất đồng bộ: Fast Loop chịu trách nhiệm gửi gói tin đột biến ở tốc độ cao, Slow Loop đảm nhiệm việc phân tích traffic và gọi LLM. Hai vòng này không bao giờ chặn nhau, nhờ đó tốc độ fuzzing không bị ảnh hưởng bởi độ trễ của LLM. Một bộ điều khiển thích nghi tự động điều chỉnh tần suất lấy mẫu phản hồi của server, cân bằng giữa thông lượng và khả năng quan sát trạng thái.
+
+Với các giao thức có tập lệnh phổ biến như FTP, hệ thống khởi động bằng một từ điển token cơ bản (USER, PASS, PORT, QUIT...). Đây không phải là đặc tả đầy đủ hay luật state machine viết tay — đó chỉ là điểm xuất phát. Đóng góp thật sự nằm ở chỗ: từ những token đó, hệ thống tự động suy diễn ra máy trạng thái của giao thức và tự động mở rộng kích thước dữ liệu gửi vào các trường (pay load escalation), giúp kích hoạt các lỗ hổng sâu mà không cần con người viết luật State Machine hay luật Length bằng tay.
 
 Thực nghiệm trên LightFTP (một FTP server thực tế, chạy trong môi trường Firecracker MicroVM) trong chiến dịch mười giờ cho thấy các baseline không dùng LLM duy trì được khoảng 60 đến 140 lần thực thi mỗi giây, còn baseline dùng LLM đầy đủ chậm hơn (khoảng 50) nhưng khám phá nhiều trạng thái giao thức nhất. Trên LightFTP bản ổn định không phát hiện được lỗi bộ nhớ nào, song pipeline đã chứng minh khả năng phát hiện và xác nhận lỗi tràn bộ đệm thật thông qua đối chứng dương tính trên một server có lỗ hổng đã biết. Kết quả chi tiết và những hạn chế được thảo luận trong các chương sau. Toàn bộ hệ thống gồm khoảng 17.000 dòng Python với hơn 250 bài kiểm thử.
 
-**Từ khóa:** fuzzing, hộp đen, mô hình ngôn ngữ lớn, suy diễn giao thức, Firecracker, EWMA
+**Từ khóa:** fuzzing, suy diễn giao thức, mô hình ngôn ngữ lớn, state machine tự động, Firecracker, EWMA
 
 \newpage
 
@@ -44,6 +46,8 @@ Khi không có mã nguồn hay tài liệu giao thức, cách duy nhất là fuz
 Một hướng tiếp cận mới đang nổi lên gần đây là sử dụng các mô hình ngôn ngữ lớn (LLM) để phân tích cấu trúc gói tin. Các nghiên cứu cho thấy LLM có khả năng nhận diện các mẫu trong dữ liệu nhị phân, chẳng hạn như đâu là mã magic, đâu là số thứ tự, nếu được cung cấp các mẫu traffic dạng hex [1]. Thay vì fuzz một cách mù quáng, ta có thể dùng LLM để tìm hiểu cấu trúc giao thức trước, rồi dùng kiến thức đó để dẫn dắt quá trình đột biến.
 
 Tuy nhiên, ý tưởng này vấp phải ba khó khăn. Thứ nhất, LLM xử lý rất chậm. Một lần gọi API có thể mất từ 15 tới 60 giây, trong khi fuzzing cần tốc độ hàng trăm hay thậm chí hàng nghìn lần thực thi mỗi giây. Nếu phải chờ LLM trả lời trước khi gửi gói tin tiếp theo, tốc độ sẽ giảm từ vài trăm xuống dưới một lần mỗi giây. Thứ hai, chi phí sử dụng LLM rất cao. Việc gửi toàn bộ dữ liệu hex thô cho LLM và yêu cầu nó phân tích từ đầu tiêu tốn một lượng lớn token, trong khi những việc đơn giản như xác định byte nào là cố định có thể được giải quyết bằng một phép tính entropy trong chưa đầy một phần nghìn giây, gần như không tốn kém. Thứ ba, khi nhiều trường trong gói tin bị biến đổi cùng lúc, nếu server crash thì rất khó xác định trường nào thực sự là nguyên nhân. Điều này làm giảm giá trị của mỗi crash vì người kiểm thử phải mất thêm thời gian truy tìm gốc rễ vấn đề.
+
+Với các giao thức phổ biến như FTP, LIFA-Fuzz thừa nhận có một bước khởi động nhỏ: một từ điển token cơ bản chứa các lệnh thông dụng (USER, PASS, PORT, SYST, QUIT...). Điểm cốt lõi là từ đó trở đi, mọi thứ đều tự động. Hệ thống không có đặc tả state machine, không có luật length viết tay, không có grammar file như Peach hay Sulley. Từ điển token chỉ là điểm khởi đầu; phần suy diễn state machine và quyết định trường nào dài bao nhiêu, gửi bao nhiêu byte để kích nổ lỗi đều do máy làm.
 
 ## 1.2. Mục tiêu nghiên cứu
 
@@ -75,7 +79,7 @@ Báo cáo này đóng góp bảy điểm chính:
 
 *Thứ ba*, một phương pháp tự động nhận diện trạng thái của giao thức từ dữ liệu mạng, không cần bất kỳ tài liệu hay mã nguồn nào. Nhờ đó, chương trình có thể biết được phiên giao tiếp đang ở bước nào và đưa ra các đột biến phù hợp.
 
-*Thứ tư*, kiến trúc dạng module cho phép thêm giao thức mới mà không cần sửa phần lõi. Kiến thức riêng của từng giao thức (như FTP) được đóng gói riêng, phần lõi hoàn toàn tổng quát.
+*Thứ tư*, hệ thống có một từ điển token cơ bản cho các giao thức phổ biến (FTP: USER, PASS, PORT, SYST...). Đây không phải là đặc tả đầy đủ — chỉ là điểm khởi động để fuzzer không phải đoán mò mọi thứ từ đầu. Từ đó, phần lõi tự động suy diễn ra máy trạng thái và quyết định chiến lược đột biến cho từng trường. Kiến trúc dạng module cho phép thêm từ điển cho giao thức mới mà không cần sửa phần lõi.
 
 *Thứ năm*, cơ chế ghi nhớ chuỗi lệnh trước đó. Chẳng hạn, nếu giao thức yêu cầu đăng nhập trước (USER rồi PASS), chương trình sẽ gửi đúng hai lệnh đó, sau đó mới đột biến gói tin tiếp theo. Nhờ vậy có thể kiểm thử ở các bước sâu của giao thức, không chỉ bị kẹt ở lời chào đầu tiên.
 
@@ -132,8 +136,8 @@ Khoảng trống mà LIFA-Fuzz giải quyết. SemFuzz mạnh về hiểu ngữ 
 | Đặc trưng | SemFuzz | NSFuzz | LIFA-Fuzz |
 |---|---|---|---|
 | Nguồn ngữ pháp | Tài liệu RFC | Chạy theo vùng lệnh | LLM + phân tích thống kê |
-| Yêu cầu đầu vào | RFC đầy đủ | Mã nguồn | Chỉ traffic |
-| Chế độ | Có mã nguồn | Có mã nguồn | **Không cần gì** |
+| Yêu cầu đầu vào | RFC đầy đủ | Mã nguồn | Traffic + từ điển token cơ bản |
+| Chế độ | Có mã nguồn | Có mã nguồn | **Không cần mã nguồn** |
 | Suy luận ngữ nghĩa | LLM từ RFC | Không | LLM + thống kê từ traffic |
 | Đột biến có mục đích | Chuỗi thao tác | Không | Chuỗi thao tác + lập lịch |
 | Tốc độ | Trung bình | Rất cao | Cao (60–140 EPS) |
@@ -218,7 +222,7 @@ Bộ lập lịch có trọng số mở rộng cách chọn ngẫu nhiên bằng
 
 Với giao thức có trạng thái như FTP, muốn kiểm thử hiệu quả thì phải khám phá cả cách chuyển trạng thái chứ không chỉ từng trường trong gói tin. LIFA-Fuzz dùng hai cách.
 
-**Mô đun FTP.** Dùng riêng cho LightFTP. Một đồ thị theo dõi các bước chuyển dạng $\langle\text{prev\_code}, \text{command}, \text{new\_code}\rangle$, như $\langle\text{"220"}, \text{USER}, \text{"331"}\rangle$. Nếu một mẫu gói tin phát hiện bước chưa từng thấy thì nó được ưu tiên cao gấp 5 lần. Mô đun này chỉ viết riêng cho LightFTP, không thuộc phần lõi.
+**Từ điển token cho FTP.** Hệ thống có một bảng ánh xạ các lệnh FTP (USER, PASS, PORT, SYST...) để làm điểm khởi động. Từ đó, bộ suy diễn máy trạng thái tự động xây dựng đồ thị các bước chuyển dạng $\langle\text{prev\_code}, \text{command}, \text{new\_code}\rangle$, như $\langle\text{"220"}, \text{USER}, \text{"331"}\rangle$. Nếu một mẫu gói tin phát hiện bước chưa từng thấy thì nó được ưu tiên cao gấp 5 lần. Toàn bộ việc xây dựng máy trạng thái và quyết định ưu tiên đều tự động, không cần ai viết luật chuyển trạng thái bằng tay.
 
 **Bộ suy diễn máy trạng thái.** Để hỗ trợ giao thức lạ không có mô đun riêng, LIFA-Fuzz dùng Veritas [19], một hệ thống suy diễn máy trạng thái xác suất từ dữ liệu mạng không cần đặc tả giao thức, mã nguồn, hay từ khóa cố định. Quá trình gồm bốn bước. Một, lấy các đơn vị ba byte từ đầu gói tin và lọc bằng kiểm định thống kê. Hai, dùng thuật toán phân nhóm với hệ số tương tự và chỉ số đánh giá để chọn số nhóm phù hợp. Ba, gán nhãn trạng thái cho mỗi gói tin theo nhóm gần nhất. Bốn, xây máy trạng thái từ chuỗi các nhãn qua nhiều phiên và tính xác suất chuyển.
 
@@ -352,7 +356,7 @@ Cấu hình A ngẫu nhiên không ghi nhận trạng thái vì chạy ở chế
 
 # Chương 6: Thảo luận
 
-## 6.1. Phát hiện chính: LLM tăng độ chính xác ngữ pháp nhưng giảm độ phủ trạng thái giao thức
+## 6.1. Phát hiện chính: LLM tăng độ chính xác ngữ pháp và tăng độ phủ trạng thái giao thức
 
 Kết quả quan trọng nhất từ chiến dịch đo lại mười giờ là cấu hình dùng LLM khám phá nhiều cạnh chuyển trạng thái giao thức nhất, không ít như các số liệu cũ từng cho thấy. Cụ thể, cấu hình C kết hợp đầy đủ đạt 1.916 cạnh chuyển trạng thái, gấp khoảng 8,6 lần cấu hình B chỉ thống kê với 223 cạnh, và đạt 20 trạng thái so với 13 của B. Đây là kết quả ủng hộ kỳ vọng ban đầu: LLM dẫn dắt fuzzer thông minh hơn, giúp mở rộng không gian khám phá trạng thái.
 
@@ -406,13 +410,15 @@ Thứ bảy, báo cáo chưa thực hiện phân tích đầy đủ để tách 
 
 ## 7.1. Kết luận
 
-Báo cáo này đã trình bày LIFA-Fuzz, một chương trình fuzzing không cần mã nguồn cho các giao thức mạng, dùng mô hình ngôn ngữ lớn để suy diễn cấu trúc giao thức từ dữ liệu mạng thực tế. Ba đóng góp chính của đề tài như sau.
+Báo cáo này đã trình bày LIFA-Fuzz, một chương trình fuzzing cho các giao thức mạng, dùng mô hình ngôn ngữ lớn để suy diễn cấu trúc giao thức từ dữ liệu mạng thực tế. Bốn đóng góp chính của đề tài như sau.
 
 Thứ nhất là kiến trúc hai vòng Fast Loop và Slow Loop chạy bất đồng bộ, tách fuzzing tốc độ cao ra khỏi phân tích bằng LLM, đảm bảo tốc độ gửi của chương trình không bị ảnh hưởng bởi độ trễ khi gọi LLM.
 
 Thứ hai là cách kết hợp giữa xử lý bằng thống kê và suy luận bằng mô hình ngôn ngữ. Lớp thống kê xử lý các việc đơn giản như phát hiện byte cố định hay trường độ dài trong chưa đầy một phần nghìn giây, giúp LLM chỉ phải tập trung vào việc đặt tên có ý nghĩa cho từng trường và đề xuất cách đột biến phù hợp. Nhờ đó giảm đáng kể lượng token tiêu thụ.
 
 Thứ ba là bộ điều khiển EWMA thích nghi tự động điều chỉnh tần suất đọc phản hồi dựa trên mức độ khám phá mới, với công thức liên tục được thiết kế để tránh rung lắc.
+
+Thứ tư là cơ chế tự động suy diễn máy trạng thái giao thức và tự động mở rộng dữ liệu vào các trường (payload escalation). Hệ thống có một từ điển token cơ bản (USER, PASS, PORT...) làm điểm khởi động, nhưng mọi thứ sau đó — từ việc xây dựng đồ thị chuyển trạng thái tới quyết định gửi bao nhiêu byte để kích nổ lỗi — đều do máy tự làm, không cần luật state machine hay luật length viết tay. Điều này giúp LIFA-Fuzz vượt qua giới hạn của các công cụ như Peach (cần grammar viết tay) hay Sulley (cần mô tả từng trường).
 
 Hệ thống đã được triển khai hoàn chỉnh với khoảng 17.000 dòng Python, hơn 250 bài kiểm thử, và chạy được trên target thực tế là LightFTP trong máy ảo Firecracker. Kiến trúc dạng mô đun cho phép thay đổi từng phần mà không ảnh hưởng tới các phần còn lại. Đặc biệt, lớp thống kê có thể sinh luật tạm đủ tốt để fuzzer tiếp tục chạy ngay cả khi LLM không phản hồi.
 
@@ -450,7 +456,7 @@ Từ kết quả hiện tại có thể phát triển thêm theo nhiều hướn
 
 [9] Cui, W., et al. "Tupni: Automatic Reverse Engineering of Input Formats." ACM CCS, 2008.
 
-[10] Caballero, J., et al. "Dispatcher: Enabling Active Botnet Infiltration Using Automatic Protocol Interface Reverse-Engineering." ACM CCS, 2009.
+[10] Beddoe, M. "The Protocol Informatics Project (PIP)." 2004. http://www.4tphi.net/~awalters/PI/PI.html
 
 [11] Comparetti, P.M., et al. "Prospex: Protocol Specification Extraction." IEEE Symposium on Security and Privacy, 2009.
 

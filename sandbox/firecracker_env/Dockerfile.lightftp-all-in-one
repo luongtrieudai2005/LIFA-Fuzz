@@ -9,10 +9,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN cd /tmp && \
     git clone https://github.com/hfiref0x/LightFTP.git && \
     cd LightFTP && \
-    git checkout 5980ea1 && \
+    git checkout 85c6a90 && \
     cd Source/Release && \
-    gcc -fsanitize=address -static-libasan -g -O2 -c ../*.c -I.. && \
-    gcc -fsanitize=address -static-libasan -g -O2 -o fftp *.o -lpthread -lgnutls && \
+    gcc -fsanitize=address,undefined -static-libasan -static-libubsan -fno-sanitize-recover=undefined -fno-stack-protector -g -O2 -c ../*.c -I.. && \
+    gcc -fsanitize=address,undefined -static-libasan -static-libubsan -fno-sanitize-recover=undefined -fno-stack-protector -g -O2 -o fftp *.o -lpthread -lgnutls && \
     cp fftp /usr/local/bin/fftp && \
     chmod +x /usr/local/bin/fftp
 

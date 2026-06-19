@@ -1,0 +1,33 @@
+# Runnable ThreadSanitizer LightFTP target for DOCKER-mode fuzzing (CVE-2023-24042
+# @ commit 85c6a90, parent of fix 084baa7).
+#
+# Reuses the ffp already compiled by build_rootfs_lightftp_tsan.sh (image
+# lifa-lightftp-tsan) instead of re-running apt + gcc here — the Debian mirror
+# is intermittently returning 403 in this environment, which broke standalone
+# builds. This Dockerfile only sets the ffp.conf and CMD, so it needs no network.
+#
+# Why Docker, not Firecracker: ThreadSanitizer cannot initialize its shadow
+# memory in the Firecracker guest kernel (mapping + madvise both fail), so the
+# race is hunted under Docker where TSAN runs fine. TSAN needs ASLR off (the PIE
+# load collides with its fixed shadow); done per-process via `setarch -R` in CMD,
+# which requires the container to start with --security-opt seccomp=unconfined
+# (added in docker_driver.py). No host sysctl is touched.
+#
+# Prereq:   bash scripts/build_rootfs_lightftp_tsan.sh   (builds lifa-lightftp-tsan)
+# Build:    docker build -t lifa-lightftp-complete:latest \
+#             -f sandbox/firecracker_env/Dockerfile.lightftp-tsan-docker sandbox/firecracker_env
+# Run:      python3 -m evaluation.evaluation_runner --driver docker --target lightftp ...
+
+FROM lifa-lightftp-tsan:latest
+
+# external_ip=127.0.0.1 so PASV advertises localhost (the container is reached
+# via the driver's published port). Control-connection command fuzzing — which
+# is what spawns the racing worker threads — works regardless of PASV.
+RUN printf '[ftpconfig]\nport=21\ninterface=0.0.0.0\nexternal_ip=127.0.0.1\nlocal_mask=255.255.255.0\nminport=40000\nmaxport=40100\nmaxusers=10\nmaxcmds=999999\n\n[admin]\npswd=*\naccs=admin\nroot=/tmp/ftp_root\n' > /etc/fftp.conf
+
+# halt_on_error=1 → abort on the first reported race so the crash monitor sees
+# the process die + the TSAN report on the container stdout.
+ENV TSAN_OPTIONS=halt_on_error=1
+
+# setarch -R disables ASLR for ffp only (personality ADDR_NO_RANDOMIZE).
+CMD ["setarch", "x86_64", "-R", "/usr/local/bin/fftp", "/etc/fftp.conf"]

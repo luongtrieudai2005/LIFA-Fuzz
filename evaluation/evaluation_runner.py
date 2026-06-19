@@ -228,6 +228,13 @@ async def run_single_baseline(
             "container": "lifa-lightftp-server",
             "client_script": "sandbox/client/ftp_client.py",
         },
+        "uftpd": {
+            "image": "lifa-uftpd-complete:latest",  # not used with firecracker
+            "build_context": "sandbox/firecracker_env",
+            "port": 21,
+            "container": "lifa-uftpd-server",
+            "client_script": "sandbox/client/ftp_client.py",
+        },
     }
     tcfg = TARGET_CONFIGS.get(target)
     if tcfg is None:
@@ -257,6 +264,16 @@ async def run_single_baseline(
         },
         "lightftp": {
             "rootfs_path": "sandbox/firecracker_env/rootfs_lightftp.ext4",
+            "kernel_args": (
+                "console=ttyS0 reboot=k panic=1 pci=off"
+                " root=/dev/vda rw"
+                " init=/init"
+                " ip=172.16.0.2::172.16.0.1:255.255.255.0::eth0:off"
+            ),
+            "target_port": 21,  # FTP standard port
+        },
+        "uftpd": {
+            "rootfs_path": "sandbox/firecracker_env/rootfs_uftpd.ext4",
             "kernel_args": (
                 "console=ttyS0 reboot=k panic=1 pci=off"
                 " root=/dev/vda rw"
@@ -381,6 +398,11 @@ async def run_single_baseline(
         )
         background_tasks.append(serve_task)
 
+        # uftpd: anonymous login (uftpd is anonymous-only). Must be set BEFORE
+        # the client subprocess starts so it inherits this env var.
+        if target == "uftpd":
+            os.environ.setdefault("FTP_USER", "anonymous")
+
         # ── 3. Client Subprocess ──────────────────────────────────
         from fast_loop.client_process import ClientSubprocess
 
@@ -479,7 +501,7 @@ async def run_single_baseline(
         # Target-specific mutator tuning
         # Firecracker + FTP: need generous timeouts (FTP banner + command
         # response arrive asynchronously over the TAP bridge).
-        _is_fc_ftp = (sandbox_driver == "firecracker" and target == "lightftp")
+        _is_fc_ftp = (sandbox_driver == "firecracker" and target in ("lightftp", "uftpd"))
         # Resolve ProtocolModule: env var override (ablation uses this to force
         # null/ftp cleanly) else auto-resolve (lightftp→ftp case-study, else
         # null = pure black-box core). WITHOUT this, MutationEngine defaulted to
@@ -488,7 +510,7 @@ async def run_single_baseline(
         import os as _os
         _protocol_module = _os.environ.get("LIFA_PROTOCOL_MODULE")
         if not _protocol_module:
-            _protocol_module = "ftp" if target == "lightftp" else "null"
+            _protocol_module = "ftp" if target in ("lightftp", "uftpd") else "null"
         # Register the FTP module so get_protocol_module("ftp") resolves — the
         # module name is only in the shared registry after fast_loop.ftp_module
         # is imported (its register_protocol_module call runs at import). Without
@@ -536,6 +558,19 @@ async def run_single_baseline(
             # Phase 1: confirm each crash by replaying the frozen attribution
             # window on a clean target, so PoC artifacts actually reproduce.
             confirm_crashes=True,
+            # uftpd is fork-per-connection: per-connection ASAN aborts kill the
+            # child, not the daemon, so death-based detection never fires. Scan
+            # the serial console for ASAN markers instead.
+            serial_asan_detection=(target == "uftpd"),
+            # uftpd is fork-per-connection: aborted children accumulate →
+            # server stops accepting → EPS collapse. Periodically snapshot-
+            # restore to clear them.
+            serial_asan_reset_every=(3 if target == "uftpd" else 0),
+            # Time-based reset (decoupled from crash count): snapshot-restore
+            # every 30s to clear fork-per-conn zombies. Without this, once-per-
+            # site crash counting starves the crash-triggered resets → zombies
+            # accumulate → "Cannot connect upstream" → EPS collapse.
+            serial_asan_reset_interval_s=(30.0 if target == "uftpd" else 0.0),
         )
 
         watch_task = asyncio.create_task(
@@ -906,6 +941,18 @@ async def run_single_baseline(
 
         print(f"  ⏭ Baseline {baseline_id} done — cleaning up...", flush=True)
 
+        # STOP THE CLIENT FIRST — it is the traffic source. Always run + it
+        # force-kills the subprocess; NEVER gate this on the deadline below.
+        # If skipped, the client orphans, keeps sending, the interceptor keeps
+        # capturing, and the process hangs after the baseline (never advances
+        # to the next one — the symptom: "đơ sau mỗi baseline"). Stopping it
+        # first also closes in-flight connections so bg tasks settle quickly.
+        try:
+            if client_proc is not None:
+                await asyncio.wait_for(client_proc.stop(), timeout=5.0)
+        except (Exception, asyncio.TimeoutError):
+            pass
+
         for task in background_tasks:
             if not task.done():
                 task.cancel()
@@ -919,18 +966,14 @@ async def run_single_baseline(
             except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 pass
 
-        if _cleanup_time.monotonic() <= _cleanup_deadline:
-            try:
-                if client_proc is not None:
-                    await asyncio.wait_for(client_proc.stop(), timeout=5.0)
-            except (Exception, asyncio.TimeoutError):
-                pass
-
-            try:
-                if interceptor is not None:
-                    await asyncio.wait_for(interceptor.stop(), timeout=5.0)
-            except (Exception, asyncio.TimeoutError):
-                pass
+        # ALWAYS stop the interceptor too — never gate on the deadline (same
+        # orphan-hang risk as the client: a live interceptor holds port 8001
+        # and keeps capturing, blocking the next baseline's boot).
+        try:
+            if interceptor is not None:
+                await asyncio.wait_for(interceptor.stop(), timeout=5.0)
+        except (Exception, asyncio.TimeoutError):
+            pass
 
         # Collect gcov coverage ONLY in --coverage mode. In crash-finding mode
         # (auto_reset/snapshot) gcov counters are discarded on every snapshot
@@ -1737,8 +1780,8 @@ Examples:
         help="Sandbox driver (default: firecracker)",
     )
     parser.add_argument(
-        "--target", default="lifa", choices=["lifa", "lighttpd", "lightftp"],
-        help="Target server: lifa, lightttpd, or lightftp",
+        "--target", default="lifa", choices=["lifa", "lighttpd", "lightftp", "uftpd"],
+        help="Target server: lifa, lightttpd, lightftp, or uftpd",
     )
     parser.add_argument(
         "--no-dashboard",
@@ -1892,7 +1935,17 @@ Examples:
     # LoggingWorker thread + asyncio cleanup can hang indefinitely. We have the
     # results (comparison printed, files written); nothing useful remains.
     import os as _os
-    print("  ✅ Campaign complete — exiting.")
+    print("  ✅ Campaign complete — exiting.", flush=True)
+    # os._exit() skips stdio flushing. When stdout is redirected to a file it is
+    # block-buffered, so WITHOUT this flush the comparison table + the line
+    # above stay in the buffer and are lost — the campaign looks like it hung
+    # or produced no summary. Flush explicitly before the hard exit.
+    import sys as _sys
+    try:
+        _sys.stdout.flush()
+        _sys.stderr.flush()
+    except Exception:
+        pass
     _os._exit(0)
 
 

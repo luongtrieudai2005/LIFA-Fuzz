@@ -404,11 +404,13 @@ class FirecrackerSandbox(BaseSandbox):
                 rootfs_path = f"{fc_env}/rootfs_lightftp.ext4"
             elif target_name == "lighttpd":
                 rootfs_path = f"{fc_env}/rootfs_lighttpd.ext4"
+            elif target_name == "uftpd":
+                rootfs_path = f"{fc_env}/rootfs_uftpd.ext4"
             else:
                 rootfs_path = f"{fc_env}/rootfs.ext4"
         if not kernel_args:
             base_args = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw"
-            if target_name in ("lighttpd", "lightftp"):
+            if target_name in ("lighttpd", "lightftp", "uftpd"):
                 kernel_args = f"{base_args} init=/init"
             else:
                 kernel_args = (
@@ -416,8 +418,8 @@ class FirecrackerSandbox(BaseSandbox):
                     " ip=172.16.0.2::172.16.0.1:255.255.255.0::eth0:off"
                 )
 
-        # LightFTP listens on port 21 by default
-        if target_name == "lightftp" and target_port == 9000:
+        # LightFTP/uftpd listen on port 21 by default
+        if target_name in ("lightftp", "uftpd") and target_port == 9000:
             target_port = 21
 
         self.binary_path = Path(binary_path)
@@ -470,15 +472,17 @@ class FirecrackerSandbox(BaseSandbox):
                 self.rootfs_path = Path(f"{fc_env}/rootfs_lightftp.ext4")
             elif self.target_name == "lighttpd":
                 self.rootfs_path = Path(f"{fc_env}/rootfs_lighttpd.ext4")
+            elif self.target_name == "uftpd":
+                self.rootfs_path = Path(f"{fc_env}/rootfs_uftpd.ext4")
 
         # Update kernel args for init-based targets
-        if self.target_name in ("lighttpd", "lightftp"):
+        if self.target_name in ("lighttpd", "lightftp", "uftpd"):
             base_args = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw"
             if "init=/init" not in self.kernel_args:
                 self.kernel_args = f"{base_args} init=/init"
 
-        # LightFTP listens on port 21
-        if self.target_name == "lightftp" and self.target_port == 9000:
+        # LightFTP/uftpd listen on port 21
+        if self.target_name in ("lightftp", "uftpd") and self.target_port == 9000:
             self.target_port = 21
 
         logger.info(
@@ -666,12 +670,22 @@ class FirecrackerSandbox(BaseSandbox):
                 driver="firecracker",
             ) from e
 
-        # 8. Wait for target server to be ready
+        # 8. Drain guest serial DURING boot — captures boot/panic/TSAN output so
+        # we can diagnose a target that dies before listening, and keeps the
+        # Firecracker stdout pipe from filling on a chatty guest.
+        self._start_serial_drain()
+
+        # 9. Wait for target server to be ready
         # LightFTP is pre-baked into rootfs (all-in-one Docker build),
         # no SSH provisioning needed — boots directly to fftp on port 21.
         boot_timeout = 15.0
         ready = await self._wait_for_target_tcp(timeout_s=boot_timeout)
         if not ready:
+            if self._serial_buffer:
+                logger.error(
+                    "Guest serial console on boot failure:\n"
+                    + "\n".join(self._serial_buffer)
+                )
             await self._kill_process()
             raise SandboxStartError(
                 f"Target server did not become ready within {boot_timeout}s",
@@ -941,6 +955,27 @@ class FirecrackerSandbox(BaseSandbox):
             status=status,
             exit_code=exit_code,
         )
+
+    # -----------------------------------------------------------------
+    # Serial console accessor (for serial-ASAN detection on fork-per-conn
+    # targets that survive per-connection crashes — e.g. uftpd, where an ASAN
+    # abort kills the child but the daemon lives, so death-based crash
+    # detection never fires. The crash monitor scans this for ASAN markers.)
+    # -----------------------------------------------------------------
+
+    def get_serial_output(self) -> str:
+        """Return the current serial console buffer text (live + history)."""
+        if not self._serial_buffer:
+            return ""
+        return "\n".join(self._serial_buffer)
+
+    def clear_serial_buffer(self) -> None:
+        """Clear the serial console buffer. Called after a serial-ASAN crash
+        is recorded so the consumed ASAN report doesn't re-fire on the next
+        poll — otherwise the stale report sits in the buffer and is re-detected
+        every cycle until rotation, inflating the crash count 25:1 with phantom
+        re-detections (the false-positive storm)."""
+        self._serial_buffer.clear()
 
     # -----------------------------------------------------------------
     # BaseSandbox: get_last_crash_info()

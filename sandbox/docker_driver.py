@@ -120,6 +120,10 @@ class DockerSandbox(BaseSandbox):
                 network=self.network_name,
                 detach=True,
                 ports={f"{self.target_internal_port}/tcp": self.target_internal_port},
+                # seccomp=unconfined lets TSAN targets disable ASLR per-process
+                # via setarch -R (PIE shadow collision) without touching the host
+                # sysctl. Harmless for non-sanitizer targets.
+                security_opt=["seccomp=unconfined"],
             )
 
             # 4. Wait for target to be ready

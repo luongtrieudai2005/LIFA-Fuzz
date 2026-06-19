@@ -127,8 +127,8 @@ def main() -> None:
     logger.info(f"FTP tokens: {FTP_TOKENS}")
 
     seq = 0
-    username = "admin"
-    password = "admin"
+    username = os.environ.get("FTP_USER", "admin")
+    password = os.environ.get("FTP_PASS", "admin")
 
     while True:
         sock = None
@@ -164,21 +164,50 @@ def main() -> None:
             logger.info(f"[seq={seq}] Response: {code} {text}")
 
             # ── Phase 2: Post-auth commands ──────────────────────────
-            # Alternate between various FTP commands
+            # Comprehensive RFC-959 FTP verb pool — fair protocol knowledge
+            # (every FTP textbook lists these verbs). The fuzzer's value is in
+            # MUTATION discovery (finding which mutations trigger crashes), NOT
+            # in discovering which commands exist. All arguments are benign;
+            # the mutator must find the triggering mutation on its own.
             post_auth_cmds = [
+                # Access control
                 ("SYST", ""),
                 ("PWD", ""),
+                ("CDUP", ""),
+                ("CWD", f"dir_{seq % 3:05d}"),
+                # Transfer parameter setup
                 ("TYPE", "I"),
-                ("MKD", f"testdir_{seq:05d}"),
-                ("CWD", f"testdir_{seq:05d}"),
-                ("DELE", f"testfile_{seq:05d}.txt"),
-                ("RNFR", f"old_{seq:05d}.txt"),
-                ("SIZE", f"testfile_{seq:05d}.txt"),
-                ("NOOP", ""),
-                ("FEAT", ""),
-                ("LIST", ""),
-                ("RETR", f"testfile_{seq % 5:05d}.txt"),
+                ("MODE", "S"),
+                ("STRU", "F"),
+                ("PORT", "127,0,0,1,4,210"),
+                ("PASV", ""),
+                ("EPRT", "|1|127.0.0.1|1234|"),
+                ("EPSV", ""),
+                # File transfer
+                ("RETR", f"file_{seq % 5:05d}.txt"),
                 ("STOR", f"upload_{seq:05d}.txt"),
+                ("STOU", ""),
+                ("APPE", f"append_{seq:05d}.txt"),
+                ("LIST", ""),
+                ("NLST", ""),
+                # Directory management
+                ("MKD", f"dir_{seq:05d}"),
+                ("RMD", f"dir_{seq % 3:05d}"),
+                # File management
+                ("DELE", f"file_{seq:05d}.txt"),
+                ("RNFR", f"old_{seq:05d}.txt"),
+                ("RNTO", f"new_{seq:05d}.txt"),
+                # Informational
+                ("SIZE", f"file_{seq:05d}.txt"),
+                ("MDTM", f"file_{seq:05d}.txt"),
+                ("FEAT", ""),
+                ("NOOP", ""),
+                ("HELP", ""),
+                # Extended (RFC 2428, 3659, etc.)
+                ("SITE", "HELP"),
+                ("ALLO", "100"),
+                ("REST", "0"),
+                ("ABOR", ""),
             ]
 
             for cmd, arg in post_auth_cmds[:3 + (seq % 4)]:  # 3-6 cmds per session

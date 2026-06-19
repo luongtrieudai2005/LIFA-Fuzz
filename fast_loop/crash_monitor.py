@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -99,6 +100,9 @@ class CrashMonitor:
         auto_reset: bool = True,
         restart_delay_s: float = 2.0,
         confirm_crashes: bool = False,
+        serial_asan_detection: bool = False,
+        serial_asan_reset_every: int = 0,
+        serial_asan_reset_interval_s: float = 0.0,
     ) -> None:
         self.sandbox = sandbox
         self.interceptor = interceptor
@@ -114,6 +118,32 @@ class CrashMonitor:
         # Opt-in (default False) so legacy tests/behaviour are unchanged.
         # See docs/crash_attribution_plan.md.
         self.confirm_crashes: bool = confirm_crashes
+        # Serial-ASAN detection (fork-per-connection targets): when True, the
+        # watch loop also scans the driver's serial console for ASAN markers
+        # each cycle and fires on_crash(target_survived=True) on a NEW marker —
+        # because the daemon survives per-connection ASAN aborts, so the normal
+        # death-based detection never sees them.
+        self.serial_asan_detection: bool = serial_asan_detection
+        # Periodically snapshot-restore after this many per-connection ASAN
+        # crashes to clear forked-child zombies before they clog a fork-per-
+        # connection server (else PID/fd exhaustion → server stops accepting →
+        # EPS collapse). 0 = never reset on survived crashes.
+        self.serial_asan_reset_every: int = serial_asan_reset_every
+        # Time-based periodic reset (independent of crash count). For fork-per-
+        # connection targets, snapshot-restore every N seconds to clear zombie
+        # children — without this, once-per-site crash counting starves the
+        # crash-triggered resets above, zombies accumulate, the server stops
+        # accepting, and EPS collapses to ~1. 0 = disabled.
+        self.serial_asan_reset_interval_s: float = serial_asan_reset_interval_s
+        self._last_reset_time: float = 0.0
+        self._survived_since_reset: int = 0
+        self._last_asan_sig: str = ""  # signature of the last ASAN block fired on
+        # Once-per-site: a given ASAN crash-site signature fires at most ONCE.
+        # This makes fires == unique (no re-counting of the same bug hit N
+        # times). Combined with serial-confirmation, each unique crash is
+        # confirmed (reproduced=True) on its first (and only) fire.
+        self._fired_asan_sigs: set[str] = set()
+        self._confirmed_asan_sigs: dict[str, bool] = {}  # sig → reproduced
         # Drain pause after pause_interceptor(): the mutator's run loop is
         # sequential, so at most ONE _send is in-flight when we pause. It
         # finishes within recv_timeout (≤0.5s). Sleeping this long before
@@ -215,6 +245,49 @@ class CrashMonitor:
                     logger.info("Target server is back up — resuming operations")
                     was_alive = True
 
+                # ── Serial-ASAN detection (fork-per-connection targets) ──
+                # The daemon survives per-connection ASAN aborts (e.g. uftpd:
+                # the forked child aborts, PID 1 lives), so the death transition
+                # above never fires. Scan the live serial console for a NEW
+                # ASAN marker and treat it as a crash (target survived).
+                if self.serial_asan_detection and alive:
+                    asan_block = self._scan_serial_for_new_asan()
+                    if asan_block:
+                        classification = self._classify_crash(134, asan_block)
+                        await self.on_crash(
+                            134,
+                            classification=classification,
+                            serial_output=asan_block,
+                            target_survived=True,
+                        )
+                        try:
+                            was_alive = await self.sandbox.is_target_alive()
+                        except Exception:
+                            pass
+
+                # Time-based periodic reset (fork-per-conn): snapshot-restore
+                # every N seconds to clear zombie children, INDEPENDENT of crash
+                # count. Without this, once-per-site crash counting starves the
+                # crash-triggered resets → zombies accumulate → server stops
+                # accepting → "Cannot connect upstream" storm → EPS collapse.
+                if (self.serial_asan_detection and alive
+                        and self.serial_asan_reset_interval_s > 0):
+                    now = time.monotonic()
+                    if now - self._last_reset_time >= self.serial_asan_reset_interval_s:
+                        self._last_reset_time = now
+                        logger.info(
+                            f"serial-ASAN: time-based reset "
+                            f"({self.serial_asan_reset_interval_s:.0f}s) — "
+                            f"clearing forked-child zombies"
+                        )
+                        await self.pause_interceptor()
+                        try:
+                            await self.restart_target(settle=False)
+                        except Exception as _e:
+                            logger.error(
+                                f"serial-ASAN time-based reset failed: {_e}"
+                            )
+
             except Exception as e:
                 logger.error(f"Error in crash monitor poll: {e}", exc_info=True)
 
@@ -234,6 +307,7 @@ class CrashMonitor:
         exit_code: int,
         classification: Optional[dict] = None,
         serial_output: str = "",
+        target_survived: bool = False,
     ) -> CrashRecord:
         """Handle a target-down event (actionable crash OR normal exit).
 
@@ -376,8 +450,10 @@ class CrashMonitor:
                 f"detail={classification.get('detail', '')})"
             )
 
-        # 5. Pause traffic IMMEDIATELY
-        await self.pause_interceptor()
+        # 5. Pause traffic IMMEDIATELY (skip for serial-ASAN: the daemon
+        # survived the per-connection crash — keep fuzzing, no reset needed).
+        if not target_survived:
+            await self.pause_interceptor()
 
         # 5b. Post-crash confirmation (Phase 1, opt-in). The legacy
         #     attribution assumed crash_window[-1] was the culprit, but at
@@ -389,7 +465,7 @@ class CrashMonitor:
         #     paused, so the hot loop is unaffected; cost is paid only per
         #     crash. See docs/crash_attribution_plan.md.
         reproduced = False
-        confirmation_method = "window_last"
+        confirmation_method = "serial_asan" if target_survived else "window_last"
         # Confirmation runs whenever enabled + a mutator is present. It must
         # NOT be gated on `offending_packet`: that variable is exactly what
         # attribution produces, and when attribution already failed (empty
@@ -398,9 +474,14 @@ class CrashMonitor:
         # actual candidates; if the window is genuinely empty, _confirm_crash
         # returns (b"", None, False) and we fall through to the legacy record.
         if self.confirm_crashes and self.mutator is not None:
+            # For target_survived (fork-per-conn), pause the mutator so back-
+            # ground traffic doesn't produce ASAN that pollutes the serial-based
+            # confirmation check. For death-based (target dies), the mutator is
+            # already paused (step 5 above).
+            if target_survived:
+                await self.pause_interceptor()
             # Drain the (at most one) in-flight send so it cannot land on the
-            # target during a candidate's liveness check and cause a false
-            # "reproduced". recv_timeout is ≤0.5s in all configs.
+            # target during a candidate's check and cause a false "reproduced".
             await asyncio.sleep(self.confirm_drain_s)
             freeze = getattr(self.mutator, "freeze_crash_window", None)
             if freeze is not None:
@@ -408,13 +489,14 @@ class CrashMonitor:
                     candidates = freeze()
                     if candidates:
                         conf_payload, conf_rule, reproduced = (
-                            await self._confirm_crash(candidates)
+                            await self._confirm_crash(
+                                candidates, target_survived=target_survived
+                            )
                         )
                         if reproduced and conf_payload:
                             offending_packet = conf_payload
                             rule_id = conf_rule
                             confirmation_method = "replay_confirmed"
-                            # Rebuild the record with the confirmed culprit.
                             record = CrashRecord(
                                 exit_code=exit_code,
                                 signal=signal,
@@ -428,8 +510,6 @@ class CrashMonitor:
                         else:
                             confirmation_method = "replay_unconfirmed"
                 except Exception as exc:
-                    # Failure isolation: confirmation must never break the
-                    # crash pipeline. Fall back to window[-1], flagged.
                     logger.warning(
                         f"confirm: confirmation phase errored ({exc}); "
                         f"falling back to window[-1] attribution"
@@ -442,6 +522,9 @@ class CrashMonitor:
                             unfreeze()
                         except Exception:
                             pass
+            # Resume the mutator if we paused it for serial-ASAN confirmation.
+            if target_survived:
+                await self.resume_interceptor()
 
         # 5c. Stamp the confirmation outcome onto the record so the
         # crash_monitor's own artifact (crashes/*.json via save_crash_record)
@@ -519,8 +602,32 @@ class CrashMonitor:
             except Exception as e:
                 logger.error(f"on_crash_callback error: {e}")
 
-        # 7. Reset the target
-        if self.auto_reset:
+        # 7. Reset policy. Fork-per-connection targets (serial-ASAN) survive
+        # each per-connection crash, so we DON'T reset per crash (keeps EPS
+        # up) — but aborted children accumulate faster than they're reaped →
+        # PID/fd exhaustion → server stops accepting → EPS collapse. So
+        # periodically snapshot-restore to clear the zombies.
+        if target_survived:
+            self._survived_since_reset += 1
+            if (self.serial_asan_reset_every > 0
+                    and self._survived_since_reset >= self.serial_asan_reset_every):
+                logger.info(
+                    f"serial-ASAN: {self._survived_since_reset} per-connection "
+                    f"crashes since last reset — snapshot restore to clear "
+                    f"forked-child zombies (throughput recovery)."
+                )
+                self._survived_since_reset = 0
+                await self.pause_interceptor()
+                try:
+                    await self.restart_target(settle=False)
+                except Exception as e:
+                    logger.error(f"serial-ASAN periodic reset failed: {e}")
+            else:
+                logger.info(
+                    "Target survived per-connection crash (serial-ASAN) — "
+                    "no reset; continuing to fuzz."
+                )
+        elif self.auto_reset:
             await self.restart_target()
         else:
             logger.warning(
@@ -780,6 +887,100 @@ class CrashMonitor:
         }
 
     # -----------------------------------------------------------------
+    # Serial-ASAN detection (fork-per-connection targets)
+    # -----------------------------------------------------------------
+
+    def _get_serial_text(self) -> str:
+        """Live serial console text from the driver (defensive — only the
+        Firecracker driver exposes get_serial_output())."""
+        getter = getattr(self.sandbox, "get_serial_output", None)
+        if getter is None:
+            return ""
+        try:
+            return getter() or ""
+        except Exception:
+            return ""
+
+    def _scan_serial_for_new_asan(self) -> str:
+        """Scan the live serial console for an ASAN block not yet fired on.
+
+        Dedups by crash-site signature so repeated same-site aborts (e.g.
+        uftpd's handle_PORT) fire once, matching σ₃ unique-crash semantics.
+        Returns the block text if a NEW one is found, else ''.
+        """
+        text = self._get_serial_text()
+        if not text:
+            return ""
+        low = text.lower()
+        if "addresssanitizer" not in low and "==error:" not in low:
+            return ""
+        block = self._extract_asan_block(text)
+        if not block:
+            return ""
+        sig = self._asan_sig(block)
+        if sig and sig in self._fired_asan_sigs:
+            return ""  # once-per-site: this crash site already fired — no re-counting
+        self._last_asan_sig = sig
+        self._fired_asan_sigs.add(sig)
+        # CONSUME the report: clear the serial buffer so this ASAN block
+        # doesn't re-fire on the next poll. Without this the report sits in
+        # the buffer and is re-detected every cycle → a 25:1 false-positive
+        # storm (186 fires for 7 real sites). The next fire requires a NEW
+        # ASAN report written AFTER this clear.
+        clearer = getattr(self.sandbox, "clear_serial_buffer", None)
+        if clearer is not None:
+            try:
+                clearer()
+            except Exception:
+                pass
+        return block
+
+    @staticmethod
+    def _extract_asan_block(text: str) -> str:
+        """Extract the most recent ASAN report: from the last '==ERROR:' line
+        through the following 'ABORTING'/'SUMMARY:' (capped ~30 lines)."""
+        lines = text.splitlines()
+        start = -1
+        for i in range(len(lines) - 1, -1, -1):
+            ls = lines[i].lower()
+            if "addresssanitizer" in ls or "==error:" in ls:
+                start = i
+                break
+        if start < 0:
+            return ""
+        end = min(start + 30, len(lines))
+        for j in range(start + 1, end):
+            lj = lines[j].lower()
+            if "aborting" in lj or "summary:" in lj:
+                end = j + 1
+                break
+        return "\n".join(lines[start:end])
+
+    @staticmethod
+    def _asan_sig(block: str) -> str:
+        """Crash-site signature: ASAN error type + the SUMMARY line (carries
+        the binary offset, e.g. 'uftpd+0x605ac'). Same site → same sig."""
+        low = block.lower()
+        errtype = "asan"
+        for spec in (
+            "stack-buffer-overflow", "heap-buffer-overflow",
+            "heap-use-after-free", "stack-use-after-free",
+            "global-buffer-overflow", "stack-overflow",
+        ):
+            if spec in low:
+                errtype = spec
+                break
+        summary = ""
+        for line in block.splitlines():
+            if "summary:" in line.lower():
+                # Strip the per-process "==N==" PID prefix so the signature is
+                # stable across crashes at the SAME site (each forked child has
+                # a different PID, else every same-site abort looks "new").
+                summary = re.sub(r"^==\d+==\s*", "", line.strip())
+                break
+        return f"{errtype}|{summary}"
+
+    # -----------------------------------------------------------------
     # Corpus Management
     # -----------------------------------------------------------------
 
@@ -916,6 +1117,7 @@ class CrashMonitor:
     async def _confirm_crash(
         self,
         candidates: list[tuple],
+        target_survived: bool = False,
     ) -> tuple[bytes, Optional[str], bool]:
         """Replay candidate packets on a clean target to find the real culprit.
 
@@ -989,7 +1191,7 @@ class CrashMonitor:
                     continue  # target didn't come back — can't test this one
             except Exception:
                 continue
-            reproduced = await self._replay_and_check(payload, host, port, prefix)
+            reproduced = await self._replay_and_check(payload, host, port, prefix, check_serial=target_survived)
             if reproduced:
                 logger.info(
                     f"confirm: REPRODUCED crash with replayed packet "
@@ -1008,6 +1210,7 @@ class CrashMonitor:
 
     async def _replay_and_check(
         self, payload: bytes, host: str, port: int, prefix: list | None = None,
+        check_serial: bool = False,
     ) -> bool:
         """Replay prefix (session setup) + payload on a fresh connection;
         return True if the target crashed afterward.
@@ -1019,6 +1222,15 @@ class CrashMonitor:
         The prefix is the verbatim setup captured from the real client.
         """
         prefix = prefix or []
+        if check_serial:
+            # Clear the serial buffer BEFORE replay so only ASAN from THIS
+            # replay is detected (not stale or leftover reports).
+            clearer = getattr(self.sandbox, "clear_serial_buffer", None)
+            if clearer:
+                try:
+                    clearer()
+                except Exception:
+                    pass
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(host, port), timeout=2.0
@@ -1054,6 +1266,25 @@ class CrashMonitor:
                 await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
             except Exception:
                 pass
+        if check_serial:
+            # Fork-per-connection: the daemon survives per-connection ASAN
+            # aborts, so death-based check never fires. Poll the serial console
+            # for a NEW ASAN marker (written after the buffer-clear above).
+            # Poll every 0.3s for up to 3s — some crash chains (child abort →
+            # serial drain → buffer update) take >1s; a single 1s check misses
+            # them and marks REAL PoCs as unconfirmed.
+            _SERIAL_DEADLINE_S = 3.0
+            _SERIAL_POLL_S = 0.3
+            _elapsed = 0.0
+            while _elapsed < _SERIAL_DEADLINE_S:
+                await asyncio.sleep(_SERIAL_POLL_S)
+                _elapsed += _SERIAL_POLL_S
+                _st = self._get_serial_text()
+                _sl = _st.lower() if _st else ""
+                if "addresssanitizer" in _sl or "==error:" in _sl:
+                    return True
+            return False
+
         # Grace period for the crash to manifest, then check liveness.
         # A single short sleep is insufficient for targets whose crash chain
         # is slow: e.g. a fork-per-connection server where the child aborts

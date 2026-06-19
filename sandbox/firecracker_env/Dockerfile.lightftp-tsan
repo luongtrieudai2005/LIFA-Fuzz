@@ -1,0 +1,47 @@
+# LightFTP @ commit 85c6a90 = parent of the CVE-2023-24042 fix (084baa7).
+# Built with ThreadSanitizer (NOT AddressSanitizer): CVE-2023-24042 is a data
+# race on the shared per-connection context, which ASAN cannot detect.
+FROM debian:bookworm-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc make git libssl-dev libc6-dev libgnutls28-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN cd /tmp && \
+    git clone https://github.com/hfiref0x/LightFTP.git && \
+    cd LightFTP && git checkout 85c6a90 && \
+    cd Source/Release && \
+    gcc -fsanitize=thread -static-libtsan -no-pie -fno-PIE -g -O1 -c ../*.c -I.. && \
+    gcc -fsanitize=thread -static-libtsan -no-pie -fno-PIE -g -O1 -o fftp *.o -lpthread -lgnutls && \
+    cp ffp /usr/local/bin/fftp && chmod +x /usr/local/bin/fftp
+
+# Stage 2: Minimal runtime image
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    iproute2 libssl3 libgnutls30 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/bin/fftp /usr/local/bin/fftp
+
+RUN mkdir -p /tmp/ftp_root && \
+    printf '[ftpconfig]\nport=21\ninterface=0.0.0.0\nexternal_ip=172.16.0.2\nlocal_mask=255.255.255.0\nminport=1024\nmaxport=65535\nmaxusers=10\nmaxcmds=999999\n\n[admin]\npswd=*\naccs=admin\nroot=/tmp/ftp_root\n' > /etc/fftp.conf
+
+# halt_on_error=1 → abort (exit) on the first reported race so the crash
+# monitor sees the process die + the TSAN report on the serial console.
+# No ASLR toggle needed: ffp is built -no-pie, so its text loads at a fixed
+# address and TSAN's fixed shadow layout no longer collides with it.
+RUN printf '#!/bin/sh\n\
+mount -t proc proc /proc\n\
+mount -t sysfs sysfs /sys\n\
+mount -t devtmpfs devtmpfs /dev\n\
+mount -t tmpfs tmpfs /tmp\n\
+mkdir -p /dev/pts\n\
+mount -t devpts devpts /dev/pts\n\
+ip link set lo up\n\
+ip addr add 172.16.0.2/24 dev eth0\n\
+ip link set eth0 up\n\
+ip route add default via 172.16.0.1\n\
+echo "LIFA-Fuzz: LightFTP ready on 172.16.0.2:21 (TSAN enabled)"\n\
+export TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1\n\
+exec /usr/local/bin/fftp /etc/fftp.conf\n' > /init && chmod +x /init

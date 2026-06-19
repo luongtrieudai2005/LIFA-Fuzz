@@ -569,13 +569,14 @@ async def run_pipeline(
         # Auto-resolve module from target if not explicit (ftp target → ftp
         # module); anything unknown → null (black-box).
         if protocol_module is None:
-            protocol_module = "ftp" if target_name == "lightftp" else "null"
+            protocol_module = "ftp" if target_name in ("lightftp", "uftpd") else "null"
         # Ensure the ftp module is importable/registered when selected.
         if protocol_module == "ftp":
             import fast_loop.ftp_module  # noqa: F401 (registers "ftp")
         _TARGET_REGISTRY = {
             "lightftp": "sandbox/client/ftp_client.py",
             "lighttpd": "sandbox/client/http_client.py",
+            "uftpd": "sandbox/client/ftp_client.py",
         }
         client_script = _TARGET_REGISTRY.get(target_name, "sandbox/client/client.py")
         logger.info(

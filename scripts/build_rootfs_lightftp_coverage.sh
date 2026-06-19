@@ -50,13 +50,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Flush handler: constructor installs SIGTERM/SIGINT → __gcov_dump() + _exit.
 COPY gcov_flush.c /tmp/gcov_flush.c
 
+# LightFTP @ commit 85c6a90 = parent of the CVE-2023-24042 fix (084baa7).
+# Shared per-connection context across threads (no PTHCONTEXT copy yet) →
+# use-after-free / race that ASAN can catch. Drop-in for 5980ea1.
 RUN cd /tmp && \
     git clone https://github.com/hfiref0x/LightFTP.git && \
-    cd LightFTP && git checkout 5980ea1 && \
+    cd LightFTP && git checkout 85c6a90 && \
     cd Source/Release && \
-    gcc -fsanitize=address -static-libasan -fprofile-arcs -ftest-coverage -g -O2 -c ../*.c -I.. && \
-    gcc -fsanitize=address -static-libasan -fprofile-arcs -ftest-coverage -g -O2 -c /tmp/gcov_flush.c -o gcov_flush.o && \
-    gcc -fsanitize=address -static-libasan -fprofile-arcs -ftest-coverage -g -O2 -o fftp *.o gcov_flush.o -lpthread -lgnutls && \
+    gcc -fsanitize=address,undefined -static-libasan -static-libubsan -fno-sanitize-recover=undefined -fno-stack-protector -fprofile-arcs -ftest-coverage -g -O2 -c ../*.c -I.. && \
+    gcc -fsanitize=address,undefined -static-libasan -static-libubsan -fno-sanitize-recover=undefined -fno-stack-protector -fprofile-arcs -ftest-coverage -g -O2 -c /tmp/gcov_flush.c -o gcov_flush.o && \
+    gcc -fsanitize=address,undefined -static-libasan -static-libubsan -fno-sanitize-recover=undefined -fno-stack-protector -fprofile-arcs -ftest-coverage -g -O2 -o fftp *.o gcov_flush.o -lpthread -lgnutls && \
     cp fftp /usr/local/bin/fftp && chmod +x /usr/local/bin/fftp
 
 # Stage 2: Minimal runtime image

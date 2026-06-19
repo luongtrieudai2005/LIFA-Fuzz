@@ -1,0 +1,74 @@
+# Dockerfile.uftpd-rootfs — uftpd @ 0fb2c031~1 (v2.10) built with AddressSanitizer
+# for the Firecracker rootfs. CVE: PORT-parser stack-buffer-overflow in
+# src/ftpcmd.c:handle_PORT (`sprintf(addr[INET_ADDRSTRLEN], "%d.%d.%d.%d", ...)`
+# from attacker-controlled PORT octets). ASAN runs on Firecracker (proven by the
+# golden campaign); this is the deterministic, packet-attributable memory-CVE
+# target for RQ3.
+#
+# Build:  bash scripts/build_rootfs_uftpd.sh   →  rootfs_uftpd.ext4
+
+# ── Stage 1: build uftpd with ASAN ────────────────────────────────────────────
+FROM debian:bookworm-slim AS builder
+
+# libuev-dev + libite-dev are both in Debian bookworm apt (agent-verified).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential autoconf automake libtool pkg-config git ca-certificates \
+        libuev-dev libite-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 0fb2c031~1 = parent of the PORT-parser fix (0fb2c031). Vulnerable.
+# NOTE: automake's per-target `uftpd_CFLAGS` in src/Makefile.am OVERRIDES the
+# global CFLAGS, so -fsanitize=address via `./configure CFLAGS=...` instruments
+# nothing. We override CC itself with the sanitizer flags — $(CC) is used for
+# every compile regardless of per-target CFLAGS, so this instruments the sources
+# definitively. -static-libasan bakes libasan into the binary (no runtime .so).
+RUN cd /tmp \
+    && git clone https://github.com/troglobit/uftpd.git \
+    && cd uftpd && git checkout 0fb2c031~1 \
+    && ./autogen.sh \
+    && ./configure \
+        CC="gcc -fsanitize=address -static-libasan -fno-stack-protector" \
+        CFLAGS="-g -O1" \
+        LDFLAGS="-fsanitize=address -static-libasan" \
+    && make -j"$(nproc)" \
+    && make install \
+    && chmod +x /usr/local/sbin/uftpd
+
+# ── Stage 2: minimal runtime ─────────────────────────────────────────────────
+FROM debian:bookworm-slim
+
+# iproute2 (network) + libuev-dev/libite-dev (shared runtime libs for the
+# dynamically-linked deps). No libasan needed: uftpd is built -static-libasan.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        iproute2 libuev-dev libite-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/sbin/uftpd /usr/local/sbin/uftpd
+
+# uftpd maps the anonymous login to the 'ftp' system user (needed for login +
+# the post-auth chroot). Create it + the writable FTP root.
+RUN useradd -r -u 14 -d /tmp/ftp_root -s /sbin/nologin ftp \
+    && mkdir -p /tmp/ftp_root && chmod 777 /tmp/ftp_root
+
+# /init = PID 1. -n = foreground (mandatory), -o ftp=21,tftp=0,writable
+# (writable is mandatory or uftpd refuses a writable root; tftp=0 disables TFTP).
+# abort_on_error=1 → ASAN aborts on the first overflow → PID1 dies → guest panic
+# → VM exit → crash monitor detects it; the ASAN report lands on the serial console.
+RUN printf '#!/bin/sh\n\
+mkdir -p /proc /sys\n\
+mount -t proc proc /proc\n\
+mount -t sysfs sysfs /sys\n\
+mount -t devtmpfs devtmpfs /dev\n\
+mount -t tmpfs tmpfs /tmp\n\
+mkdir -p /tmp/ftp_root\n\
+chmod 777 /tmp/ftp_root\n\
+mkdir -p /dev/pts\n\
+mount -t devpts devpts /dev/pts\n\
+ip link set lo up\n\
+ip addr add 172.16.0.2/24 dev eth0\n\
+ip link set eth0 up\n\
+ip route add default via 172.16.0.1\n\
+echo "LIFA-Fuzz: uftpd ready on 172.16.0.2:21 (ASAN enabled)"\n\
+export ASAN_OPTIONS=disable_coredump=1:abort_on_error=1:halt_on_error=1:detect_leaks=0\n\
+exec /usr/local/sbin/uftpd -n -o ftp=21,tftp=0,writable /tmp/ftp_root\n' \
+    > /init && chmod +x /init
