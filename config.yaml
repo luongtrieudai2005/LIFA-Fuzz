@@ -120,14 +120,14 @@ slow_loop:
   llm_agent:
     mode: "REAL"                # "REAL" (calls actual API) or "MOCK" (simulated for testing)
     provider: "openai"          # litellm provider string (openai, anthropic, ollama)
-    model: "glm-5-turbo"        # Model name (must be supported by litellm)
+    model: "glm-5"              # Model name (must match .env LLM_MODEL)
     api_key_env: "OPENAI_API_KEY"  # Environment variable holding the API key
     api_base: "https://api.z.ai/api/coding/paas/v4"  # Custom API endpoint (empty = provider default)
     enable_thinking: false      # Disable reasoning/thinking mode (Z.ai GLM needs this)
     extra_body: {}              # Extra JSON body params passed to the API (e.g. {"enable_thinking": false})
     max_tokens: 4096            # Max tokens for LLM response
     temperature: 0.2            # Low temperature for consistent inference
-    timeout_seconds: 60         # Request timeout (glm-5-turbo needs ~15-20s with long prompts)
+    timeout_seconds: 60         # Request timeout (glm-5 needs ~15-20s with long prompts)
     max_retries: 3              # Retry count on API failure
     retry_backoff_ms: 5000      # Base retry backoff
     session_budget_tokens: 0    # Max tokens per session (0 = unlimited)
@@ -152,7 +152,7 @@ slow_loop:
 
     # ZhipuAI (via OpenAI-compatible endpoint):
     #   provider: "openai"
-    #   model: "glm-5-turbo"
+    #   model: "glm-5"
     #   api_key_env: "ZHIPUAI_API_KEY"
     #   api_base: "https://api.z.ai/api/coding/paas/v4"
 

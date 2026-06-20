@@ -73,7 +73,7 @@ except ImportError:
 # Model Pricing (USD per 1M tokens)
 # =============================================================================
 MODEL_PRICING: dict[str, dict[str, float]] = {
-    "glm-5-turbo":                 {"input_per_m": 0.60,  "output_per_m": 1.92},
+    "glm-5":                       {"input_per_m": 0.60,  "output_per_m": 1.92},
     "gpt-4o":                      {"input_per_m": 2.50,  "output_per_m": 10.00},
     "gpt-4o-mini":                 {"input_per_m": 0.15,  "output_per_m": 0.60},
     "claude-sonnet-4-20250514":    {"input_per_m": 3.00,  "output_per_m": 15.00},
