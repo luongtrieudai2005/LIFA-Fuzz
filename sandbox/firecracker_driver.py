@@ -406,11 +406,13 @@ class FirecrackerSandbox(BaseSandbox):
                 rootfs_path = f"{fc_env}/rootfs_lighttpd.ext4"
             elif target_name == "uftpd":
                 rootfs_path = f"{fc_env}/rootfs_uftpd.ext4"
+            elif target_name == "live555":
+                rootfs_path = f"{fc_env}/rootfs_live555.ext4"
             else:
                 rootfs_path = f"{fc_env}/rootfs.ext4"
         if not kernel_args:
             base_args = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw"
-            if target_name in ("lighttpd", "lightftp", "uftpd"):
+            if target_name in ("lighttpd", "lightftp", "uftpd", "live555"):
                 kernel_args = f"{base_args} init=/init"
             else:
                 kernel_args = (
@@ -474,6 +476,8 @@ class FirecrackerSandbox(BaseSandbox):
                 self.rootfs_path = Path(f"{fc_env}/rootfs_lighttpd.ext4")
             elif self.target_name == "uftpd":
                 self.rootfs_path = Path(f"{fc_env}/rootfs_uftpd.ext4")
+            elif self.target_name == "live555":
+                self.rootfs_path = Path(f"{fc_env}/rootfs_live555.ext4")
 
         # Update kernel args for init-based targets
         if self.target_name in ("lighttpd", "lightftp", "uftpd"):
@@ -482,7 +486,7 @@ class FirecrackerSandbox(BaseSandbox):
                 self.kernel_args = f"{base_args} init=/init"
 
         # LightFTP/uftpd listen on port 21
-        if self.target_name in ("lightftp", "uftpd") and self.target_port == 9000:
+        if self.target_name in ("lightftp", "uftpd", "live555") and self.target_port == 9000:
             self.target_port = 21
 
         logger.info(

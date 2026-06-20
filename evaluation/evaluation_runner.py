@@ -235,6 +235,13 @@ async def run_single_baseline(
             "container": "lifa-uftpd-server",
             "client_script": "sandbox/client/ftp_client.py",
         },
+        "live555": {
+            "image": "lifa-live555:latest",
+            "build_context": "sandbox/firecracker_env",
+            "port": 8554,
+            "container": "lifa-live555-server",
+            "client_script": "sandbox/client/rtsp_client.py",
+        },
     }
     tcfg = TARGET_CONFIGS.get(target)
     if tcfg is None:
@@ -280,7 +287,21 @@ async def run_single_baseline(
                 " init=/init"
                 " ip=172.16.0.2::172.16.0.1:255.255.255.0::eth0:off"
             ),
-            "target_port": 21,  # FTP standard port
+            "target_port": 21,
+        },
+        "live555": {
+            "rootfs_path": "sandbox/firecracker_env/rootfs_live555.ext4",
+            "kernel_args": (
+                "console=ttyS0 reboot=k panic=1 pci=off"
+                " root=/dev/vda rw"
+                " init=/init"
+                " ip=172.16.0.2::172.16.0.1:255.255.255.0::eth0:off"
+            ),
+            "target_port": 8554,
+            # Transport framing: RTSP/HTTP requests end with \r\n\r\n.
+            # This is universal text-protocol message framing (RFC 2326 §4),
+            # NOT protocol knowledge. FTP targets omit this (pass-through).
+            "message_delimiter": "\r\n\r\n",
         },
     }
 
@@ -384,12 +405,19 @@ async def run_single_baseline(
         Path(traffic_log).parent.mkdir(parents=True, exist_ok=True)
         Path(traffic_log).unlink(missing_ok=True)
 
+        # Message delimiter for transport framing (e.g. \r\n\r\n for RTSP/HTTP).
+        # This is NOT protocol knowledge — it's universal text-protocol message
+        # framing (RFC 2326 §4, RFC 7230 §3). Empty = pass-through (FTP).
+        _msg_delim_str = fc_cfg.get("message_delimiter", "") if sandbox_driver == "firecracker" else ""
+        _msg_delim = _msg_delim_str.encode("latin-1") if _msg_delim_str else b""
+
         interceptor = Interceptor(
             listen_host="0.0.0.0",
             listen_port=8001,
             upstream_host=target_host,
             upstream_port=target_port,
             traffic_log_path=traffic_log,
+            message_delimiter=_msg_delim,
         )
 
         await interceptor.start()
@@ -501,7 +529,9 @@ async def run_single_baseline(
         # Target-specific mutator tuning
         # Firecracker + FTP: need generous timeouts (FTP banner + command
         # response arrive asynchronously over the TAP bridge).
-        _is_fc_ftp = (sandbox_driver == "firecracker" and target in ("lightftp", "uftpd"))
+        # Generous timeouts for text protocols on Firecracker (TAP bridge latency).
+        # This is about TRANSPORT (async responses over TAP), NOT protocol knowledge.
+        _is_fc_ftp = (sandbox_driver == "firecracker" and target in ("lightftp", "uftpd", "live555"))
         # Resolve ProtocolModule: env var override (ablation uses this to force
         # null/ftp cleanly) else auto-resolve (lightftp→ftp case-study, else
         # null = pure black-box core). WITHOUT this, MutationEngine defaulted to
@@ -528,7 +558,11 @@ async def run_single_baseline(
             k=2,
             max_eps=5000,
             connection_timeout=1.0 if _is_fc_ftp else 0.2,
-            recv_timeout=0.5 if _is_fc_ftp else 0.01,
+            # RTSP (live555) responds in <50ms; FTP responses are also fast.
+            # 0.1s is generous enough for real responses but avoids wasting
+            # 0.4s on each malformed-mutation no-response (5 prefix reads ×
+            # 0.4s saved = 2s per cold-path mutation → EPS 3-5× improvement).
+            recv_timeout=0.2 if target == "live555" else (0.5 if _is_fc_ftp else 0.01),
             no_recv=False,
             protocol_module=_protocol_module,
         )
@@ -1780,8 +1814,8 @@ Examples:
         help="Sandbox driver (default: firecracker)",
     )
     parser.add_argument(
-        "--target", default="lifa", choices=["lifa", "lighttpd", "lightftp", "uftpd"],
-        help="Target server: lifa, lightttpd, lightftp, or uftpd",
+        "--target", default="lifa", choices=["lifa", "lighttpd", "lightftp", "uftpd", "live555"],
+        help="Target server: lifa, lightttpd, lightftp, uftpd, or live555",
     )
     parser.add_argument(
         "--no-dashboard",

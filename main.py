@@ -545,6 +545,7 @@ async def run_pipeline(
             upstream_host=target_host,
             upstream_port=target_port,
             traffic_log_path=traffic_log,
+            message_delimiter=_cfg.get("sandbox", {}).get("firecracker", {}).get("message_delimiter", "").encode("latin-1"),
         )
 
         await interceptor.start()
@@ -577,6 +578,7 @@ async def run_pipeline(
             "lightftp": "sandbox/client/ftp_client.py",
             "lighttpd": "sandbox/client/http_client.py",
             "uftpd": "sandbox/client/ftp_client.py",
+            "live555": "sandbox/client/rtsp_client.py",
         }
         client_script = _TARGET_REGISTRY.get(target_name, "sandbox/client/client.py")
         logger.info(

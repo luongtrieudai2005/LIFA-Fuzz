@@ -54,12 +54,17 @@ class Interceptor:
     """Async TCP proxy with packet capture and mutation injection.
 
     Args:
-        listen_host:      Host to bind the proxy to.
-        listen_port:      Port for the proxy (client connects here).
-        upstream_host:    Target server hostname/IP.
-        upstream_port:    Target server port.
-        traffic_log_path: Path to the JSONL traffic log file.
-        max_connections:   Maximum concurrent proxied connections.
+        listen_host:        Host to bind the proxy to.
+        listen_port:        Port for the proxy (client connects here).
+        upstream_host:      Target server hostname/IP.
+        upstream_port:      Target server port.
+        traffic_log_path:   Path to the JSONL traffic log file.
+        max_connections:     Maximum concurrent proxied connections.
+        message_delimiter:   When non-empty, reassemble C2S bytes into complete
+                            messages split on this delimiter before capture.
+                            Transport framing (e.g. ``b"\\r\\n\\r\\n"`` for
+                            HTTP/RTSP), NOT protocol knowledge. Default empty
+                            = pass-through (FTP compatible).
     """
 
     def __init__(
@@ -70,6 +75,7 @@ class Interceptor:
         upstream_port: int = 9000,
         traffic_log_path: str = "shared/raw_traffic.jsonl",
         max_connections: int = 100,
+        message_delimiter: bytes = b"",
     ) -> None:
         self.listen_host = listen_host
         self.listen_port = listen_port
@@ -77,6 +83,7 @@ class Interceptor:
         self.upstream_port = upstream_port
         self.traffic_log_path = Path(traffic_log_path)
         self.max_connections = max_connections
+        self.message_delimiter = message_delimiter
 
         self._server: Optional[asyncio.Server] = None
         self._active_connections: int = 0
@@ -255,14 +262,40 @@ class Interceptor:
         direction: Direction,
         session_id: str = "",
     ) -> None:
-        """Relay data, capturing each chunk."""
+        """Relay data, capturing each chunk.
+
+        When ``self.message_delimiter`` is set AND direction is C2S, bytes are
+        reassembled into complete messages (split on the delimiter) before
+        capture. This is transport framing (e.g. ``\\r\\n\\r\\n`` for
+        HTTP/RTSP), not protocol knowledge. S2C is always pass-through.
+        """
+        # Only reassemble C2S (client requests are what we mutate)
+        use_reassembly = (
+            self.message_delimiter
+            and direction == Direction.CLIENT_TO_SERVER
+        )
+        buf = b""
+
         try:
             while True:
                 data = await reader.read(65536)
                 if not data:
+                    # Flush remaining buffered bytes on disconnect
+                    if use_reassembly and buf:
+                        await self.capture_packet(direction, buf, session_id=session_id)
                     break
 
-                await self.capture_packet(direction, data, session_id=session_id)
+                if use_reassembly:
+                    buf += data
+                    # Split into complete messages on the delimiter
+                    while self.message_delimiter in buf:
+                        idx = buf.index(self.message_delimiter) + len(self.message_delimiter)
+                        message = buf[:idx]
+                        buf = buf[idx:]
+                        await self.capture_packet(direction, message, session_id=session_id)
+                else:
+                    await self.capture_packet(direction, data, session_id=session_id)
+
                 writer.write(data)
                 await writer.drain()
         except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError):

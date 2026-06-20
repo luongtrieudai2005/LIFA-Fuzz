@@ -135,7 +135,7 @@ class CrashMonitor:
         # crash-triggered resets above, zombies accumulate, the server stops
         # accepting, and EPS collapses to ~1. 0 = disabled.
         self.serial_asan_reset_interval_s: float = serial_asan_reset_interval_s
-        self._last_reset_time: float = 0.0
+        self._last_reset_time: float = -1.0  # <0 = not started; set in watch()
         self._survived_since_reset: int = 0
         self._last_asan_sig: str = ""  # signature of the last ASAN block fired on
         # Once-per-site: a given ASAN crash-site signature fires at most ONCE.
@@ -172,6 +172,10 @@ class CrashMonitor:
         """
         self._running = True
         was_alive = True  # Track state transitions
+        # Initialize reset timer on first watch() call (BUG L1 fix)
+        if self._last_reset_time < 0:
+            import time as _t
+            self._last_reset_time = _t.monotonic()
 
         logger.info(
             f"CrashMonitor started (poll={self.poll_interval_ms}ms, "

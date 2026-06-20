@@ -437,6 +437,11 @@ class SeedSequence(BaseModel):
         default="",
         description="Optional protocol name hint (e.g. 'FTP', 'HTTP')",
     )
+    response_fps: set[str] = Field(
+        default_factory=set,
+        description="Unique response hashes produced by this seed (response-guided IFPS, "
+                    "inspired by Snipuzz CCS'21 — diverse responses = exploratory seed)",
+    )
 
     model_config = {
         "json_schema_extra": {

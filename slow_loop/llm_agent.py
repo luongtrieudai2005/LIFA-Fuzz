@@ -441,6 +441,17 @@ You MUST follow these rules:
 6. **DO NOT re-derive** what the heatmap already tells you. Your value-add \
    is: semantic naming, cross-field relationships, state machine patterns, \
    checksum detection, and vulnerability-focused strategy refinement.
+
+## GENERATIVE VOCABULARY EXPLORATION
+
+For fields assigned `mutation_strategy: "dictionary"`, you MUST provide \
+TWO categories of values in `possible_values`:
+
+1. **Observed**: values actually seen in the traffic samples.
+2. **Generative**: values NOT observed but PLAUSIBLE based on the structural \
+   pattern you see. Consider what ELSE a client following the same grammar \
+   pattern MIGHT send. These are pattern-based suggestions, NOT claims \
+   about any protocol specification.
 """
 
 TRAFFIC_SAMPLE_TEMPLATE = """\

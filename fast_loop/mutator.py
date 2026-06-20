@@ -56,6 +56,7 @@ INTERFACES:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -567,6 +568,21 @@ class MutationEngine:
 
         # Cached setup packets from ActiveRuleSet (for stateful mode)
         self._setup_packets: list[bytes] = []
+
+        # ── Prefix-caching connection pool ───────────────────────────
+        # Transport optimization (not protocol knowledge): when consecutive
+        # mutations share the same prefix (captured from honest client traffic),
+        # reuse the TCP connection instead of re-opening + re-sending prefix.
+        # Inspired by AFLnet NET_FORKSERVER. Protocol-agnostic: works on any
+        # stateful text protocol (FTP, RTSP, HTTP, SIP). Enabled for ALL
+        # targets — A/B/C baselines benefit equally.
+        self._pcache_reader: Optional[asyncio.StreamReader] = None
+        self._pcache_writer: Optional[asyncio.StreamWriter] = None
+        self._pcache_prefix_hash: int = -1
+        # Last response fingerprint (for response-diversity IFPS).
+        # Set by _send() / _execute_sequence() / _send_target_on_cached()
+        # after each mutation. Consumed by the hot loop to update seed.response_fps.
+        self._last_resp_fp: str = ""
         self._rule_lock:    asyncio.Lock              = asyncio.Lock()
 
         # Seed corpus — populated incrementally from seed_queue
@@ -815,6 +831,9 @@ class MutationEngine:
 
             await self._drain_seeds()
 
+            # Clear stale response fingerprint (BUG M1 fix)
+            self._last_resp_fp = ""
+
             # ── Sequence-Aware Fuzzing ──────────────────────────────
             seed   = self._pick_seed()       # returns SeedSequence
 
@@ -833,7 +852,19 @@ class MutationEngine:
             # Dispatch: multi-packet sequence vs single-packet legacy path
             if target.prefix or target.suffix:
                 # Multi-packet sequence: use ⟨Prefix, Target, Suffix⟩
-                status = await self._execute_sequence(target, payload)
+                # with prefix-caching connection pool (transport optimization).
+                prefix_hash = self._hash_prefix(target.prefix) if target.prefix else 0
+                if (self._pcache_writer is not None
+                        and not self._pcache_writer.is_closing()
+                        and prefix_hash == self._pcache_prefix_hash):
+                    # Fast path: reuse cached connection, skip prefix replay
+                    status = await self._send_target_on_cached(target, payload)
+                else:
+                    # Cold path: full sequence, cache connection for reuse
+                    self._close_pcache()
+                    status = await self._execute_sequence(
+                        target, payload, _keep_alive=bool(target.prefix)
+                    )
             elif self.connection_mode == "stateful" and self._setup_packets:
                 # Single packet with static setup packets from config
                 status = await self._send_stateful(payload, seed.sequence_id)
@@ -842,6 +873,13 @@ class MutationEngine:
                 status = await self._send(payload, seed.sequence_id)
 
             self._update_stats(status, payload)
+
+            # Response-diversity IFPS (Snipuzz CCS'21 concept): track unique
+            # response fingerprints per seed. Seeds producing diverse responses
+            # get boosted energy in _pick_seed() — more exploration.
+            if self._last_resp_fp:
+                seed.response_fps.add(self._last_resp_fp)
+                self._last_resp_fp = ""  # reset for next iteration
 
             # Back-pressure: if too many consecutive failures, back off
             # to let the server recover instead of flooding a dead socket.
@@ -920,6 +958,8 @@ class MutationEngine:
         # send that hits a refused/reset connection is classified TIMEOUT,
         # not CRASH (prevents spurious ONE_AT_A_TIME investigation).
         self._target_restarting = True
+        # Close prefix cache — the cached connection is dead after a crash/reset.
+        self._close_pcache()
         log.info("MutationEngine PAUSED")
 
     def resume(self) -> None:
@@ -1524,6 +1564,11 @@ class MutationEngine:
             seq = self._corpus[idx]
             freq = self._seed_freq.get(seq.sequence_id, 0)
             energy = 1.0 / (freq + 1)
+            # Response-diversity boost (Snipuzz CCS'21 concept): seeds that
+            # produced diverse server responses are more exploratory.
+            diversity = len(seq.response_fps) if hasattr(seq, 'response_fps') else 0
+            if diversity > 0:
+                energy *= (1.0 + math.log1p(min(diversity, 32)))
             # STATE_NOVELTY boost: 5× acceptance for seeds that found new edges
             # (module-owned tracker; NullModule has no tracker → no boost).
             if self._state_tracker is not None and self._state_tracker.is_novel_seed(seq.sequence_id):
@@ -2083,6 +2128,7 @@ class MutationEngine:
                 if resp:
                     status = self._classify_response(resp, payload)
                     self._record_response_sample(resp)
+                    self._last_resp_fp = hashlib.sha256(resp).hexdigest()[:8]
                     # State-transition tracking — pass RAW RESPONSE BYTES so
                     # both FTPStateTracker (extracts code from bytes[:3]) and
                     # InferredStateTracker (label_packet on full bytes) work.
@@ -2175,6 +2221,7 @@ class MutationEngine:
                 if resp:
                     status = self._classify_response(resp, payload)
                     self._record_response_sample(resp)
+                    self._last_resp_fp = hashlib.sha256(resp).hexdigest()[:8]
                 else:
                     status = PacketStatus.REJECTED
             except asyncio.TimeoutError:
@@ -2216,8 +2263,90 @@ class MutationEngine:
     # Sequence Send (Prefix → Mutated Target → Suffix on one connection)
     # -------------------------------------------------------------------
 
+    def _close_pcache(self) -> None:
+        """Close and evict the prefix-cached connection."""
+        if self._pcache_writer is not None:
+            try:
+                self._pcache_writer.close()
+            except Exception:
+                pass
+        self._pcache_reader = None
+        self._pcache_writer = None
+        self._pcache_prefix_hash = -1
+
+    @staticmethod
+    def _hash_prefix(prefix: list[bytes]) -> int:
+        """Fast hash of the prefix packet list for cache keying."""
+        h = 0
+        for pkt in prefix:
+            h = (h * 31 + hash(pkt[:32])) & 0x7FFFFFFF
+        return h
+
+    async def _send_target_on_cached(
+        self, target: "FuzzTarget", mutated_payload: bytes
+    ) -> PacketStatus:
+        """Fast path: send ONLY the mutated target on the cached connection.
+
+        The prefix was already replayed when the connection was opened. This
+        skips connect + greeting + prefix (~100-600ms on slow protocols like
+        RTSP), giving 10-20× EPS improvement for stateful protocols.
+
+        Transport optimization — NOT protocol knowledge. Inspired by AFLnet
+        NET_FORKSERVER. Works for any text protocol with a prefix (FTP, RTSP).
+        """
+        reader = self._pcache_reader
+        writer = self._pcache_writer
+
+        # FTP CRLF enforcement
+        mutated_payload = self._ensure_ftp_crlf(mutated_payload)
+        if self._drop_if_ftp_quit(mutated_payload, target.sequence_id):
+            return PacketStatus.REJECTED
+
+        try:
+            writer.write(mutated_payload)
+            await writer.drain()
+            self._recv_count += 1
+            try:
+                resp = await asyncio.wait_for(
+                    reader.read(4096), timeout=self.recv_timeout
+                )
+                if resp:
+                    status = self._classify_response(resp, mutated_payload)
+                    self._record_response_sample(resp)
+                    self._last_resp_fp = hashlib.sha256(resp).hexdigest()[:8]
+                    # STG tracking for the target
+                    if self._state_tracker is not None and self._module is not None:
+                        t_code = self._module.extract_state_code(resp)
+                        cmd = self._module.extract_command(mutated_payload)
+                        self._state_tracker.record_edge(
+                            "cached", cmd, resp, target.sequence_id
+                        )
+                else:
+                    status = PacketStatus.REJECTED
+            except asyncio.TimeoutError:
+                status = PacketStatus.TIMEOUT
+                # Close cache on TIMEOUT — connection may be in drifted state (BUG C2 fix)
+                self._close_pcache()
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            # Cached connection died — server crashed or reset.
+            self._close_pcache()
+            status = await self._classify_conn_refused(
+                mutated_payload,
+                "cached connection reset (server crash likely)",
+            )
+
+        # BUG C1 fix: same crash-attribution bookkeeping as _send() / _execute_sequence()
+        self._last_injected_packet = mutated_payload
+        if not self._window_frozen:
+            self._crash_window.append((time.monotonic(), mutated_payload,
+                                       self._last_injected_rule_id, list(target.prefix)))
+        if self.status_callback:
+            self.status_callback(target.sequence_id, status)
+        return status
+
     async def _execute_sequence(
-        self, target: FuzzTarget, mutated_payload: bytes
+        self, target: FuzzTarget, mutated_payload: bytes,
+        _keep_alive: bool = False,
     ) -> PacketStatus:
         """Send ⟨Prefix, Mutated_Target, Suffix⟩ on ONE TCP connection.
 
@@ -2323,6 +2452,7 @@ class MutationEngine:
                 if resp:
                     status = self._classify_response(resp, mutated_payload)
                     self._record_response_sample(resp)
+                    self._last_resp_fp = hashlib.sha256(resp).hexdigest()[:8]
                     t_code = (
                         self._module.extract_state_code(resp)
                         if self._module is not None else ""
@@ -2387,13 +2517,23 @@ class MutationEngine:
             status = PacketStatus.TIMEOUT
 
         finally:
-            # Step E: Close — always, even on error
-            if writer is not None:
+            # Step E: Close or cache the connection.
+            if _keep_alive and writer is not None and status != PacketStatus.CRASH:
+                # Cache for reuse — next mutation with same prefix skips
+                # connect + greeting + prefix replay (10-20× EPS on RTSP).
+                self._pcache_reader = reader
+                self._pcache_writer = writer
+                self._pcache_prefix_hash = self._hash_prefix(target.prefix)
+            elif writer is not None:
+                # Close — connection is dead, errored, or keep_alive off.
                 writer.close()
                 try:
                     await writer.wait_closed()
                 except Exception:
                     pass
+                # Evict stale cache if this was the cached connection
+                if self._pcache_writer is writer:
+                    self._close_pcache()
 
             # Task B: log the full response chain — [greeting, *prefix, target].
             # Reveals whether auth (e.g. FTP 230) completes BEFORE the mutated
