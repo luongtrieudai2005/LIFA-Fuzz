@@ -802,7 +802,7 @@ async def run_single_baseline(
         from shared.runtime_state import (
             PipelineState, TargetState, ClientState, InterceptorState,
             MutatorState, SlowLoopState, RuleSetState, EvaluationState,
-            write_runtime_state, RUNTIME_STATE_FILE,
+            write_runtime_state, read_slow_loop_state, RUNTIME_STATE_FILE,
         )
 
         async def _eval_state_writer() -> None:
@@ -811,6 +811,11 @@ async def run_single_baseline(
                 try:
                     target_alive = await sandbox.is_target_alive()
                     ms = mutator.get_stats()
+                    # Slow-loop counters: the in-process fusion loop writes
+                    # shared/slow_loop_state.json each cycle; merge it here so
+                    # the dashboard Slow-Loop card shows real cycles/inferences
+                    # (was hardcoded to 0 — #5).
+                    _sl = read_slow_loop_state() or {}
                     state = PipelineState(
                         timestamp=time.time(),
                         uptime_seconds=time.monotonic() - start,
@@ -850,16 +855,20 @@ async def run_single_baseline(
                             confidence=0.0,
                             total_rules=ms.active_rule_count,
                         ),
+                        # Slow-loop counters merged from _sl (read before this
+                        # call from slow_loop_state.json, written by
+                        # _run_fusion_loop each cycle). Was hardcoded to 0 (#5).
                         slow_loop=SlowLoopState(
                             alive=(
                                 _slow_loop_in_process
                                 or (slow_loop_proc is not None and slow_loop_proc.poll() is None)
+                                or bool(_sl.get("alive", False))
                             ),
-                            pid=slow_loop_proc.pid if slow_loop_proc else None,
-                            total_cycles=0,
-                            total_inferences=0,
-                            total_rules_pushed=ms.active_rule_count,
-                            last_error="",
+                            pid=(slow_loop_proc.pid if slow_loop_proc else None) or _sl.get("pid"),
+                            total_cycles=_sl.get("total_cycles", 0),
+                            total_inferences=_sl.get("total_inferences", 0),
+                            total_rules_pushed=_sl.get("total_rules_pushed") or ms.active_rule_count,
+                            last_error=_sl.get("last_error", ""),
                         ),
                         evaluation=EvaluationState(
                             campaign_active=True,
@@ -937,7 +946,29 @@ async def run_single_baseline(
         final_stats = mutator.coverage_summary
         summary["final_mutations"] = final_stats["total_mutations"]
         summary["final_rules"] = final_stats["active_rules"]
-        summary["final_coverage"] = final_stats["unique_offsets_fuzzed"]
+
+        # Coverage metrics. final_offset_coverage (canonical) / final_coverage
+        # (back-compat alias) is a BYTE-OFFSET mutation-signature count — NOT
+        # comparable across protocol types: on text/line protocols the math
+        # baseline (B) inflates it (per-byte signatures on a fixed packet)
+        # while the LLM baseline's (C) token mutations register few, so B can
+        # look 67x "better" while doing less semantic work. To stop this
+        # misrepresenting text-protocol runs, also surface two honest,
+        # already-computed signals: protocol state-transition coverage
+        # (unique_states / unique_state_edges — C leads here on text) and
+        # per-strategy rule response stats (did mutations reach handlers).
+        # These flow into comparison.json via write_comparison(). See README.
+        summary["final_offset_coverage"] = final_stats["unique_offsets_fuzzed"]
+        summary["final_coverage"] = final_stats["unique_offsets_fuzzed"]  # alias
+        summary["final_state_states"] = final_stats.get("unique_states", 0)
+        summary["final_state_edges"] = final_stats.get("unique_state_edges", 0)
+        try:
+            _rrs = Path("shared/rule_response_stats.json")
+            summary["rule_response_stats"] = (
+                json.loads(_rrs.read_text(encoding="utf-8")) if _rrs.exists() else {}
+            )
+        except Exception:
+            summary["rule_response_stats"] = {}
 
         # Honest crash breakdown: total detected events, unique crash SITES
         # (σ₃ dedup — distinct vulnerabilities), and how many of those unique
@@ -1077,6 +1108,11 @@ def _reset_shared_state() -> None:
         "shared/last_known_grammar.json",
         # Dashboard runtime state
         "shared/runtime_state.json",
+        # Per-strategy accepted/timeout counts (written by mutator on
+        # shutdown). Reset per baseline so each summary's rule_response_stats
+        # reflects ONLY that baseline — otherwise A/B stats bleed into C's
+        # summary/comparison (integrity: this file is now surfaced in #3).
+        "shared/rule_response_stats.json",
     ]:
         p = Path(path)
         if p.exists():
@@ -1519,6 +1555,14 @@ async def _run_math_only_loop(
             )
 
             if field_rules:
+                # NOTE: these are OFFSET-based rules (the math layer has no
+                # text tokenizer). On line-oriented text protocols (RTSP/HTTP)
+                # they mutate byte offsets rather than tokens, so B is a weaker
+                # baseline there BY DESIGN — B isolates the math layer without
+                # the LLM's text-detection contribution (see C for text-aware
+                # fuzzing). A text-aware math baseline, if wanted, should be a
+                # new named Baseline D reusing shared/text_tokenizer, not a
+                # change to B (would corrupt the A/B/C ablation).
                 # Use RulesOrchestrator._convert_field_rules() which correctly
                 # handles: STATIC → preserve_bytes, SKIP filtering,
                 # dictionary_values transfer, and field_type inference.
@@ -1577,21 +1621,26 @@ async def _run_fusion_loop(
     from slow_loop.rules_orchestrator import RulesOrchestrator
     from slow_loop.rule_generator import RuleGenerator
 
-    rule_gen = RuleGenerator(min_confidence=0.5, max_rules=200)
-    parser = TrafficParser(log_path=traffic_log, read_interval_ms=2000)
-
-    # Phase 3 / TASK 4: read force-inference thresholds from config.yaml so the
-    # in-process campaign path honours the same force_inference keys as the
-    # run_slow_loop.py daemon (single source of truth). Falls back to 600s /
-    # 20000 mutations. NOTE: re_infer_interval_s=30 below is the dominant
-    # cadence driver (fires first); force_inference is a starvation backstop.
+    # Read rule_generator and force_inference config FIRST so both
+    # RuleGenerator creation and force_inference use the same config.yaml.
     try:
         import yaml as _yaml
         with open(_project_root / "config.yaml", encoding="utf-8") as _f:
             _sl_cfg = (_yaml.safe_load(_f) or {}).get("slow_loop", {}) or {}
     except Exception:
         _sl_cfg = {}
+    _rule_gen_cfg = _sl_cfg.get("rule_generator", {}) or {}
     _force_cfg = _sl_cfg.get("force_inference", {}) or {}
+
+    rule_gen = RuleGenerator(
+        min_confidence=_rule_gen_cfg.get("min_confidence", 0.5),
+        max_rules=_rule_gen_cfg.get("max_rules", 200),
+        rule_output_file=_rule_gen_cfg.get(
+            "rule_output_file",
+            "shared/active_rules.json",
+        ),
+    )
+    parser = TrafficParser(log_path=traffic_log, read_interval_ms=2000)
 
     orchestrator = RulesOrchestrator(
         parser=parser,
@@ -1610,6 +1659,31 @@ async def _run_fusion_loop(
         await asyncio.sleep(poll_interval)
         try:
             result = await orchestrator.run_cycle()
+
+            # Publish slow-loop state so runtime_state.json / telemetry /
+            # dashboard see real cycle/inference counts. The subprocess path
+            # (run_slow_loop.py) writes this file; the in-process fusion loop
+            # must too, else runtime_state slow_loop counters stay at 0 (#5).
+            try:
+                from shared.runtime_state import (
+                    write_slow_loop_state, SLOW_LOOP_STATE_FILE,
+                )
+                _st = orchestrator.stats
+                write_slow_loop_state({
+                    "timestamp": time.time(),
+                    "pid": os.getpid(),
+                    "alive": True,
+                    "last_cycle_time": (
+                        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                        if _st.get("total_cycles", 0) > 0 else ""
+                    ),
+                    "total_cycles": _st.get("total_cycles", 0),
+                    "total_inferences": _st.get("total_inferences", 0),
+                    "total_rules_pushed": _st.get("total_rules_pushed", 0),
+                    "last_error": _st.get("last_error", ""),
+                }, SLOW_LOOP_STATE_FILE)
+            except Exception:
+                pass
 
             if result is not None and result.get("status") == "success":
                 rules = result.get("rules", [])

@@ -500,8 +500,20 @@ def plot_coverage_proxy_growth(
     ax.set_xlabel("Elapsed Time (seconds)", fontsize=12)
     ax.set_ylabel("Unique Byte Offsets Fuzzed", fontsize=12)
     ax.set_title(
-        "Coverage Proxy Growth — Unique Offsets Fuzzed Over Time",
-        fontsize=14, fontweight="bold",
+        "Byte-Offset Mutation Proxy (NOT comparable across binary/text protocols)",
+        fontsize=13, fontweight="bold",
+    )
+    # Honesty footnote: this is a byte-offset proxy, not semantic coverage.
+    # On text/line protocols the math baseline inflates it (per-byte
+    # signatures on a fixed packet) while token-based mutation (LLM
+    # baseline) registers few — so a higher line here does NOT mean more
+    # real coverage on text protocols. See final_state_edges /
+    # rule_response_stats in summary.json for the semantic metrics.
+    fig.text(
+        0.5, 0.005,
+        "Byte-offset proxy — inflated for text protocols. "
+        "See final_state_edges / rule_response_stats for semantic coverage.",
+        ha="center", fontsize=8, style="italic", color="#666",
     )
     ax.legend(fontsize=10, loc="upper left")
     ax.grid(True, alpha=0.3)

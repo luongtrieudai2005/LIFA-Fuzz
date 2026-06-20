@@ -105,6 +105,52 @@ class TestTextRuleGeneration:
         rules = RuleGenerator().grammar_to_rules(g)
         assert all(r.text_selector is None for r in rules)
 
+    def test_text_grammar_with_bytes_body_field_detected_without_keyword(self):
+        """Regression (#1): a text protocol that carries a BYTES body field
+        (e.g. RTSP payload_body) AND whose description lacks a text keyword
+        must STILL be detected as text via the structural majority check.
+        Previously the strict `all(string/enum)` failed on the BYTES field,
+        so detection depended on the LLM description wording — non-
+        deterministic across inferences (2/8 cycles missed text)."""
+        g = ProtocolGrammar(
+            protocol_name="Generic Proto",  # no text keyword
+            description="A request/response message format.",  # no keyword
+            fields=[
+                InferredField(
+                    name="method", offset_start=0, offset_end=0,
+                    field_type=FieldType.ENUM, is_constant=False,
+                    mutation_strategy=MutationStrategy.DICTIONARY,
+                    possible_values=["AAA", "BBB"],
+                ),
+                InferredField(
+                    name="uri", offset_start=-1, offset_end=-1,
+                    field_type=FieldType.STRING, is_constant=False,
+                    mutation_strategy=MutationStrategy.RANDOM_BYTES,
+                ),
+                InferredField(
+                    name="ver", offset_start=-1, offset_end=-1,
+                    field_type=FieldType.STRING, is_constant=False,
+                    mutation_strategy=MutationStrategy.STATIC,
+                ),
+                InferredField(
+                    name="hdr_val", offset_start=0, offset_end=0,
+                    field_type=FieldType.STRING, is_constant=False,
+                    mutation_strategy=MutationStrategy.BOUNDARY_VALUES,
+                ),
+                InferredField(
+                    name="body", offset_start=-1, offset_end=-1,
+                    field_type=FieldType.BYTES, is_constant=False,
+                    mutation_strategy=MutationStrategy.PAYLOAD_EXTEND,
+                ),
+            ],
+            confidence=0.95,
+        )
+        rg = RuleGenerator()
+        assert rg._is_text_grammar(g) is True
+        rules = rg.grammar_to_rules(g)
+        # text rules generated despite the BYTES body field + no keyword
+        assert any(r.text_selector is not None for r in rules)
+
 
 class TestTextRuleRuntime:
     def test_method_rule_mutates_method_token(self):

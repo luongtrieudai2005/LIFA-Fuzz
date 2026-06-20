@@ -343,8 +343,9 @@ class RuleGenerator:
               text keyword ("text", "ascii", "header", "line", "crlf",
               "delimited") — these words come from the LLM, not from us; or
           (b) a structural signature: most non-constant fields carry no fixed
-              byte offset (LLM returned ``-1`` or ``[0,0)``) AND are typed
-              string/enum — i.e. the offset model genuinely does not fit.
+              byte offset (LLM returned ``-1`` or ``[0,0)``) AND a MAJORITY
+              are typed string/enum — i.e. the offset model genuinely does
+              not fit.
 
         Binary grammars (placeable offsets) never match, so this path is
         opt-in by detection and cannot affect binary targets.
@@ -365,8 +366,20 @@ class RuleGenerator:
             for f in non_const
             if f.offset_end < 0 or f.offset_end <= f.offset_start
         )
-        if unplaceable / len(non_const) >= 0.5 and all(
-            f.field_type in (FieldType.STRING, FieldType.ENUM) for f in non_const
+        # MAJORITY (not all) of non-const fields must be string/enum. A text
+        # protocol legitimately carries a binary/bytes body field (e.g. a
+        # payload body typed BYTES) which would falsely fail an `all` check —
+        # leaving detection dependent solely on the LLM description keyword
+        # above, which the LLM omits on some inferences (observed: 2/8 cycles
+        # missed text). Majority makes detection deterministic.
+        text_typed = sum(
+            1
+            for f in non_const
+            if f.field_type in (FieldType.STRING, FieldType.ENUM)
+        )
+        if (
+            unplaceable / len(non_const) >= 0.5
+            and text_typed / len(non_const) >= 0.6
         ):
             return True
         return False

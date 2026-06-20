@@ -1262,6 +1262,12 @@ class RulesOrchestrator:
         the math layer's FieldRules are converted directly so the fuzzer
         never starves for rules.
 
+        These rules are OFFSET-based (the math layer has no text tokenizer).
+        On line-oriented text protocols they mutate byte offsets, not tokens
+        — by design: this path isolates the math layer (Baseline B). A
+        text-aware variant should be a new named baseline reusing
+        shared/text_tokenizer, not a change here.
+
         Pure function: uses no instance state (only the two staticmethod
         helpers below). C2 fix — previously called via a fragile
         ``RulesOrchestrator.__new__()`` hack in evaluation_runner that would

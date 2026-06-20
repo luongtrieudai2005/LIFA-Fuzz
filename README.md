@@ -216,6 +216,8 @@ Server:       57%  ACCEPTED mutated commands (deep processing)
 - **No binary code coverage inside the Firecracker VM.** Snapshots discard coverage counters, so gcov cannot work with snapshot-restore. Coverage is measured separately via a Docker variant.
 - **Old A/B/C benchmark data is invalid.** It was collected with a broken fuzzer that was stuck at the server greeting and never authenticated. Results must be re-run with the fixed pipeline.
 - **Zero crashes found so far.** The pipeline was only recently fixed; a longer overnight campaign is needed.
+- **`final_coverage` is a byte-offset proxy, not semantic coverage.** It counts unique byte-offset mutation signatures, which is **not comparable across protocol types**: on text/line protocols (RTSP/HTTP) the math-only baseline (B) inflates it (per-byte signatures on a fixed packet) while the LLM baseline's (C) token mutations register few. No single number is "coverage", so `summary.json`/`comparison.json` now report several metrics transparently — `final_offset_coverage` (this byte-offset proxy), `final_state_edges` (protocol state-transition coverage), and `rule_response_stats` (per-strategy accepted/timeout, i.e. did mutations reach handlers). The decisive RQ3 metric remains **crashes**; on live555 all baselines found 0. The coverage plot is labeled accordingly.
+- **Baseline B is offset-only on text protocols, by design.** B isolates the DifferentialAnalyzer (math) layer, which has no text-tokenization; on line protocols it produces byte-offset mutations rather than token-based ones. This is the ablation working as intended — a text-aware math baseline, if wanted, should be a new named baseline reusing the generic tokenizer, not a change to B.
 
 ---
 
