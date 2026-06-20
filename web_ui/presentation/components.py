@@ -381,9 +381,17 @@ def render_metrics(
     rules: list,
     crashes: list,
     eps: float,
+    rule_count: int | None = None,
 ) -> None:
-    """Render the top-level metric cards."""
+    """Render the top-level metric cards.
+
+    ``rule_count`` is the authoritative active-rule count (see
+    ``readers.read_active_rule_count``): when provided it overrides
+    ``len(rules)``, so the card reflects the engine's live rule count even
+    if the rule file is temporarily unavailable.
+    """
     crash_count = len(crashes)
+    active_rules = rule_count if rule_count is not None else len(rules)
 
     col1, col2, col3, col4, col5 = st.columns(5)
 
@@ -404,7 +412,7 @@ def render_metrics(
         )
     with col4:
         st.markdown(
-            load_section("metrics.html", "rules", rules_count=len(rules)),
+            load_section("metrics.html", "rules", rules_count=active_rules),
             unsafe_allow_html=True,
         )
     with col5:

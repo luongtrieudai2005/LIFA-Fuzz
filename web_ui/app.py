@@ -32,6 +32,7 @@ from web_ui.logic.readers import (
     EPS_HISTORY_LEN,
     compute_eps,
     infer_pipeline_status,
+    read_active_rule_count,
     read_active_rules,
     read_crash_records,
     read_evaluation_state,
@@ -126,7 +127,11 @@ def main() -> None:
     render_evaluation_progress(eval_state, stats)
     render_pipeline_status(pipeline_state)
     st.divider()
-    render_metrics(stats, rules, crashes, eps)
+    # Authoritative active-rule count: len(rules) when the rule file is
+    # present, else the live engine count from runtime_state.json. Keeps the
+    # "Active Rules" card honest even when the rule file is cleaned up.
+    active_rule_count = read_active_rule_count(rules)
+    render_metrics(stats, rules, crashes, eps, rule_count=active_rule_count)
 
     st.divider()
     col_chart, col_rules = st.columns([3, 2])

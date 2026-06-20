@@ -190,17 +190,57 @@ def read_traffic_stats() -> dict[str, Any]:
     }
 
 
+def _resolve_rules_file() -> Path:
+    """Resolve the active-rules file path the engine actually writes to.
+
+    The rule-file location is configurable in config.yaml
+    (slow_loop.rule_generator.rule_output_file, falling back to
+    fast_loop.rule_watcher.rules_file). The engine is typically configured
+    to write to ``/tmp/lifa_rules.json`` — NOT ``shared/active_rules.json``.
+    This mirrors ``fast_loop/mutator.py:_load_rules_path_from_config()`` so
+    the dashboard reads the SAME file the engine reads; otherwise the
+    "Active Rules" metric card always shows 0 (the old default file is
+    never written).
+
+    Config is read from ``DATA_DIR/config.yaml`` (the deployment the
+    dashboard monitors). If absent — e.g. a stripped data dir or a test
+    tmp_path — fall back to the default ``shared/active_rules.json`` under
+    DATA_DIR.
+    """
+    try:
+        import yaml as _yaml
+
+        cfg = DATA_DIR / "config.yaml"
+        if cfg.exists():
+            data = _yaml.safe_load(cfg.read_text(encoding="utf-8")) or {}
+            rg = (data.get("slow_loop") or {}).get("rule_generator") or {}
+            p = rg.get("rule_output_file")
+            if not p:
+                rw = (data.get("fast_loop") or {}).get("rule_watcher") or {}
+                p = rw.get("rules_file")
+            if p:
+                rp = Path(p)
+                return rp if rp.is_absolute() else DATA_DIR / rp
+    except Exception:
+        pass
+    return RULES_FILE  # default: DATA_DIR/shared/active_rules.json
+
+
 def read_active_rules() -> list[dict]:
     """Load active rules from the shared JSON file.
 
     Handles two formats:
       - A flat list: [{...}, {...}, ...]
       - A dict with "rules" key: {"rules": [{...}, ...], "protocol_name": ...}
+
+    Reads the path resolved by :func:`_resolve_rules_file` (config-aware),
+    so it picks up the same file the mutation engine uses.
     """
-    if not RULES_FILE.exists():
+    rules_file = _resolve_rules_file()
+    if not rules_file.exists():
         return []
     try:
-        with open(RULES_FILE, "r", encoding="utf-8") as f:
+        with open(rules_file, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
             return data
@@ -209,6 +249,37 @@ def read_active_rules() -> list[dict]:
         return []
     except (json.JSONDecodeError, OSError):
         return []
+
+
+def read_active_rule_count(rules: list[dict] | None = None) -> int:
+    """Authoritative active-rule count for the metric card.
+
+    Primary source: the length of the rules list read from the rule file
+    (config-resolved — same path the engine writes). Fallback: when the
+    rule file is missing or empty, use the live engine count reported in
+    ``runtime_state.json`` (``rule_set.total_rules``, then
+    ``mutator.active_rule_count``). This guarantees the metric never reads
+    0 while the engine actually has rules loaded — e.g. right after a run
+    when ``/tmp/lifa_rules.json`` has been cleaned up but the last
+    ``runtime_state.json`` snapshot still reflects the active rule set.
+    """
+    if rules:
+        return len(rules)
+    try:
+        if RUNTIME_STATE.exists():
+            with open(RUNTIME_STATE, "r", encoding="utf-8") as f:
+                rs = json.load(f)
+            rule_set = rs.get("rule_set") or {}
+            n = rule_set.get("total_rules")
+            if isinstance(n, int) and n > 0:
+                return n
+            mutator = rs.get("mutator") or {}
+            n = mutator.get("active_rule_count")
+            if isinstance(n, int) and n > 0:
+                return n
+    except (json.JSONDecodeError, OSError):
+        pass
+    return 0
 
 
 def _safe_mtime(p: Path) -> float:
