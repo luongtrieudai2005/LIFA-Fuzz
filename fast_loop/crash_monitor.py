@@ -925,7 +925,9 @@ class CrashMonitor:
         if sig and sig in self._fired_asan_sigs:
             return ""  # once-per-site: this crash site already fired — no re-counting
         self._last_asan_sig = sig
-        self._fired_asan_sigs.add(sig)
+        # Cap to prevent unbounded growth over 7+ hour campaigns (BUG M2 fix)
+        if len(self._fired_asan_sigs) < 2000:
+            self._fired_asan_sigs.add(sig)
         # CONSUME the report: clear the serial buffer so this ASAN block
         # doesn't re-fire on the next poll. Without this the report sits in
         # the buffer and is re-detected every cycle → a 25:1 false-positive

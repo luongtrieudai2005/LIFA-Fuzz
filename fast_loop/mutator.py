@@ -877,9 +877,11 @@ class MutationEngine:
             # Response-diversity IFPS (Snipuzz CCS'21 concept): track unique
             # response fingerprints per seed. Seeds producing diverse responses
             # get boosted energy in _pick_seed() — more exploration.
-            if self._last_resp_fp:
+            # Cap at 64 entries (IFPS multiplier already capped at min(32))
+            # to prevent unbounded memory growth over 7+ hour campaigns.
+            if self._last_resp_fp and len(seed.response_fps) < 64:
                 seed.response_fps.add(self._last_resp_fp)
-                self._last_resp_fp = ""  # reset for next iteration
+            self._last_resp_fp = ""
 
             # Back-pressure: if too many consecutive failures, back off
             # to let the server recover instead of flooding a dead socket.
@@ -1100,20 +1102,57 @@ class MutationEngine:
         )
 
     async def update_rule_set(self, new_rules: SemanticRuleSet) -> None:
-        """Atomically replace the active SemanticRuleSet.
+        """MERGE new rules into the active SemanticRuleSet.
 
-        P1-B: Auto-transition from DUMB to normal mode when rules arrive.
+        Each LLM inference produces a standalone grammar. Without merging,
+        inference 2 OVERWRITES inference 1's rules → knowledge loss
+        (14 rules → 4 rules). Fix: union all rules, keep highest-confidence
+        version per field.
         """
         async with self._rule_lock:
             old_id = self._rule_set.rule_set_id[:8] if self._rule_set else "none"
-            self._rule_set = new_rules
+
+            if self._rule_set is not None and self._rule_set.rules:
+                # MERGE: union of old + new, dedup by (field_name, offset_start)
+                merged = {}
+                for r in self._rule_set.rules:
+                    key = (r.field_name, r.offset_start)
+                    merged[key] = r
+                for r in new_rules.rules:
+                    key = (r.field_name, r.offset_start)
+                    if key in merged:
+                        # Keep higher-confidence version
+                        if r.priority >= merged[key].priority:
+                            merged[key] = r
+                    else:
+                        merged[key] = r
+                merged_rules = list(merged.values())
+                log.info(
+                    f"Rule MERGE: old={len(self._rule_set.rules)} "
+                    f"new={len(new_rules.rules)} "
+                    f"merged={len(merged_rules)}"
+                )
+                self._rule_set = ActiveRuleSet(
+                    rules=merged_rules,
+                    base_packet=new_rules.base_packet or self._rule_set.base_packet,
+                    setup_packets=new_rules.setup_packets or self._rule_set.setup_packets,
+                    overall_confidence=max(
+                        new_rules.overall_confidence,
+                        self._rule_set.overall_confidence,
+                    ),
+                    protocol_name=new_rules.protocol_name,
+                )
+            else:
+                # First load or empty old set — just use new
+                self._rule_set = new_rules
+
             self._stats.rule_set_version += 1
-            self._stats.rule_set_id       = new_rules.rule_set_id[:8]
-            self._stats.active_fields     = len(new_rules.get_mutable_fields())
+            self._stats.rule_set_id       = self._rule_set.rule_set_id[:8]
+            self._stats.active_fields     = len(self._rule_set.get_mutable_fields())
 
             # Cache decoded setup packets for stateful mode
             self._setup_packets = [
-                bytes.fromhex(hp) for hp in new_rules.setup_packets if hp
+                bytes.fromhex(hp) for hp in self._rule_set.setup_packets if hp
             ]
 
         # P1-B: auto-transition from DUMB → normal when rules arrive
