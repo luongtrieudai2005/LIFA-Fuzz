@@ -745,17 +745,10 @@ class RulesOrchestrator:
                 # rules have been pushed yet (C3 fix: don't overwrite good
                 # LLM rules with stale heatmap bootstrap rules).
                 if self._last_heatmap and not self._llm_rules_active:
-                    bootstrap = self._convert_field_rules(
-                        self._last_heatmap.to_field_rules()
+                    await self._push_bootstrap(
+                        "  Budget exhausted — pushed {n} bootstrap rules "
+                        "from heatmap"
                     )
-                    if bootstrap:
-                        await self.rule_gen.push_rules(bootstrap)
-                        self._total_rules_pushed += len(bootstrap)
-                        self._bootstrap_count += 1
-                        logger.info(
-                            f"  Budget exhausted — pushed {len(bootstrap)} "
-                            f"bootstrap rules from heatmap"
-                        )
                 elif self._llm_rules_active:
                     logger.debug(
                         "  Budget exhausted but LLM rules already active — "
@@ -789,7 +782,11 @@ class RulesOrchestrator:
                         self._last_heatmap.to_field_rules()
                     )
                     if bootstrap:
-                        await self.rule_gen.push_rules(bootstrap)
+                        await self.rule_gen.push_rules(
+                            bootstrap,
+                            overall_confidence=0.6,
+                            protocol_name="bootstrap",
+                        )
                         self._total_rules_pushed += len(bootstrap)
                         self._bootstrap_count += 1
                     elapsed = time.monotonic() - t0
@@ -856,18 +853,12 @@ class RulesOrchestrator:
                 )
 
                 if self._last_heatmap and not self._llm_rules_active:
-                    bootstrap = self._convert_field_rules(
-                        self._last_heatmap.to_field_rules()
+                    bootstrap = await self._push_bootstrap(
+                        "  BOOTSTRAP FALLBACK: pushed {n} rules from "
+                        "DifferentialAnalyzer (LLM was unavailable)",
+                        level="warning",
                     )
                     if bootstrap:
-                        await self.rule_gen.push_rules(bootstrap)
-                        self._total_rules_pushed += len(bootstrap)
-                        self._bootstrap_count += 1
-                        logger.warning(
-                            f"  BOOTSTRAP FALLBACK: pushed {len(bootstrap)} "
-                            f"rules from DifferentialAnalyzer "
-                            f"(LLM was unavailable)"
-                        )
                         elapsed = time.monotonic() - t0
                         self._last_cycle_time = elapsed
                         return {
@@ -903,6 +894,26 @@ class RulesOrchestrator:
                     # C3 fix: mark that LLM rules have been pushed so
                     # bootstrap fallback won't overwrite them.
                     self._llm_rules_active = True
+                elif not self._llm_rules_active:
+                    # LLM SUCCEEDED but grammar_to_rules yielded 0 placeable
+                    # fields — e.g. a text/line protocol whose fields carry no
+                    # fixed byte offsets (the LLM returns offsets as [0,0) or
+                    # -1, which rule_generator drops). Without this fallback a
+                    # successful inference leaves the engine starving at 0
+                    # rules for the whole campaign. Feed bootstrap rules from
+                    # the math heatmap so fuzzing continues. We deliberately do
+                    # NOT set _llm_rules_active (these are not LLM rules), so a
+                    # future grammar with placeable fields can still replace
+                    # them.
+                    pushed = await self._push_bootstrap(
+                        ("  LLM yielded 0 placeable fields (fields="
+                         f"{len(grammar.fields)}, likely text/line protocol "
+                         "with no fixed offsets) — pushed {n} bootstrap "
+                         "rules from DifferentialAnalyzer"),
+                        level="warning",
+                    )
+                    if pushed:
+                        rules = pushed
 
             # ── 9b. Incremental: mark inferred + store grammar ───────
             # Track which packets have been sent to the LLM so future
@@ -971,17 +982,12 @@ class RulesOrchestrator:
             self._update_ewma()
 
             if self._last_heatmap and not self._llm_rules_active:
-                bootstrap = self._convert_field_rules(
-                    self._last_heatmap.to_field_rules()
+                bootstrap = await self._push_bootstrap(
+                    "  BOOTSTRAP FALLBACK (parse error): pushed {n} rules "
+                    "from DifferentialAnalyzer",
+                    level="warning",
                 )
                 if bootstrap:
-                    await self.rule_gen.push_rules(bootstrap)
-                    self._total_rules_pushed += len(bootstrap)
-                    self._bootstrap_count += 1
-                    logger.warning(
-                        f"  BOOTSTRAP FALLBACK (parse error): pushed "
-                        f"{len(bootstrap)} rules from DifferentialAnalyzer"
-                    )
                     return {
                         "status": "bootstrap",
                         "reason": f"Parse error, heatmap fallback: {e}",
@@ -1010,17 +1016,12 @@ class RulesOrchestrator:
             self._update_ewma()
 
             if self._last_heatmap and not self._llm_rules_active:
-                bootstrap = self._convert_field_rules(
-                    self._last_heatmap.to_field_rules()
+                bootstrap = await self._push_bootstrap(
+                    "  BOOTSTRAP FALLBACK (API error): pushed {n} rules "
+                    "from DifferentialAnalyzer",
+                    level="warning",
                 )
                 if bootstrap:
-                    await self.rule_gen.push_rules(bootstrap)
-                    self._total_rules_pushed += len(bootstrap)
-                    self._bootstrap_count += 1
-                    logger.warning(
-                        f"  BOOTSTRAP FALLBACK (API error): pushed "
-                        f"{len(bootstrap)} rules from DifferentialAnalyzer"
-                    )
                     return {
                         "status": "bootstrap",
                         "reason": f"API error, heatmap fallback: {e}",
@@ -1210,6 +1211,46 @@ class RulesOrchestrator:
         }
         # Marker header (see docstring) + compact JSON body.
         return "## RESPONSE FEEDBACK\n\n" + _json.dumps(feedback, indent=2)
+
+    async def _push_bootstrap(
+        self, log_msg: str, *, level: str = "info"
+    ) -> list[SemanticRule]:
+        """Convert the last DifferentialAnalyzer heatmap into rules and push
+        them as bootstrap rules — the math-layer fallback that keeps the
+        engine fed when the LLM yields no usable rules.
+
+        Returns the pushed rules (possibly empty: no heatmap yet, or the
+        heatmap produced nothing). Only bumps ``_total_rules_pushed`` /
+        ``_bootstrap_count`` when rules are actually pushed.
+
+        The caller owns the ``_llm_rules_active`` guard — do not overwrite
+        good LLM rules with stale heatmap bootstrap rules (C3 fix, see the
+        budget-exhausted / LLM-failure call sites).
+
+        ``log_msg`` is a plain string that may contain the literal token
+        ``{n}``, replaced with the number of rules pushed.
+        """
+        if not self._last_heatmap:
+            return []
+        bootstrap = self._convert_field_rules(
+            self._last_heatmap.to_field_rules()
+        )
+        if not bootstrap:
+            return []
+        await self.rule_gen.push_rules(
+            bootstrap,
+            overall_confidence=0.6,
+            protocol_name="bootstrap",
+        )
+        self._total_rules_pushed += len(bootstrap)
+        self._bootstrap_count += 1
+        _log = {
+            "info": logger.info,
+            "warning": logger.warning,
+            "error": logger.error,
+        }.get(level, logger.info)
+        _log(log_msg.replace("{n}", str(len(bootstrap))))
+        return bootstrap
 
     @staticmethod
     def _convert_field_rules(

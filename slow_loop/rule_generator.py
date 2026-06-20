@@ -101,7 +101,7 @@ class RuleGenerator:
         self,
         min_confidence: float = 0.5,
         max_rules: int = 200,
-        rule_output_file: str = "shared/active_rules.json",
+        rule_output_file: str = "/tmp/lifa_rules.json",
     ) -> None:
         self.min_confidence = min_confidence
         self.max_rules = max_rules
@@ -147,6 +147,23 @@ class RuleGenerator:
                 f"threshold {self.min_confidence:.2f} — skipping"
             )
             return []
+
+        # ── Text / line-protocol fast path (generic tokenizer) ──────
+        # If the LLM-inferred grammar describes a text/line protocol whose
+        # fields carry no fixed byte offsets, generate token-based rules via
+        # the generic text tokenizer instead of dropping every unplaceable
+        # field to zero rules. Generic / black-box — the tokenizer knows only
+        # universal delimiters; all semantics come from the LLM grammar. See
+        # shared/text_tokenizer.py and tests/test_text_protocol_integrity.py.
+        if self._is_text_grammar(grammar):
+            logger.info(
+                f"Text/line protocol detected ('{grammar.protocol_name}', "
+                f"fields={len(grammar.fields)}) — generating token-based "
+                f"rules via the generic text tokenizer"
+            )
+            return self._finalize_rules(
+                self._generate_text_rules(grammar), grammar
+            )
 
         # ── Cross-validate LLM fields against mathematical heatmap ────
         validated_fields = self._validate_field_types(grammar, heatmap)
@@ -253,6 +270,16 @@ class RuleGenerator:
                 )
             rules.extend(field_rules)
 
+        return self._finalize_rules(rules, grammar)
+
+    def _finalize_rules(
+        self, rules: list[SemanticRule], grammar: ProtocolGrammar
+    ) -> list[SemanticRule]:
+        """Dedup → sort → trim → log → attach grammar violations.
+
+        Shared by the binary/offset path and the text/token path so both
+        receive identical post-processing.
+        """
         # Deduplicate by (field_name, rule_type, has_dictionary, strategy_override)
         # Extended key allows dictionary and non-dictionary STRUCTURAL rules
         # to coexist for the same field (Issue O3/R4 fix).
@@ -303,6 +330,137 @@ class RuleGenerator:
         self._attach_grammar_violations(unique, grammar)
 
         return unique
+
+    # -----------------------------------------------------------------
+    # Text / line-protocol path (generic tokenizer — black-box)
+    # -----------------------------------------------------------------
+
+    def _is_text_grammar(self, grammar: ProtocolGrammar) -> bool:
+        """Detect a text/line-based grammar from LLM-supplied signals ONLY.
+
+        No protocol-specific knowledge. Triggers on either:
+          (a) the LLM's own description/protocol_name containing a generic
+              text keyword ("text", "ascii", "header", "line", "crlf",
+              "delimited") — these words come from the LLM, not from us; or
+          (b) a structural signature: most non-constant fields carry no fixed
+              byte offset (LLM returned ``-1`` or ``[0,0)``) AND are typed
+              string/enum — i.e. the offset model genuinely does not fit.
+
+        Binary grammars (placeable offsets) never match, so this path is
+        opt-in by detection and cannot affect binary targets.
+        """
+        blob = (
+            (grammar.description or "") + " " + (grammar.protocol_name or "")
+        ).lower()
+        if any(
+            k in blob
+            for k in ("text", "ascii", "header", "line", "crlf", "delimited")
+        ):
+            return True
+        non_const = [f for f in grammar.fields if not f.is_constant]
+        if len(non_const) < 2:
+            return False
+        unplaceable = sum(
+            1
+            for f in non_const
+            if f.offset_end < 0 or f.offset_end <= f.offset_start
+        )
+        if unplaceable / len(non_const) >= 0.5 and all(
+            f.field_type in (FieldType.STRING, FieldType.ENUM) for f in non_const
+        ):
+            return True
+        return False
+
+    def _generate_text_rules(
+        self, grammar: ProtocolGrammar
+    ) -> list[SemanticRule]:
+        """Generate token-based rules for a text/line grammar.
+
+        Each non-constant field becomes ONE text rule carrying a
+        ``text_selector`` resolved at runtime by the generic tokenizer
+        (``shared/text_tokenizer.py``):
+
+          - Enum field with LLM ``possible_values`` → ``{"locate":
+            "match_dictionary"}``: locate the token whose bytes equal one of
+            the LLM-supplied values, then DICTIONARY-mutate it. This is the
+            precise, fully-LLM-driven case (e.g. fuzzing the method verb).
+          - Other fields → ``{"nth_token": i}``: the i-th mutable token in
+            document order (header names are treated as static labels; the
+            value is the mutable unit — universal for ``Name: value``
+            framing). A runtime miss (token absent in this seed) is a no-op.
+
+        Mutation strategies reuse the existing generic operators; NO
+        protocol-specific content is embedded (red line enforced by
+        ``tests/test_text_protocol_integrity.py``).
+        """
+        rules: list[SemanticRule] = []
+        nth = 0  # document-order token index (LLM field order ↔ token order)
+        for field in grammar.fields:
+            if field.mutation_strategy == MutationStrategy.SKIP:
+                continue
+            pv = list(getattr(field, "possible_values", None) or [])
+            if not field.is_constant and field.field_type == FieldType.ENUM and pv:
+                rules.append(
+                    self._make_text_rule(
+                        field, grammar,
+                        selector={"locate": "match_dictionary"},
+                        strat=MutationStrategy.DICTIONARY,
+                        dictionary=[self._coerce_hex(v) for v in pv],
+                    )
+                )
+            elif not field.is_constant:
+                rules.append(
+                    self._make_text_rule(
+                        field, grammar,
+                        selector={"nth_token": nth},
+                        strat=field.mutation_strategy or MutationStrategy.RANDOM_BYTES,
+                        dictionary=[],
+                    )
+                )
+            # Constant fields emit no rule but still occupy a document token
+            # slot, so the nth index stays aligned with runtime token order.
+            nth += 1
+        return rules
+
+    @staticmethod
+    def _coerce_hex(value: str) -> str:
+        """Normalise a possible_value to a hex string.
+
+        Binary enum values arrive as hex (e.g. "01"); text tokens arrive as
+        ASCII words (e.g. a method verb). Hex is returned unchanged; an ASCII
+        word is hex-encoded so it round-trips through ``dictionary_values``
+        (a list[str] of hex) and the tokenizer resolver.
+        """
+        v = (value or "").strip()
+        try:
+            bytes.fromhex(v)
+            return v.lower()
+        except ValueError:
+            return v.encode("utf-8").hex()
+
+    def _make_text_rule(
+        self,
+        field,
+        grammar: ProtocolGrammar,
+        selector: dict,
+        strat: MutationStrategy,
+        dictionary: list[str],
+    ) -> SemanticRule:
+        return SemanticRule(
+            rule_type=RuleType.STRUCTURAL,
+            target_field_name=field.name or "text_field",
+            offset_start=0,  # placeholder; text_selector is authoritative
+            offset_end=0,
+            field_type=field.field_type,
+            priority=max(0.1, min(1.0, grammar.confidence)),
+            mutation_strategy_override=strat,
+            dictionary_values=dictionary,
+            text_selector=selector,
+            description=(
+                f"Text-protocol rule for '{field.name}' via generic tokenizer "
+                f"(selector={selector})"
+            ),
+        )
 
     def _attach_grammar_violations(
         self, rules: list[SemanticRule], grammar: ProtocolGrammar

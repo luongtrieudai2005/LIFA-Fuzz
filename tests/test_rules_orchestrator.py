@@ -763,3 +763,68 @@ class TestDifferentialAnalysis:
 
         await orch._check_crash_isolation()
         assert orch.precision_mode is False
+
+
+class TestPushBootstrap:
+    """Fix 1: bootstrap fallback when a successful LLM inference yields 0
+    convertible rules. Tests the extracted ``_push_bootstrap`` helper that
+    the success path (and the LLM-failure paths) now share."""
+
+    def _make_orch(self, tmp_path):
+        parser = MagicMock()
+        agent = MagicMock()
+        rule_gen = RuleGenerator(
+            min_confidence=0.3,
+            rule_output_file=str(tmp_path / "rules.json"),
+        )
+        rule_gen.push_rules = AsyncMock()
+        orch = RulesOrchestrator(
+            parser=parser, agent=agent, rule_gen=rule_gen,
+            min_packets_before_infer=1,
+        )
+        return orch, rule_gen
+
+    def _heatmap_with(self, n_fields):
+        from shared.schemas import FieldRule
+        heatmap = MagicMock()
+        heatmap.to_field_rules.return_value = [
+            FieldRule(
+                field_name=f"f{i}",
+                offset=i * 4,
+                length=4,
+                mutation_strategy=MutationStrategy.BOUNDARY_VALUES,
+            )
+            for i in range(n_fields)
+        ]
+        return heatmap
+
+    @pytest.mark.asyncio
+    async def test_push_bootstrap_pushes_heatmap_rules(self, tmp_path):
+        orch, rule_gen = self._make_orch(tmp_path)
+        orch._last_heatmap = self._heatmap_with(3)
+        orch._llm_rules_active = False
+
+        pushed = await orch._push_bootstrap("pushed {n}")
+
+        assert len(pushed) == 3
+        rule_gen.push_rules.assert_awaited_once()
+        assert orch._total_rules_pushed == 3
+        assert orch._bootstrap_count == 1
+
+    @pytest.mark.asyncio
+    async def test_push_bootstrap_no_heatmap_returns_empty(self, tmp_path):
+        orch, rule_gen = self._make_orch(tmp_path)
+        orch._last_heatmap = None
+        pushed = await orch._push_bootstrap("pushed {n}")
+        assert pushed == []
+        rule_gen.push_rules.assert_not_awaited()
+        assert orch._bootstrap_count == 0
+
+    @pytest.mark.asyncio
+    async def test_push_bootstrap_empty_heatmap_returns_empty(self, tmp_path):
+        orch, rule_gen = self._make_orch(tmp_path)
+        orch._last_heatmap = self._heatmap_with(0)
+        pushed = await orch._push_bootstrap("pushed {n}")
+        assert pushed == []
+        rule_gen.push_rules.assert_not_awaited()
+

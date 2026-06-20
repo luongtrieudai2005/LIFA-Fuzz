@@ -1638,7 +1638,12 @@ class MutationEngine:
         """Read rule_output_file from config.yaml, fallback to shared/active_rules.json."""
         try:
             import yaml as _yaml
-            _cfg = Path("config.yaml")
+            # Resolve config relative to this file's project root FIRST,
+            # so the poller works regardless of the process CWD.
+            _project_root = Path(__file__).resolve().parent.parent
+            _cfg = _project_root / "config.yaml"
+            if not _cfg.exists():
+                _cfg = Path("config.yaml")  # fallback to CWD
             if _cfg.exists():
                 with open(_cfg) as _f:
                     data = _yaml.safe_load(_f) or {}
@@ -1657,7 +1662,7 @@ class MutationEngine:
         return "shared/active_rules.json"
 
     async def _poll_rules_file(self) -> None:
-        """Poll shared/active_rules.json for new rules from Slow Loop."""
+        """Poll the shared rules file for new rules from Slow Loop."""
         path = self._rules_file
         try:
             if not os.path.exists(path):
@@ -1667,6 +1672,14 @@ class MutationEngine:
                 return
             with open(path) as _f:
                 raw = json.loads(_f.read())
+
+            # Re-check mtime: if file was updated between getmtime and
+            # read, the recorded mtime would skip the next update.
+            _current_mtime = os.path.getmtime(path)
+            if _current_mtime != mtime:
+                mtime = _current_mtime
+                with open(path) as _f:
+                    raw = json.loads(_f.read())
 
             # C4 fix: update mtime BEFORE update_rule_set so that a
             # failed update doesn't cause infinite retries on same file.
@@ -2834,6 +2847,89 @@ def _recompute_length_fields(buf: bytearray, fields: list) -> bytearray:
     return buf
 
 
+def _apply_text_field(
+    buf: bytearray,
+    rule: FieldRule,
+    preserve_length: bool = False,
+) -> bytearray:
+    """Apply a text-protocol token rule: resolve the selector to a byte span
+    via the generic tokenizer, then delegate to the normal offset path.
+
+    Selector forms (see ``rule_generator._generate_text_rules``):
+      - ``{"locate": "match_dictionary"}`` — the token whose bytes equal one
+        of the LLM-supplied ``dictionary_values`` (enum method verb).
+      - ``{"nth_token": i}``               — the i-th mutable token in
+        document order (header names are treated as static labels).
+      - ``{"line": L, "token": T}``        — positional fallback.
+
+    Tokenization runs on the current ``buf`` (the full packet). This is safe
+    because text rules are applied either single-field or under
+    ``preserve_length`` (in-place), so token byte boundaries stay valid. A
+    selector that does not resolve in this packet is a silent no-op. The
+    tokenizer is generic (universal delimiters only) — no protocol-specific
+    content; the value set comes from the LLM grammar.
+    """
+    from shared.text_tokenizer import (
+        tokenize_text,
+        find_token_by_value,
+        token_at,
+    )
+
+    sel = rule.text_selector or {}
+    packet = bytes(buf)
+    tokens = tokenize_text(packet)
+    span = None
+
+    if sel.get("locate") == "match_dictionary":
+        values = []
+        for hv in (rule.dictionary_values or []):
+            try:
+                values.append(bytes.fromhex(hv))
+            except ValueError:
+                values.append(hv.encode("utf-8", errors="ignore"))
+        tok = find_token_by_value(packet, values, tokens)
+        if tok is not None:
+            span = (tok.start, tok.end)
+    elif "nth_token" in sel:
+        # Count ALL tokens in document order so the index aligns with the
+        # generator's per-field nth counter (each non-SKIP LLM field,
+        # including constants, maps to one document token slot).
+        i = int(sel["nth_token"])
+        if 0 <= i < len(tokens):
+            t = tokens[i]
+            # Generic text-framing rule: if the positional selector lands on
+            # a header NAME (a static label), mutate its VALUE (the next
+            # token) instead — universal for "Name: value" lines.
+            if t.kind == "header_name" and i + 1 < len(tokens):
+                t = tokens[i + 1]
+            span = (t.start, t.end)
+    elif "line" in sel and "token" in sel:
+        tok = token_at(tokens, int(sel["line"]), int(sel["token"]))
+        if tok is not None:
+            span = (tok.start, tok.end)
+
+    if span is None:
+        return buf  # selector did not resolve in this packet — no-op
+
+    start, end = span
+    if start >= len(buf) or end <= start or end > len(buf):
+        return buf
+
+    # Delegate to the offset path with a proxy rule carrying the resolved
+    # span and the rule's strategy/dictionary, but NO text_selector (so the
+    # dispatch at the top of _apply_field does not recurse).
+    proxy = FieldRule(
+        field_name=rule.field_name,
+        offset=start,
+        length=end - start,
+        mutation_strategy=rule.mutation_strategy,
+        data_type=rule.data_type,
+        static_value=getattr(rule, "static_value", None),
+        dictionary_values=rule.dictionary_values,
+    )
+    return _apply_field(buf, proxy, preserve_length=preserve_length)
+
+
 def _apply_field(
     buf: bytearray,
     rule: FieldRule,
@@ -2865,6 +2961,14 @@ def _apply_field(
     Returns:
         The same bytearray (modified in-place and returned for chaining).
     """
+    # Text-protocol token selector: resolve a byte span via the generic
+    # tokenizer instead of using rule.offset/length, then delegate to the
+    # normal offset path with a text_selector-less proxy (avoids recursion).
+    # No-op if the selector does not resolve in this packet. The tokenizer
+    # is generic (universal delimiters only) — no protocol-specific content.
+    if getattr(rule, "text_selector", None):
+        return _apply_text_field(buf, rule, preserve_length=preserve_length)
+
     start = rule.offset
     if start >= len(buf):
         return buf

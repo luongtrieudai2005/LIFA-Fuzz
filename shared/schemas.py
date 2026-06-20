@@ -251,6 +251,17 @@ class FieldRule(BaseModel):
         default=None,
         description="Type-aware dispatch: endian-safe encoding for binary fields",
     )
+    text_selector: Optional[dict] = Field(
+        default=None,
+        description=(
+            "Text-protocol token selector (generic, black-box). When set, the "
+            "mutator IGNORES offset/length and resolves a token via the "
+            "generic text tokenizer — either by matching a value from "
+            "dictionary_values (LLM-supplied enum) or by line/token index — "
+            "then applies mutation_strategy to that byte span. None for "
+            "binary/offset-based fields. Carries NO protocol-specific content."
+        ),
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -618,6 +629,18 @@ class SemanticRule(BaseModel):
             "LLM generation is a later phase."
         ),
     )
+    text_selector: Optional[dict] = Field(
+        default=None,
+        description=(
+            "Text-protocol token selector (generic, black-box). When set, the "
+            "mutator resolves the target via the generic text tokenizer "
+            "instead of offset_start/offset_end: a JSON object like "
+            "{'locate': 'match_dictionary'} (find the token whose bytes equal "
+            "an LLM-supplied dictionary_values entry) or "
+            "{'line': L, 'token': T} (positional). Carries NO protocol-specific "
+            "content — only universal text framing (\\r\\n / space / colon)."
+        ),
+    )
 
     @field_serializer("preserve_bytes")
     def serialize_preserve_bytes(self, data: bytes, _info: Any) -> str:
@@ -770,6 +793,7 @@ class ActiveRuleSet(BaseModel):
                     confidence=r.priority,
                     data_type=r.field_type,
                     dictionary_values=r.dictionary_values if r.dictionary_values else None,
+                    text_selector=r.text_selector,
                 ))
         return result
 
