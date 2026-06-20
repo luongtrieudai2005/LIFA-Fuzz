@@ -115,9 +115,9 @@ def main() -> None:
             # at the Range offset → HIGH_ENTROPY → PAYLOAD_EXTEND → overflow on clock=.
             range_formats = [
                 "npt=0.001-",
-                "clock=20%02d%02d%02dT%02d%02d%02d%02dZ-" % (
+                "clock=20%02d%02d%02dT%02d%02d%02dZ-" % (
                     24 + (seq % 50), (seq % 12) + 1, (seq % 28) + 1,
-                    seq % 24, (seq % 60), (seq * 7) % 60, (seq * 13) % 60),
+                    seq % 24, (seq * 7) % 60, (seq * 13) % 60),
                 "smpte=0:%02d:%02d:%02d-" % (seq % 24, (seq * 7) % 60, (seq * 13) % 60),
             ]
             play_headers = {}

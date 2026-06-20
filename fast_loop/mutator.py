@@ -1116,10 +1116,10 @@ class MutationEngine:
                 # MERGE: union of old + new, dedup by (field_name, offset_start)
                 merged = {}
                 for r in self._rule_set.rules:
-                    key = (r.field_name, r.offset_start)
+                    key = (r.field_name, r.offset_start, r.rule_type)
                     merged[key] = r
                 for r in new_rules.rules:
-                    key = (r.field_name, r.offset_start)
+                    key = (r.field_name, r.offset_start, r.rule_type)
                     if key in merged:
                         # Keep higher-confidence version
                         if r.priority >= merged[key].priority:
@@ -2339,7 +2339,17 @@ class MutationEngine:
         # FTP CRLF enforcement
         mutated_payload = self._ensure_ftp_crlf(mutated_payload)
         if self._drop_if_ftp_quit(mutated_payload, target.sequence_id):
+            # BUG 2 fix: bookkeeping BEFORE early return (was bypassing crash window)
+            self._last_injected_packet = mutated_payload
+            if not self._window_frozen:
+                self._crash_window.append((time.monotonic(), mutated_payload,
+                                           self._last_injected_rule_id, list(target.prefix)))
+            if self.status_callback:
+                self.status_callback(target.sequence_id, PacketStatus.REJECTED)
             return PacketStatus.REJECTED
+
+        # BUG 5 fix: pre-initialize status (mirrors _execute_sequence line 2416)
+        status: PacketStatus = PacketStatus.TIMEOUT
 
         try:
             writer.write(mutated_payload)

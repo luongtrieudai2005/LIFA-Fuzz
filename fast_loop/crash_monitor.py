@@ -285,6 +285,10 @@ class CrashMonitor:
                             f"clearing forked-child zombies"
                         )
                         await self.pause_interceptor()
+                        # BUG 1 fix: close prefix cache before snapshot-restore
+                        # (cached TCP connection points to old VM → dead socket)
+                        if self.mutator is not None:
+                            self.mutator._close_pcache()
                         try:
                             await self.restart_target(settle=False)
                         except Exception as _e:
@@ -925,9 +929,12 @@ class CrashMonitor:
         if sig and sig in self._fired_asan_sigs:
             return ""  # once-per-site: this crash site already fired — no re-counting
         self._last_asan_sig = sig
-        # Cap to prevent unbounded growth over 7+ hour campaigns (BUG M2 fix)
-        if len(self._fired_asan_sigs) < 2000:
-            self._fired_asan_sigs.add(sig)
+        # Cap with LRU eviction: when full, evict oldest entry instead of
+        # blocking new adds (BUG 3 fix: hard cap broke once-per-site dedup)
+        if len(self._fired_asan_sigs) >= 2000:
+            oldest = next(iter(self._fired_asan_sigs))
+            self._fired_asan_sigs.discard(oldest)
+        self._fired_asan_sigs.add(sig)
         # CONSUME the report: clear the serial buffer so this ASAN block
         # doesn't re-fire on the next poll. Without this the report sits in
         # the buffer and is re-detected every cycle → a 25:1 false-positive
