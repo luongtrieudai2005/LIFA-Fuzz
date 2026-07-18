@@ -54,7 +54,7 @@ from typing import Any
 
 import yaml
 
-from dotenv import load_dotenv
+from shared.environment import load_env_once
 from shared.logger import get_logger, setup_root_logger
 from shared.schemas import ProtocolGrammar, SemanticRule
 from shared.crash_manager import CrashManager
@@ -208,17 +208,18 @@ async def run_slow_loop(
         prompt_truncation_strategy=llm_cfg.get("prompt_truncation_strategy", "truncate"),
     )
     # H1 fix: default to False (matches LLMAgent.__init__ and the eval path).
-    # GLM models with enable_thinking=True route all tokens to reasoning_content
-    # and return an empty .content → every call fails → silent bootstrap
-    # fallback. A config that omits this key must NOT silently flip the bit to
-    # True; opt in explicitly instead.
+    # Models with enable_thinking/thinking/reasoning=True route all tokens to
+    # reasoning_content and return an empty .content → every call fails →
+    # silent bootstrap fallback. A config that omits this key must NOT silently
+    # flip the bit to True; opt in explicitly instead.
     agent.enable_thinking = llm_cfg.get("enable_thinking", False)
 
     # Cross-validate enable_thinking for cost-sensitive models
-    if agent.enable_thinking and "glm" in agent.model.lower():
+    _thinking_warn_models = ("glm", "deepseek", "reasoner")
+    if agent.enable_thinking and any(m in agent.model.lower() for m in _thinking_warn_models):
         logger.warning(
-            "enable_thinking=True with GLM model — this may cause "
-            "all tokens to be consumed by reasoning_content. "
+            f"enable_thinking=True with {agent.model} — this may cause "
+            "all tokens to be consumed by reasoning content. "
             "Set enable_thinking: false in config.yaml"
         )
 
@@ -423,7 +424,7 @@ async def run_slow_loop(
 def main() -> None:
     """Parse CLI arguments and launch the daemon."""
     # Load .env file first (manual env vars take precedence)
-    load_dotenv(override=False)
+    load_env_once()
 
     parser = argparse.ArgumentParser(
         description="LIFA-Fuzz Slow Loop Daemon — "
@@ -496,4 +497,7 @@ Examples:
 
 
 if __name__ == "__main__":
+    # Normalize CWD to project root so all relative paths resolve correctly.
+    _project_root = Path(__file__).resolve().parent
+    os.chdir(str(_project_root))
     main()

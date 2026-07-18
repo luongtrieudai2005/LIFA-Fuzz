@@ -48,7 +48,11 @@ from shared.schemas import FieldRule, MutationStrategy, ProtocolGrammar, RuleTyp
 from slow_loop.llm_agent import LLMAgent, estimate_tokens
 from slow_loop.parser import InteractionSession, TrafficParser
 from slow_loop.rule_generator import RuleGenerator
-from slow_loop.differential_analyzer import DifferentialAnalyzer, HeatmapResult
+from slow_loop.differential_analyzer import (
+    DifferentialAnalyzer,
+    HeatmapResult,
+    generate_text_heatmap,
+)
 from slow_loop.ewma_controller import EWMAController
 
 logger = get_logger("slow_loop.rules_orchestrator")
@@ -635,11 +639,23 @@ class RulesOrchestrator:
                 except ValueError:
                     # Not enough packets for analysis — proceed without hint
                     logger.debug("  Differential analysis skipped (insufficient data)")
-            else:
-                logger.debug(
-                    f"  Differential analysis skipped "
-                    f"(need {self._analyzer.min_packets}, have {len(raw_packets)})"
-                )
+
+            # ── 5b. Text Protocol Token-Level Analysis ────────────────
+            # Runs alongside the byte-level analyzer. For text/line protocols,
+            # the byte-level analyzer sees everything as HIGH_ENTROPY (worthless).
+            # This token-frequency analysis identifies likely STATIC keywords
+            # (commands, header-names) from MUTABLE data (paths, values).
+            if raw_packets:
+                try:
+                    text_hint = generate_text_heatmap(raw_packets)
+                    if text_hint:
+                        if math_hint:
+                            math_hint += "\n\n" + text_hint
+                        else:
+                            math_hint = text_hint
+                        logger.info("  Text protocol analysis: token-level hint generated")
+                except Exception:
+                    logger.debug("  Text protocol analysis skipped")
 
             # ── 5a. State Machine Inference (Tầng 3 — Veritas-inspired) ──
             # Generic state machine from traffic: no hardcoded FTP. Produces

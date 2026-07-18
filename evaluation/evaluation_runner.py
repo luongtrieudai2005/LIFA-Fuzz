@@ -51,7 +51,7 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from evaluation.telemetry_collector import TelemetryCollector
-from dotenv import load_dotenv
+from shared.environment import load_env_once
 
 RESULTS_DIR = Path(__file__).parent / "results"
 
@@ -2058,7 +2058,7 @@ Examples:
 
 
 if __name__ == "__main__":
-    load_dotenv(override=False)
+    load_env_once()
 
     # ── Suppress core dumps (eliminate clutter at the source) ──────────
     # ASAN targets (LightFTP, dummy vulnerable_server) abort() on crash and

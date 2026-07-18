@@ -55,7 +55,7 @@ from shared.runtime_state import (
     MutatorState, SlowLoopState, RuleSetState,
     write_runtime_state, read_slow_loop_state, RUNTIME_STATE_FILE,
 )
-from dotenv import load_dotenv
+from shared.environment import load_env_once
 
 # Import sandbox drivers so they self-register via register_driver()
 import sandbox.docker_driver  # noqa: F401 — registers "docker" driver
@@ -927,8 +927,8 @@ async def stop_and_cleanup(driver_name: str = "docker") -> None:
 
 
 def main():
-    # Load .env file first (manual env vars take precedence)
-    load_dotenv(override=False)
+    # Load .env with API key validation
+    load_env_once()
 
     # Load config for default sandbox driver
     import yaml

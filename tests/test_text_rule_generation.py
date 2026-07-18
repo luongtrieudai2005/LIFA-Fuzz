@@ -151,6 +151,24 @@ class TestTextRuleGeneration:
         # text rules generated despite the BYTES body field + no keyword
         assert any(r.text_selector is not None for r in rules)
 
+    def test_text_string_field_gets_payload_extend_growth_rule(self):
+        """Step 3: each non-enum text field gets a PAYLOAD_EXTEND rule
+        (same selector) so the size-escalation mode can GROW its token value
+        past fixed server buffers. Generic 'grow a long value' technique —
+        no protocol-specific content. Enum (method) is dictionary-targeted,
+        so it does NOT get a growth rule."""
+        rules = RuleGenerator().grammar_to_rules(_text_grammar())
+        by_field = {}
+        for r in rules:
+            by_field.setdefault(r.target_field_name, set()).add(
+                r.mutation_strategy_override
+            )
+        # 'resource' and 'cseq_val' are string fields → both RANDOM_BYTES + PAYLOAD_EXTEND
+        assert MutationStrategy.PAYLOAD_EXTEND in by_field["resource"]
+        assert MutationStrategy.PAYLOAD_EXTEND in by_field["cseq_val"]
+        # 'method' is enum/dictionary → no growth rule
+        assert MutationStrategy.PAYLOAD_EXTEND not in by_field.get("method", set())
+
 
 class TestTextRuleRuntime:
     def test_method_rule_mutates_method_token(self):
@@ -199,3 +217,27 @@ class TestTextRuleRuntime:
         assert out2[val_tok.start:val_tok.end] != pkt[val_tok.start:val_tok.end]
         name_tok = next(t for t in toks if t.kind == "header_name")
         assert out2[name_tok.start:name_tok.end] == b"CSeq"
+
+    def test_payload_extend_text_rule_grows_token(self):
+        """Step 3 runtime: a PAYLOAD_EXTEND text rule, applied single-field,
+        GROWS the resolved token (the mechanism that lets the fuzzer push a
+        header value past a fixed server buffer)."""
+        random.seed(3)
+        rules = RuleGenerator().grammar_to_rules(_text_grammar())
+        ars = ActiveRuleSet(
+            rule_set_id="t", protocol_name="text", fields=[],
+            rules=rules, overall_confidence=0.99,
+        )
+        mutable = ars.get_mutable_fields()
+        # the PAYLOAD_EXTEND rule on a string field (resource)
+        grow = next(
+            f for f in mutable
+            if f.field_name == "resource"
+            and f.mutation_strategy == MutationStrategy.PAYLOAD_EXTEND
+        )
+        pkt = b"CMDA scheme://h/p VER\r\nCSeq: 1\r\n\r\n"
+        out = _apply_field(bytearray(pkt), grow, preserve_length=False)
+        # single-field growth must make the packet LONGER (token grew)
+        assert len(out) > len(pkt)
+        # framing preserved: still ends with the CRLF terminator
+        assert out.endswith(b"\r\n")

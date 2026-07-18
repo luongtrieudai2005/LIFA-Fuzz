@@ -159,8 +159,35 @@ class NullModule(ProtocolModule):
     def binary_operators(self) -> list[str]:
         return []
 
+    def _first_text_status_code(self, data: bytes) -> Optional[str]:
+        """Try to extract a generic 3-digit status code from a text response.
+
+        Looks for a 3-digit number (100-599) in the first line of a text-like
+        response. Returns the code as a string (e.g. ``"200"``) or None.
+        Pure black-box: no protocol-specific keywords or formats are assumed.
+        """
+        try:
+            text = data.decode("ascii", errors="replace")
+            first_line = text.split("\r\n")[0].split("\n")[0]
+            for token in first_line.split():
+                if len(token) == 3 and token.isdigit():
+                    code = int(token)
+                    if 100 <= code <= 599:
+                        return token
+        except Exception:
+            pass
+        return None
+
     def extract_state_code(self, response: bytes) -> str:
-        return ""
+        """Generic 3-digit status code extractor for text-like responses.
+
+        For text protocols (HTTP, RTSP, FTP, SMTP), the first line of the
+        response typically contains a status code like ``200`` or ``404``.
+        Returns the code string, or ``""`` if the response is not text-like
+        or contains no recognizable status code.
+        """
+        code = self._first_text_status_code(response)
+        return code or ""
 
     def extract_command(self, payload: bytes) -> str:
         return ""
@@ -195,18 +222,51 @@ class NullModule(ProtocolModule):
         return {}
 
     def response_category(self, response: bytes, payload: bytes) -> str:
-        """Black-box default: empty reply ⇒ error, any reply ⇒ normal."""
-        return "error" if not response else "normal"
+        """Generic text-aware response classification.
+
+        For text-like responses with a recognizable 3-digit status code:
+          - 2xx → normal (positive completion)
+          - 3xx, 4xx, 5xx → error (redirection, client error, server error)
+          - 1xx → normal (informational / continuing)
+
+        Fallback for non-text or unrecognizable responses:
+          empty → error, non-empty → normal
+        """
+        if not response:
+            return "error"
+        code = self._first_text_status_code(response)
+        if code is not None:
+            c = int(code)
+            if 200 <= c < 300:
+                return "normal"
+            if 100 <= c < 200:
+                return "normal"
+            return "error"
+        return "normal" if response else "error"
 
     def response_signature(self, response: bytes, payload: bytes) -> str:
-        """Black-box default: hex prefix + coarse length bucket.
+        """Generic text-aware response signature.
 
-        Coarse on purpose — the differential oracle only needs "did the
-        reply change meaningfully", and without protocol knowledge the
-        first bytes + a length bucket are the cheapest stable proxy.
+        For text-like responses with a 3-digit status code, produce a
+        signature of the form ``{code}|{status_text}``, e.g.:
+          ``"200|OK"``, ``"404|Not Found"``, ``"503|Service Unavailable"``
+
+        For non-text or unrecognizable responses, falls back to the
+        binary signature (hex prefix + length bucket).
         """
         if not response:
             return "empty"
+        code = self._first_text_status_code(response)
+        if code is not None:
+            try:
+                text = response.decode("ascii", errors="replace")
+                idx = text.find(code)
+                if idx >= 0:
+                    rest = text[idx + 3:].strip().split("\r\n")[0].split("\n")[0].strip()
+                    status_text = rest.split("\r")[0].split("\n")[0][:20]
+                    return f"{code}|{status_text}"
+            except Exception:
+                pass
         prefix = response[:8].hex()
         bucket = "S" if len(response) < 32 else ("M" if len(response) < 256 else "L")
         return f"{prefix}:{bucket}"

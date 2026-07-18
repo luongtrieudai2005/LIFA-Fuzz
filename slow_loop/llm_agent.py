@@ -74,9 +74,13 @@ except ImportError:
 # =============================================================================
 MODEL_PRICING: dict[str, dict[str, float]] = {
     "glm-5":                       {"input_per_m": 0.60,  "output_per_m": 1.92},
+    "glm-5-turbo":                 {"input_per_m": 0.60,  "output_per_m": 1.92},
     "gpt-4o":                      {"input_per_m": 2.50,  "output_per_m": 10.00},
     "gpt-4o-mini":                 {"input_per_m": 0.15,  "output_per_m": 0.60},
     "claude-sonnet-4-20250514":    {"input_per_m": 3.00,  "output_per_m": 15.00},
+    "deepseek-v3-1-250821":        {"input_per_m": 0.50,  "output_per_m": 2.00},
+    "deepseek-chat":               {"input_per_m": 0.50,  "output_per_m": 2.00},
+    "deepseek-reasoner":           {"input_per_m": 0.55,  "output_per_m": 2.19},
     "default":                     {"input_per_m": 1.00,  "output_per_m": 2.00},
 }
 
@@ -365,7 +369,83 @@ You MUST respond with a single valid JSON object matching this exact schema:
 7. Always include a "reasoning" field explaining your analysis.
 8. Respond with ONLY the JSON object — no markdown, no explanation.
 
-## EXAMPLE OUTPUT
+Now analyze the actual traffic below and infer the protocol wire format.
+"""
+
+SYSTEM_PROMPT_TEXT_APPEND = """\
+
+## TEXT / LINE PROTOCOL INSTRUCTIONS
+
+For text-based protocols (HTTP, RTSP, FTP, SMTP, SIP), fields do NOT have \
+fixed byte offsets. Instead, they are TOKENS separated by whitespace or \
+colon-space. Follow these special rules for text protocols:
+
+1. Set EVERY field's `offset_start: 0, offset_end: -1` — this tells the \
+   fuzzer that the field has no fixed byte position. Do NOT try to compute \
+   byte offsets for tokens in a line; they vary per packet.
+2. The command verb (e.g.\u3000``GET``,\u3000``DESCRIBE``,\u3000``USER``, ``OPTIONS``) \
+   is a constant/keyword — mark `is_constant: true` if it appears in every \
+   packet, OR enumerate all observed verbs in `possible_values`.
+3. Header names (e.g. ``Host:``, ``CSeq:``, ``User-Agent:``, ``Content-Type:``) \
+   are constant labels — mark `is_constant: true`.
+4. Header values (e.g. the URL after ``Host:``, the number after ``CSeq:``) \
+   are variable data — mark `is_constant: false` with \
+   `mutation_strategy: "random_bytes"` or `"dictionary"`.
+5. Set `field_type` to ``string`` for text tokens, ``enum`` for limited-value \
+   command verbs, and ``uint32_be`` for numeric headers like ``CSeq`` or \
+   ``Content-Length``.
+6. If a ``TEXT PRE-ANALYSIS`` block is provided, trust its STATIC token \
+   classifications — those tokens are mathematically confirmed to be \
+   constant across packets.
+7. Output fields STRICTLY in the ORDER they appear in the packet from first \
+   token to last. For example: method/verb → URL → protocol_version → \
+   header_name → header_value → next_header_name → next_header_value... \
+   Do NOT reorder fields. The first field you list must be for the first \
+   token in the packet, the second field for the second token, and so on."""
+
+SYSTEM_PROMPT_TEXT_EXAMPLE = """
+
+## EXAMPLE OUTPUT (Text Protocol)
+
+Here is a correct example for RTSP:
+Packet: 44 45 53 43 52 49 42 45  20 72 74 73 70 3a 2f 2f  |DESCRIBE rtsp://|
+        31 32 37 2e 30 2e 30 2e  31 20 52 54 53 50 2f 31  |127.0.0.1 RTSP/1|
+        2e 30 0d 0a 43 53 65 71  3a 20 31 0d 0a 0d 0a     |.0..CSeq: 1....|
+
+Fields: DESCRIBE (command), rtsp://127.0.0.1 (URL), RTSP/1.0 (version), \
+CSeq (header name), 1 (header value)
+
+Correct output:
+{
+    "protocol_name": "rtsp",
+    "description": "RTSP DESCRIBE request \u2014 retrieves stream description",
+    "fields": [
+        {"name": "method",   "offset_start": 0, "offset_end": -1,
+         "field_type": "string", "is_constant": false,
+         "possible_values": ["DESCRIBE", "SETUP", "PLAY", "TEARDOWN",
+                             "OPTIONS", "PAUSE", "GET_PARAMETER"],
+         "mutation_strategy": "dictionary"},
+        {"name": "url",      "offset_start": 0, "offset_end": -1,
+         "field_type": "string", "is_constant": false,
+         "mutation_strategy": "random_bytes"},
+        {"name": "protocol_version", "offset_start": 0, "offset_end": -1,
+         "field_type": "string", "is_constant": true,
+         "mutation_strategy": "static"},
+        {"name": "cseq_name", "offset_start": 0, "offset_end": -1,
+         "field_type": "string", "is_constant": true,
+         "mutation_strategy": "static"},
+        {"name": "cseq_value", "offset_start": 0, "offset_end": -1,
+         "field_type": "uint32_be", "is_constant": false,
+         "mutation_strategy": "boundary_values"}
+    ],
+    "min_packet_size": 16, "max_packet_size": 4096,
+    "confidence": 0.85,
+    "reasoning": "RTSP request: 'DESCRIBE' is the method verb \u2192 enum. \
+URL and CSeq value vary per packet \u2192 mutable. 'RTSP/1.0' and 'CSeq' \
+are constant across packets \u2192 static."
+}
+
+## EXAMPLE OUTPUT (Binary Protocol)
 
 Here is a correct example for a simple 3-field binary protocol:
 Packet: de ad be ef  00 07  48 65 6c 6c 6f 0d 0a
@@ -565,13 +645,11 @@ class LLMAgent:
         self.max_retries = max_retries
         self.session_budget_tokens = session_budget_tokens
         self.session_budget_usd = session_budget_usd
-        # Default to thinking-DISABLED. enable_thinking is a GLM/Z.ai-specific
-        # flag passed via extra_body; with it left ON, GLM-5 spends all tokens
-        # on reasoning_content and returns an empty .content → every call fails
-        # → silent bootstrap fallback. Thinking ON is the wrong default for the
-        # project's configured provider, and harmless to disable for
-        # OpenAI/Anthropic (they ignore the extra_body field). Config can still
-        # opt back in via the setter, e.g. agent.enable_thinking = True.
+        # Default to thinking-DISABLED. For DeepSeek (via shopaikey),
+        # enable_reasoning is passed via extra_body; disabling it ensures
+        # all model capacity goes to JSON output (not reasoning tokens).
+        # Harmless to disable for OpenAI/Anthropic (they ignore extra_body).
+        # Config can opt back in via agent.enable_thinking = True.
         self.enable_thinking = False
 
         # Runtime stats
@@ -1375,6 +1453,13 @@ class LLMAgent:
         if "RESPONSE FEEDBACK" in prompt:
             system_content += SYSTEM_PROMPT_FEEDBACK_APPEND
 
+        # Text protocol instructions: only append when the text pre-analysis
+        # block is present in the prompt (generated by generate_text_heatmap).
+        # Sending text instructions for binary protocols would confuse the LLM.
+        if "TEXT PRE-ANALYSIS" in prompt:
+            system_content += SYSTEM_PROMPT_TEXT_APPEND
+            system_content += SYSTEM_PROMPT_TEXT_EXAMPLE
+
         messages = [
             {"role": "system", "content": system_content},
             {"role": "user", "content": prompt},
@@ -1418,7 +1503,7 @@ class LLMAgent:
                 if not self.enable_thinking:
                     call_kwargs["extra_body"] = {
                         **call_kwargs.get("extra_body", {}),
-                        "enable_thinking": False,
+                        "enable_reasoning": False,
                     }
 
                 response = await litellm.acompletion(**call_kwargs)

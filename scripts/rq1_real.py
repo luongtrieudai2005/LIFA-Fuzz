@@ -28,8 +28,8 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from dotenv import load_dotenv
-load_dotenv(override=False)
+from shared.environment import load_env_once
+load_env_once()
 
 import yaml  # noqa: E402
 

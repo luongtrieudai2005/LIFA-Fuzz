@@ -2,8 +2,21 @@
 # =============================================================================
 # build_rootfs_live555.sh
 # ────────────────────────────
-# live555 RTSP server @ ceeb4f4 (CVE-2018-4013 stack BOF in HTTP tunneling).
+# live555 RTSP server @ ceeb4f4 (ASAN-instrumented, single-process).
 # Binary: testProgs/testOnDemandRTSPServer, port 8554.
+#
+# Two CVEs are present at ceeb4f4; only ONE is reachable by the RTSP fuzzer:
+#   • CVE-2020-24027 (REACHABLE — the fuzz target): stack BOF in
+#     RTSPServer::RTSPClientSession::handleCmd_PLAY(). A PLAY request whose
+#     `Range: clock=<long>` start value exceeds ~90 chars overflows
+#     `char buf[100]` via `sprintf(buf, "Range: clock=%s-%s\r\n", absStart,
+#     absEnd)` (absStart/absEnd come from parseRangeHeader of the request's
+#     `Range: clock=` value). Pure-RTSP path → the fuzzer (which sends PLAY)
+#     reaches it; ASAN abort_on_error → PID1 death → VM exit → detected.
+#   • CVE-2018-4013 (also present but UNREACHABLE by this fuzzer): stack BOF
+#     in handleHTTPCmd_TunnelingPOST (RTSP-over-HTTP tunneling, port 80, HTTP
+#     POST). The fuzzer speaks pure RTSP on 8554, so this path is never hit.
+#     Kept for reference only — do NOT report it as a fuzz-found bug.
 # =============================================================================
 set -euo pipefail
 
@@ -15,7 +28,9 @@ ROOTFS_SIZE_MB=256
 DOCKERFILE="${FC_ENV}/Dockerfile.live555"
 
 echo "============================================================"
-echo "  Building live555 @ ceeb4f4 (CVE-2018-4013) RootFS"
+echo "  Building live555 @ ceeb4f4 RootFS"
+echo "  Reachable fuzz target: CVE-2020-24027 (PLAY Range: clock= BOF)"
+echo "  (CVE-2018-4013 also present but unreachable by the RTSP fuzzer)"
 echo "============================================================"
 mkdir -p "${FC_ENV}"
 

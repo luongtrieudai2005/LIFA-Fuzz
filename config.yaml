@@ -119,15 +119,15 @@ slow_loop:
   # LLM Agent settings
   llm_agent:
     mode: "REAL"                # "REAL" (calls actual API) or "MOCK" (simulated for testing)
-    provider: "openai"          # litellm provider string (openai, anthropic, ollama)
-    model: "glm-5"              # Model name (must match .env LLM_MODEL)
+    provider: "openai"          # litellm provider string (openai, anthropic, deepseek, ollama)
+    model: "deepseek-v3-1-250821"  # Model name (must match .env LLM_MODEL)
     api_key_env: "OPENAI_API_KEY"  # Environment variable holding the API key
-    api_base: "https://api.z.ai/api/coding/paas/v4"  # Custom API endpoint (empty = provider default)
-    enable_thinking: false      # Disable reasoning/thinking mode (Z.ai GLM needs this)
-    extra_body: {}              # Extra JSON body params passed to the API (e.g. {"enable_thinking": false})
+    api_base: "https://api.shopaikey.com/v1"  # Custom API endpoint (empty = provider default)
+    enable_thinking: false      # Disable reasoning mode (DeepSeek uses enable_reasoning param)
+    extra_body: {}              # Extra JSON body params passed to the API (e.g. {"enable_reasoning": false})
     max_tokens: 4096            # Max tokens for LLM response
     temperature: 0.2            # Low temperature for consistent inference
-    timeout_seconds: 60         # Request timeout (glm-5 needs ~15-20s with long prompts)
+    timeout_seconds: 60         # Request timeout
     max_retries: 3              # Retry count on API failure
     retry_backoff_ms: 5000      # Base retry backoff
     session_budget_tokens: 0    # Max tokens per session (0 = unlimited)
@@ -150,11 +150,11 @@ slow_loop:
     #   api_key_env: "ANTHROPIC_API_KEY"
     #   api_base: ""
 
-    # ZhipuAI (via OpenAI-compatible endpoint):
+    # DeepSeek (via OpenAI-compatible endpoint):
     #   provider: "openai"
-    #   model: "glm-5"
-    #   api_key_env: "ZHIPUAI_API_KEY"
-    #   api_base: "https://api.z.ai/api/coding/paas/v4"
+    #   model: "deepseek-chat"
+    #   api_key_env: "DEEPSEEK_API_KEY"
+    #   api_base: "https://api.deepseek.com/v1"
 
     # Ollama (local, no API key needed):
     #   provider: "ollama"

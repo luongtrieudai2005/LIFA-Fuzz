@@ -1172,6 +1172,111 @@ class DifferentialAnalyzer:
 
 
 # ===========================================================================
+# Text Protocol Analysis — Token-level pre-processing for the LLM
+# ===========================================================================
+
+
+def generate_text_heatmap(packets: list[bytes]) -> Optional[str]:
+    """Token-level differential analysis for text/line protocols.
+
+    The byte-level DifferentialAnalyzer sees all bytes as HIGH_ENTROPY
+    for text protocols (every packet has different content at every offset).
+    This analysis operates on **tokens** instead: tokenize each packet via
+    the generic tokenizer, then compute token-value frequency across the
+    corpus. High-frequency tokens (appearing in ≥80% of packets) are likely
+    protocol keywords/commands/header-names (STATIC); low-frequency tokens
+    are likely mutable data fields.
+
+    Pure black-box: the tokenizer knows only universal delimiters
+    (CRLF, whitespace, colon). No protocol-specific content. The output
+    is a text hint injected into the LLM prompt alongside the byte-level
+    heatmap, helping the LLM name text fields without re-deriving which
+    tokens are constant.
+
+    Args:
+        packets: Raw C2S packet bytes from the traffic log.
+
+    Returns:
+        A formatted hint string for the LLM prompt, or None if the
+        packets don't look text-like or there's insufficient data.
+    """
+    from shared.text_tokenizer import is_text_like, tokenize_text
+
+    if len(packets) < _MIN_PACKETS:
+        return None
+
+    text_packets = [p for p in packets if is_text_like(p)]
+    if len(text_packets) < _MIN_PACKETS:
+        return None
+
+    # Tokenize all packets and collect value → frequency
+    value_freq: dict[str, int] = {}
+    token_count = len(text_packets)
+
+    for pkt in text_packets:
+        seen_this_pkt: set[str] = set()
+        for tok in tokenize_text(pkt):
+            if tok.start < 0 or tok.end > len(pkt) or tok.end <= tok.start:
+                continue
+            val = pkt[tok.start:tok.end]
+            key = val.decode("ascii", errors="replace")
+            if key not in seen_this_pkt:
+                value_freq[key] = value_freq.get(key, 0) + 1
+                seen_this_pkt.add(key)
+
+    if not value_freq:
+        return None
+
+    # Classify: high-frequency (≥80%) → likely STATIC
+    threshold = max(3, int(token_count * 0.8))
+    static_tokens: list[tuple[str, float]] = []
+    mutable_tokens: list[tuple[str, float]] = []
+
+    for val, count in sorted(value_freq.items(), key=lambda x: -x[1]):
+        freq = count / token_count
+        if freq >= 0.8:
+            static_tokens.append((val, freq))
+        elif freq <= 0.5:
+            mutable_tokens.append((val, freq))
+
+    if not static_tokens:
+        return None
+
+    lines = [
+        "## TEXT PRE-ANALYSIS (token-level, computed before LLM)",
+        f"Packets: {token_count} | "
+        f"Unique tokens: {len(value_freq)} | "
+        f"High-freq (likely STATIC): {len(static_tokens)}",
+        "",
+        "### High-frequency tokens (likely keywords/commands/header-names — "
+        "mark as STATIC):",
+    ]
+    for val, freq in static_tokens[:15]:
+        preview = val.replace("\r", "\\r").replace("\n", "\\n")
+        lines.append(f"  '{preview}'  →  {freq:.0%} of packets")
+
+    if mutable_tokens:
+        lines += [
+            "",
+            "### Low-frequency tokens (likely mutable data fields — "
+            "NOT static):",
+        ]
+        for val, freq in mutable_tokens[:10]:
+            preview = val.replace("\r", "\\r").replace("\n", "\\n")
+            lines.append(f"  '{preview}'  →  {freq:.0%} of packets")
+
+    lines += [
+        "",
+        "### Instruction for text protocol:",
+        "Tokens marked as STATIC above are protocol commands, keywords,",
+        "or header names. DO NOT suggest mutating them. Focus on naming",
+        "the remaining mutable tokens and suggesting mutation strategies",
+        "for variable-length values (paths, arguments, header values).",
+    ]
+    return "\n".join(lines)
+
+
+# ===========================================================================
 # Helper
 # ===========================================================================
 

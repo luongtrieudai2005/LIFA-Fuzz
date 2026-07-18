@@ -407,12 +407,17 @@ class RuleGenerator:
         ``tests/test_text_protocol_integrity.py``).
         """
         rules: list[SemanticRule] = []
-        nth = 0  # document-order token index (LLM field order ↔ token order)
+        # document-order token index. Counts every LLM field so that
+        # nth_token aligns with runtime token indices. The LLM MUST output
+        # fields in document order (system prompt item 7). Fields with
+        # possible_values use match_dictionary (resolved by content) but
+        # still increment nth to keep remaining nth_token values aligned.
+        nth = 0
         for field in grammar.fields:
             if field.mutation_strategy == MutationStrategy.SKIP:
                 continue
             pv = list(getattr(field, "possible_values", None) or [])
-            if not field.is_constant and field.field_type == FieldType.ENUM and pv:
+            if not field.is_constant and pv:
                 rules.append(
                     self._make_text_rule(
                         field, grammar,
@@ -430,8 +435,14 @@ class RuleGenerator:
                         dictionary=[],
                     )
                 )
-            # Constant fields emit no rule but still occupy a document token
-            # slot, so the nth index stays aligned with runtime token order.
+                rules.append(
+                    self._make_text_rule(
+                        field, grammar,
+                        selector={"nth_token": nth},
+                        strat=MutationStrategy.PAYLOAD_EXTEND,
+                        dictionary=[],
+                    )
+                )
             nth += 1
         return rules
 
@@ -491,6 +502,7 @@ class RuleGenerator:
                 continue
             ftype = field.field_type
             flen = (field.offset_end - field.offset_start) if field.offset_end and field.offset_end > 0 else (1024 if field.offset_end < 0 else 1)
+            is_text = rule.text_selector is not None and bool(rule.text_selector)
             vstrats: list[ViolationStrategy] = []
             # Magic/static header: overwrite with NULs ⇒ server should reject
             # (no/unknown framing). Expected error.
@@ -511,8 +523,33 @@ class RuleGenerator:
                     expected_category=ResponseCategory.ERROR,
                     description=f"Set {name} to max value — server should error",
                 ))
+            # Text field violations: ADD/REMOVE/UPDATE on tokens.
+            # The actual byte span is resolved at runtime by the generic
+            # tokenizer via FlatFieldViolationMutator._resolve_text_span().
+            if is_text:
+                # Remove the token (e.g. remove URL → server should error)
+                vstrats.append(ViolationStrategy(
+                    action=ViolationAction.REMOVE, target_field=name,
+                    target_length=1,
+                    expected_category=ResponseCategory.ERROR,
+                    description=f"Remove the '{name}' token — server should reject",
+                ))
+                # Overflow: replace with long string
+                vstrats.append(ViolationStrategy(
+                    action=ViolationAction.UPDATE, target_field=name,
+                    insert_value="41414141414141414141414141414141414141414141",
+                    expected_category=ResponseCategory.ERROR,
+                    description=f"Overflow '{name}' with AAAA... — server should error",
+                ))
+                # Duplicate the token (ADD with same value)
+                vstrats.append(ViolationStrategy(
+                    action=ViolationAction.ADD, target_field=name,
+                    insert_value="0d0a",
+                    expected_category=ResponseCategory.ERROR,
+                    description=f"Add a newline after '{name}' — test line-injection",
+                ))
             # Always also offer a REMOVE of the field (missing mandatory field).
-            if flen and flen > 0:
+            if flen and flen > 0 and not is_text:
                 vstrats.append(ViolationStrategy(
                     action=ViolationAction.REMOVE, target_field=name,
                     target_length=flen,
@@ -1075,9 +1112,15 @@ class RuleGenerator:
         """Validate that a rule is safe and actionable.
 
         Checks:
-        - Offsets are non-negative and ``offset_start < offset_end``.
-        - Field length is > 0 and <= 65535.
+        - Offsets are non-negative and ``offset_start < offset_end``
+          (EXCEPT for text rules where ``text_selector`` is authoritative).
+        - Field length is > 0 and <= 65535 (EXCEPT for text rules).
         - Field type is a recognized ``FieldType``.
+
+        Text rules (those with ``text_selector`` set) carry placeholder
+        offsets ``(0, 0)`` — the actual byte span is resolved at runtime
+        by the generic tokenizer (``shared/text_tokenizer.py``). Skip
+        offset-based validation for these rules.
 
         Args:
             rule: The SemanticRule to validate.
@@ -1085,6 +1128,15 @@ class RuleGenerator:
         Returns:
             True if the rule is valid, False otherwise.
         """
+        # Text rules: offset-based validation does not apply —
+        # text_selector is authoritative, offsets are placeholders (0, 0).
+        if rule.text_selector is not None and rule.text_selector:
+            logger.debug(
+                f"Text rule '{rule.target_field_name}' accepted "
+                f"(text_selector={rule.text_selector})"
+            )
+            return True
+
         if rule.offset_start < 0:
             logger.warning(f"Rule {rule.rule_id}: negative offset_start")
             return False

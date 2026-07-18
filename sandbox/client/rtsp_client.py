@@ -86,7 +86,14 @@ def main() -> None:
             sock.settimeout(5.0)
             sock.connect((TARGET_HOST, TARGET_PORT))
 
-            url = f"rtsp://{TARGET_HOST}:{TARGET_PORT}/test.mkv"
+            # testOnDemandRTSPServer registers streams BY NAME (matroskaFileTest,
+            # h264ESVideoTest, ...) and each needs its media FILE to exist at
+            # startup — the rootfs ships none, so those 404. The one stream
+            # registered WITHOUT a file is the UDP-source transport stream, so
+            # SETUP succeeds and creates a real session → PLAY reaches the
+            # server's PLAY handler (deep RTSP logic). Using a registered,
+            # playable stream is required for any PLAY-path fuzzing to work.
+            url = f"rtsp://{TARGET_HOST}:{TARGET_PORT}/mpeg2TransportStreamFromUDPSourceTest"
 
             # Phase 1: OPTIONS
             pkt = build_rtsp_request("OPTIONS", url)
