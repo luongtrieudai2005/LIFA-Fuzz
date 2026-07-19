@@ -6,6 +6,8 @@
 
 ## What It Does
 
+<img align="right" width="438" height="382" alt="image" src="https://github.com/user-attachments/assets/cd0bc619-874d-4bdb-9648-a0254b435ee4" />
+
 LIFA-Fuzz finds bugs in network servers without needing the server's source code or protocol documentation. It works by watching real traffic between a client and the server, learning the protocol structure automatically, then sending mutated packets to trigger crashes.
 
 The system does four things:
