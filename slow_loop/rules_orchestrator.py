@@ -362,7 +362,7 @@ class RulesOrchestrator:
         crash_manager: Any = None,
         ab_mode: str = "llm",
         ewma_controller: Optional[EWMAController] = None,
-        re_infer_interval_s: float = 30.0,
+        re_infer_interval_s: float = 600.0,
         force_inference_time_s: float = 600.0,
         force_inference_mutations: int = 20000,
     ) -> None:
@@ -381,8 +381,9 @@ class RulesOrchestrator:
 
         # Time-based re-inference: force a new inference cycle even when
         # no new unique packets arrive, as long as enough time has passed.
-        # This prevents the LLM from starving on protocols with few message
-        # types (e.g., HTTP with only GET/POST/HEAD).
+        # Set HIGH (default 600s) because the grammar is stable after 1-2
+        # inferences. Frequent re-inference wastes tokens and blocks the
+        # fuzzing pipeline (~40s per LLM call).
         self._re_infer_interval_s: float = re_infer_interval_s
         self._last_inference_time: float = time.monotonic()
 
@@ -613,9 +614,18 @@ class RulesOrchestrator:
             # On scheduled re-inference, reset inferred markers so ALL
             # buffer packets become eligible again (periodic full sweep),
             # then use the full diverse sample.
+            # Skip full re-inference if ALL packets have already been
+            # sent to the LLM (grammar is stable — no new info to learn).
             if re_infer_due:
-                self._window.reset_inferred()
-                llm_selected = full_selected
+                if self._window.unseen_count == 0:
+                    logger.debug(
+                        f"  Re-inference skipped: no unseen packets "
+                        f"(window={self._window.size})"
+                    )
+                    llm_selected = []
+                else:
+                    self._window.reset_inferred()
+                    llm_selected = full_selected
             else:
                 llm_selected = self._window.get_unseen_samples(
                     self.max_packets_per_inference
