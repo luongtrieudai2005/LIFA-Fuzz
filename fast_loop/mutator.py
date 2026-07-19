@@ -1245,6 +1245,24 @@ class MutationEngine:
     # Sequence Splitter — M = ⟨Prefix, Target, Suffix⟩
     # -------------------------------------------------------------------
 
+    @staticmethod
+    def _is_session_end(data: bytes) -> bool:
+        """Check if a packet is a session-ending command (generic, black-box).
+
+        Session-ending commands (TEARDOWN, QUIT, BYE, EXIT, LOGOUT) cause
+        the server to close the connection after processing them. When such
+        a command appears in the suffix, the cached connection dies after
+        every mutation → cache miss → cold path → EPS collapse. Filtering
+        them from the suffix is the single highest-impact EPS fix for text
+        protocols.
+        """
+        if not data:
+            return False
+        first_word = data.split(b" ")[0].split(b"\r\n")[0]
+        return first_word in (
+            b"TEARDOWN", b"QUIT", b"BYE", b"EXIT", b"LOGOUT",
+        )
+
     def _split_sequence(self, seq: SeedSequence) -> FuzzTarget:
         """Split a SeedSequence into ⟨Prefix, Target, Suffix⟩.
 
@@ -1253,6 +1271,10 @@ class MutationEngine:
         so later packets (deeper protocol states) are selected more often.
         For a 3-packet FTP session (USER, PASS, LIST), this means:
             P(index=0) = 1/14, P(index=1) = 4/14, P(index=2) = 9/14
+
+        Session-ending commands (TEARDOWN, QUIT, BYE) are excluded from the
+        suffix and avoided as targets — they close the server connection,
+        which kills the prefix cache and drops EPS from ~20 to ~4.
         """
         n = len(seq.packets)
         if n == 0:
@@ -1278,11 +1300,26 @@ class MutationEngine:
                 target_idx = i
                 break
 
+        # Avoid selecting session-ending commands as target (they kill the
+        # connection and prevent prefix caching). Retry up to 5 times.
+        target_seed = seq.packets[target_idx]
+        for _ in range(5):
+            if not self._is_session_end(target_seed.raw_bytes) or n <= 1:
+                break
+            target_idx = random.randint(0, n - 2)
+            target_seed = seq.packets[target_idx]
+
+        # Build suffix, removing session-ending commands from the end.
+        # They close the connection and make the prefix cache useless.
+        suffix_raw = [p.raw_bytes for p in seq.packets[target_idx + 1:]]
+        while suffix_raw and self._is_session_end(suffix_raw[-1]):
+            suffix_raw.pop()
+
         return FuzzTarget(
             prefix=[p.raw_bytes for p in seq.packets[:target_idx]],
-            target_seed=seq.packets[target_idx],
+            target_seed=target_seed,
             target_index=target_idx,
-            suffix=[p.raw_bytes for p in seq.packets[target_idx + 1:]],
+            suffix=suffix_raw,
             sequence_id=seq.sequence_id,
         )
 
@@ -2583,9 +2620,17 @@ class MutationEngine:
             if _keep_alive and writer is not None and status != PacketStatus.CRASH:
                 # Cache for reuse — next mutation with same prefix skips
                 # connect + greeting + prefix replay (10-20× EPS on RTSP).
-                self._pcache_reader = reader
-                self._pcache_writer = writer
-                self._pcache_prefix_hash = self._hash_prefix(target.prefix)
+                # Quick liveness check: write an empty byte to verify the
+                # socket is still open (server hasn't closed after suffix).
+                try:
+                    writer.write(b"")
+                    await writer.drain()
+                except Exception:
+                    writer.close()
+                else:
+                    self._pcache_reader = reader
+                    self._pcache_writer = writer
+                    self._pcache_prefix_hash = self._hash_prefix(target.prefix)
             elif writer is not None:
                 # Close — connection is dead, errored, or keep_alive off.
                 writer.close()

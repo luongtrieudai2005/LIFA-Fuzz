@@ -79,7 +79,8 @@ fast_loop:
     use_weighted: true           # P2-B: strategy-priority weighted field selection
     investigation_budget: 500    # Total sends in ONE_AT_A_TIME mode before reverting
     budget_per_field: 0          # P2-D: 0 = adaptive (5s * EPS per field), >0 = fixed
-    warmup_seconds: 30           # P3-A: ALL_FIELDS warm-up duration (0 = disabled)
+    warmup_seconds: 0            # P3-A: ALL_FIELDS warm-up duration (0 = disabled).
+                                 # Text protocols don't benefit (no byte offsets).
 
   # EWMA Adaptive State Sampling — file-based IPC with Slow Loop
   adaptive_sampling:
